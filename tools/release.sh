@@ -11,10 +11,11 @@ SRC=build/Halliday.app
 OUT=build/release
 ID=${RELEASE_ID:-$(security find-identity -v -p codesigning | awk '/Developer ID Application/ {print $2; exit}')}
 [ -n "$ID" ] || { echo "no \"Developer ID Application\" identity in the keychain"; exit 1; }
+grep -q PUBLIC_KEY_PENDING "$SRC/Contents/Info.plist" && { echo "Info.plist has no SUPublicEDKey yet (reference/sparkle/bin/generate_keys)"; exit 1; }
 [ -x "$SRC/Contents/Resources/quest/klepton-runner" ] && [ -x "$SRC/Contents/Resources/quest/unzl" ] \
     || { echo "the Quest runtime isn't in the app: make klepton unzl, then make release"; exit 1; }
 tools/check-bundled-libs.sh "$SRC"
-for f in Halliday.txt THIRD-PARTY.md libusb-COPYING.txt SDL3-LICENSE.txt MoltenVK-LICENSE.txt Zstandard-LICENSE.txt; do
+for f in Halliday.txt THIRD-PARTY.md libusb-COPYING.txt SDL3-LICENSE.txt MoltenVK-LICENSE.txt Zstandard-LICENSE.txt Sparkle-LICENSE.txt; do
     [ -f "$SRC/Contents/Resources/Licenses/$f" ] || { echo "the bundle's licences are missing $f (tools/collect-licenses.sh, run by make)"; exit 1; }
 done
 
@@ -27,6 +28,11 @@ sign() { codesign --force --options runtime --timestamp --sign "$ID" "$@"; }
 for lib in "$APP"/Contents/Resources/quest/*.dylib; do sign "$lib"; done
 sign "$APP/Contents/Resources/quest/klepton-runner"
 sign "$APP/Contents/Resources/quest/unzl"
+# Sparkle (the updater): its helper tool and app, then the framework.
+SPK="$APP/Contents/Frameworks/Sparkle.framework/Versions/B"
+sign "$SPK/Autoupdate"
+sign "$SPK/Updater.app"
+sign "$APP/Contents/Frameworks/Sparkle.framework"
 sign --entitlements app/Halliday.entitlements "$APP"
 
 codesign --verify --strict --deep --verbose=2 "$APP"

@@ -10,6 +10,7 @@ extension AppDelegate {
 
         let appMenu = NSMenu()
         appMenu.addItem(withTitle: "About Halliday", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        appMenu.addItem(item("Check for Updates…", #selector(menuCheckForUpdates), "", [], target: self))
         appMenu.addItem(.separator())
         appMenu.addItem(item("Settings…", #selector(menuSettings), ",", .command, target: self))
         appMenu.addItem(.separator())
@@ -100,6 +101,7 @@ extension AppDelegate {
     @objc func menuCloseTab() { focusedBrowser?.closeActiveTab() }
     @objc func menuNewWindow() { handleKey("b") }
     @objc func menuCompanion() { showCompanion() }
+    @objc func menuCheckForUpdates() { Updates.shared.checkNow() }
     @objc func menuSettings() { handleKey(".") }
     @objc func menuReload() { focusedBrowser?.reloadPage() }
     @objc func menuHistory() { (focusedBrowser ?? openBrowser())?.showHistory() }

@@ -5,7 +5,7 @@ members = ["halliday-core", "halliday-probe", "halliday-openxr", "halliday-bridg
 exclude = ["halliday-vrclient"]
 
 [workspace.package]
-version = "0.1.0"
+version = "0.1.1"
 edition = "2024"
 license = "MIT"
 repository = "https://github.com/ThiagoTelho/halliday"

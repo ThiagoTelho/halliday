@@ -79,6 +79,7 @@ struct SetupView: View {
     @ObservedObject var setup = Setup.shared
     @ObservedObject var model: CompanionModel
     @ObservedObject var permissions = Permissions.shared
+    @ObservedObject var updates = Updates.shared
 
     var body: some View {
         HStack(spacing: 0) {
@@ -330,6 +331,19 @@ struct SetupView: View {
                     } else {
                         Label("Connected", systemImage: "checkmark").foregroundStyle(companionAccent)
                     }
+                }
+                .padding(.vertical, 12)
+                Divider()
+                // Updates: asked here once, off unless the person turns them on (Updates.swift).
+                HStack(alignment: .center, spacing: 12) {
+                    VStack(alignment: .leading, spacing: 3) {
+                        Text("Check for updates automatically")
+                        Text("Once a day Halliday asks GitHub whether a newer release is out. Nothing about you or this Mac is sent, and nothing installs without your yes.")
+                            .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                    }
+                    Spacer()
+                    Toggle("", isOn: Binding(get: { updates.automatic }, set: { updates.setAutomatic($0) }))
+                        .labelsHidden().toggleStyle(.switch)
                 }
                 .padding(.vertical, 12)
             }

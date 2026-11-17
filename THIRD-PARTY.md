@@ -199,6 +199,16 @@ Halliday's Rust core links these into the app (Cargo fetches them when building)
 - **openxr-sys** (https://github.com/Ralith/openxrs), the OpenXR runtime's types: MIT or
   Apache-2.0.
 
+## Sparkle
+
+https://sparkle-project.org (https://github.com/sparkle-project/Sparkle)
+
+The updater behind Halliday's opt-in update checks. Not part of Halliday's sources:
+`tools/fetch-sparkle.sh` downloads one pinned release (its checksum checked) into
+`reference/sparkle/`, and the app bundle carries its framework (`Contents/Frameworks/`), without
+the XPC services only sandboxed apps need. MIT licensed (Copyright (c) 2006-2013 Andy Matuschak and
+others; its own notices are in its `LICENSE`, also in the bundle's `Licenses/`).
+
 ## LLVM compiler-rt
 
 https://github.com/llvm/llvm-project/tree/main/compiler-rt

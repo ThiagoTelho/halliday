@@ -38,6 +38,9 @@ copy_crate thiserror LICENSE-MIT LICENSE-APACHE
 # openxr-sys (MIT or Apache-2.0) carries no licence file: taken under Apache-2.0, whose text is libc's.
 cp "$(crate_dir libc)/LICENSE-APACHE" "$OUT/openxr-sys-LICENSE-APACHE.txt"
 
+# Sparkle, the updater the app always carries.
+cp reference/sparkle/LICENSE "$OUT/Sparkle-LICENSE.txt"
+
 # The Quest runtime, when the bundle has it.
 if [ -x build/quest/klepton-runner ]; then
     cp reference/klepton-moltenvr/LICENSE "$OUT/Klepton-LICENSE.txt"

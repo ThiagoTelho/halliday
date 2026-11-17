@@ -611,6 +611,18 @@ if !open, passthroughForVideo {
             if self.onHeadset { self.notify("macOS is asking on your Mac's screen: take off the headset to answer", kind: .warning, seconds: 10) }
         }
         Permissions.shared.askerIsElsewhere = { [weak self] in self.map { $0.onHeadset || $0.desktopMode } ?? false }
+        // Updates (opt-in): Sparkle's window would land on the headset's display, so while the headset
+        // is connected an update found is said in the headset and installed from the companion.
+        Updates.shared.onHeadset = Permissions.shared.askerIsElsewhere
+        Updates.shared.bringForward = { [weak self] in
+            guard let self else { return }
+            self.setPointerLock(false)
+            self.pointerEngaged = false
+            self.showCompanion(activating: true)
+            if self.onHeadset { self.notify("Halliday's updater is on your Mac's screen: take off the headset to answer", kind: .warning, seconds: 10) }
+        }
+        Updates.shared.notify = { [weak self] text in self?.notify(text, seconds: 8) }
+        Updates.shared.start(testRun: CommandLine.arguments.contains(where: ["--no-activate", "--keys-snapshot", "--picker-snapshot", "--test-headset", "--no-companion", "--snapshot", "--setup-snapshot"].contains))
         if onHeadset, !testRun { showCompanion(activating: false) }
         // Setup not done (the first launch): the companion opens on it, and the headset says to
         // take it off and go to the Mac. Otherwise a permission missing is asked for at once, in

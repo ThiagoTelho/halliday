@@ -17,7 +17,7 @@ REMAP      := RUSTFLAGS="--remap-path-prefix=$(HOME)=~" CFLAGS="-ffile-prefix-ma
 # C code built by Rust crates (vendored libusb) must target the same macOS as the app.
 export MACOSX_DEPLOYMENT_TARGET := 14.0
 
-.PHONY: all core app run open smoke test lint fmt clean openxr openxr-check openxr-metal-check klepton quest-libs unzl vrclient vrtest release dmg notarize
+.PHONY: all core app run open smoke test lint fmt clean openxr openxr-check openxr-metal-check klepton quest-libs unzl vrclient vrtest release dmg notarize appcast publish
 
 all: app
 
@@ -48,14 +48,24 @@ vrtest:
 	cd core/halliday-vrclient && cargo build --release -p halliday-vrtest
 	cp core/halliday-vrclient/target/x86_64-pc-windows-msvc/release/vrtest.exe $(BUILD)/vrtest.exe
 
-$(BUILD)/halliday: $(SWIFT_SRCS) $(CORE_LIB) core/halliday-core/include/halliday_core.h app/Sources/CHallidayCore/module.modulemap app/Sources/CVirtualDisplay/CGVirtualDisplay.h
+# Sparkle, the updater (opt-in update checks; Updates.swift), fetched pinned by tools/fetch-sparkle.sh.
+SPARKLE := reference/sparkle/Sparkle.framework
+$(SPARKLE): tools/fetch-sparkle.sh
+	tools/fetch-sparkle.sh
+	@touch $@
+
+# The app finds Sparkle in its bundle's Frameworks; build/halliday run alone (make smoke, make run)
+# in reference/sparkle.
+$(BUILD)/halliday: $(SWIFT_SRCS) $(CORE_LIB) $(SPARKLE) core/halliday-core/include/halliday_core.h app/Sources/CHallidayCore/module.modulemap app/Sources/CVirtualDisplay/CGVirtualDisplay.h
 	@mkdir -p $(BUILD)
 	swiftc $(SWIFTFLAGS) -swift-version 6 -target $(TARGET) \
 		-I app/Sources/CHallidayCore -I app/Sources/CVirtualDisplay -L core/target/release \
+		-F reference/sparkle -framework Sparkle \
+		-Xlinker -rpath -Xlinker @executable_path/../Frameworks -Xlinker -rpath -Xlinker @executable_path/../reference/sparkle \
 		-framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework ApplicationServices -framework WebKit -framework AVFoundation -framework CoreGraphics -framework IOKit -framework CoreFoundation -framework Security \
 		$(SWIFT_SRCS) -o $@
 
-$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns docs/extensions.md $(wildcard extensions/example/*)
+$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns app/Halliday-dev.entitlements docs/extensions.md $(wildcard extensions/example/*)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp app/Info.plist $(APP)/Contents/Info.plist
 	cp app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns $(APP)/Contents/Resources/
@@ -67,8 +77,15 @@ $(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licen
 	if [ -d $(BUILD)/quest ]; then mkdir -p $(APP)/Contents/Resources/quest && cp -f $(BUILD)/quest/* $(APP)/Contents/Resources/quest/; fi
 	@# The licences of everything the bundle carries (THIRD-PARTY.md says what each is).
 	tools/collect-licenses.sh $(APP)/Contents/Resources/Licenses
+	@# Sparkle, without its XPC services (only sandboxed apps need them), each part signed inside out.
+	rm -rf $(APP)/Contents/Frameworks && mkdir -p $(APP)/Contents/Frameworks
+	ditto $(SPARKLE) $(APP)/Contents/Frameworks/Sparkle.framework
+	rm -rf $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices $(APP)/Contents/Frameworks/Sparkle.framework/XPCServices
+	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
+	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app
+	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework
 	cp $(BUILD)/halliday $(APP)/Contents/MacOS/halliday
-	codesign --force --options runtime --entitlements app/Halliday.entitlements --sign "$(SIGN_ID)" $(APP)
+	codesign --force --options runtime --entitlements app/Halliday-dev.entitlements --sign "$(SIGN_ID)" $(APP)
 
 app: $(APP)
 
@@ -161,6 +178,15 @@ dmg:
 
 notarize:
 	tools/notarize.sh
+
+# Sparkle's update feed for the notarized DMG, signed with the releaser's key (tools/make-appcast.sh).
+appcast:
+	tools/make-appcast.sh
+
+# The GitHub release with the DMG and the feed (tools/publish.sh): NOTES=FILE, the release's notes.
+publish:
+	@test -n "$(NOTES)" || { echo "make publish NOTES=FILE"; exit 1; }
+	tools/publish.sh "$(NOTES)"
 
 # A Metal session against the runtime: a pattern fixed to the room, both eyes, into Halliday (or
 # `halliday-probe game-host`), which must be running. FRAMES=n for how long (120).

@@ -15,9 +15,9 @@
 	<key>CFBundlePackageType</key>
 	<string>APPL</string>
 	<key>CFBundleVersion</key>
-	<string>0.1.0</string>
+	<string>0.1.1</string>
 	<key>CFBundleShortVersionString</key>
-	<string>0.1.0</string>
+	<string>0.1.1</string>
 	<key>LSMinimumSystemVersion</key>
 	<string>14.0</string>
 	<key>NSRemovableVolumesUsageDescription</key>
@@ -30,6 +30,18 @@
 	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<!-- Updates (Sparkle, Updates.swift): opt-in. Off until the person turns them on; nothing about the
+	     Mac is sent with a check; an update must carry this key's signature and the Developer ID's. -->
+	<key>SUFeedURL</key>
+	<string>https://github.com/ThiagoTelho/halliday/releases/latest/download/appcast.xml</string>
+	<key>SUEnableAutomaticChecks</key>
+	<false/>
+	<key>SUEnableSystemProfiling</key>
+	<false/>
+	<key>SUAllowsAutomaticUpdates</key>
+	<false/>
+	<key>SUPublicEDKey</key>
+	<string>NOdZ2F4KkQu5w1yox9Nk5Yu2HEpUkbi2L3sNosAYPUg=</string>
 	<key>NSAppleEventsUsageDescription</key>
 	<string>Halliday's Music panel shows and controls what Music or Spotify is playing while you are in VR.</string>
 	<key>NSHighResolutionCapable</key>

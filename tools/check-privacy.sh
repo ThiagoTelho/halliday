@@ -20,6 +20,11 @@
 #   ExtensionFromGitHub.swift  (the whole file) an extension the user asked for by pasting its
 #                        GitHub link: that repository's archive, fetched once from github.com
 #                        (codeload.github.com, nothing else), no cookies, at most 25 MB.
+#   Updates.swift        (the whole file) Sparkle, the updater, only once the user turned on update
+#                        checks (setup or the companion; off until then) or asked for one: the
+#                        latest release's appcast.xml from github.com, then, with the user's yes,
+#                        that release's DMG. Nothing about the user or the Mac is sent
+#                        (SUEnableSystemProfiling off). Sparkle may be used nowhere else.
 # (VideoPlayer's "Watch in VR" plays a page's video from that site through AVFoundation's AVURLAsset,
 # with no network code of Halliday's own.)
 set -eu
@@ -35,13 +40,15 @@ allowed() {
         app/Sources/Halliday/QuestAppFiles.swift:*) return 0 ;;
         # (every line of it: one session, one download, its redirects kept to GitHub)
         app/Sources/Halliday/ExtensionFromGitHub.swift:*) return 0 ;;
+        # (every line of it: the updater, opt-in)
+        app/Sources/Halliday/Updates.swift:*) return 0 ;;
     esac
     return 1
 }
 
 status=0
 # Network APIs in the Swift app and the Rust core (comment lines are skipped).
-hits=$(grep -rnE 'URLSession|NWConnection|NWListener|NWBrowser|CFStream|CFSocket|URLRequest[(]|import Network|reqwest|hyper::|TcpStream|UdpSocket|std::net' \
+hits=$(grep -rnE 'import Sparkle|SPU[A-Za-z]*Updater|URLSession|NWConnection|NWListener|NWBrowser|CFStream|CFSocket|URLRequest[(]|import Network|reqwest|hyper::|TcpStream|UdpSocket|std::net' \
     app/Sources core/*/src) || [ $? -eq 1 ] || { echo "privacy check: grep failed" >&2; exit 2; }
 # The scripts Halliday puts into web pages talk only to Halliday, never to the network.
 js=$(grep -nE 'fetch[(]|XMLHttpRequest|WebSocket|sendBeacon|EventSource|new Image[(]' app/Resources/*.js) \

@@ -6,7 +6,8 @@ A VR headset sees more of you than any other device: where you look, how you mov
 around you, how tall you are, how your hands shake. Many VR platforms send that to their makers.
 Halliday is built the other way around. It has no servers, no accounts and no analytics. It never
 sends anything about you anywhere. The only connections it makes are the ones you start, to
-services you chose, and what you share with them is between you and them.
+services you chose, and what you share with them is between you and them. The one exception is
+yours to turn on: a daily check for a newer Halliday, off unless you say yes.
 
 This page says exactly what that means, and how the code keeps it true.
 
@@ -14,7 +15,8 @@ This page says exactly what that means, and how the code keeps it true.
 
 - No analytics, telemetry, usage statistics or "anonymous" counters.
 - No crash reports of its own (macOS's own crash reporting is yours to set in System Settings).
-- No accounts, no sign-in, no ads, no update checks, no servers of any kind.
+- No accounts, no sign-in, no ads, no servers of any kind, and no update checks unless you turn
+  them on (below).
 - Nothing from the headset leaves your Mac. Head tracking is computed on the Mac, used for the
   frame being drawn and dropped. Halliday doesn't read the headset's eye tracking. It reads the
   headset's cameras for two things, both on your Mac only: to find the controllers (of each
@@ -41,6 +43,7 @@ Everything Halliday keeps is a plain file in your user folder. Nothing is synced
 | Halliday's volume (videos, Quest apps, its own sounds) | `~/Library/Application Support/Halliday/Quest/volume`, and Halliday's preferences |
 | Pointing a game's Wine prefix at that runtime, only when you ask (in Games, or `halliday --install-openvr`): one file, and a copy of the one it replaces, which Undo puts back. Games reads GameHub's list of games and its Steam library folder to find your VR games; it changes nothing of GameHub's | `drive_c/users/*/AppData/Local/openvr/openvrpaths.vrpath` in that prefix |
 | MKV files repacked for playing | `~/Library/Caches/Halliday/Repacked/` |
+| Whether update checks are on and when the last one was; an update you chose to install, until it is in place | Halliday's preferences, and `~/Library/Caches/app.halliday.Halliday/org.sparkle-project.Sparkle/` |
 | Cookies and data of the sites you visit (as in any browser) | WebKit's store for Halliday, under `~/Library/WebKit/` and `~/Library/Caches/` |
 | A log of what Halliday did, for fixing problems (app names and window titles, the hosts of VR pages, notices, which programs used the GPU) | `~/Library/Logs/Halliday.log`, and the run before as `Halliday.previous.log` |
 | Headset recordings, only if you make one with `halliday-probe -r` | where you choose |
@@ -101,6 +104,14 @@ on your Mac.
 - **WebKit**, the engine of Halliday's browser and of Safari, may check addresses against lists of
   fraudulent sites through Apple. That is part of macOS, not of Halliday.
 - **ffmpeg**, if you install it for MKV files, runs on your Mac and doesn't go online.
+- **Updates**, only if you ask: setup asks once whether Halliday should check for updates
+  automatically, and the answer is no until you say yes (you can change it any time in the
+  companion's Overview, or check once from the app menu's "Check for Updates…"). A check asks
+  GitHub for the latest release's update feed; GitHub sees that request, as it would from your
+  browser. Nothing about you or your Mac goes with it (the updater, Sparkle, can send a profile of
+  the Mac, and Halliday turns that off). When an update is found, Halliday asks you first, then
+  downloads it from GitHub and installs it only if it carries both its own signature and Apple's
+  notarization.
 
 ## How this is kept true
 

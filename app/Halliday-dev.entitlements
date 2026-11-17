@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Halliday in development builds only: app/Halliday.entitlements, plus library validation off.
+  Signed with the local "Halliday Dev" identity, which has no Team ID, the hardened runtime would
+  refuse the app's own Sparkle framework. Releases (tools/release.sh) sign the app and Sparkle with
+  one team's Developer ID and use app/Halliday.entitlements, with library validation on.
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+	<key>com.apple.security.cs.disable-library-validation</key>
+	<true/>
+</dict>
+</plist>

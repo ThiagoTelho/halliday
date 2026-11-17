@@ -422,6 +422,7 @@ private struct FactRow: View {
 private struct OverviewPane: View {
     @ObservedObject var model: CompanionModel
     @ObservedObject var permissions = Permissions.shared
+    @ObservedObject var updates = Updates.shared
     var body: some View {
         let s = model.status
         if !Setup.shared.done {
@@ -482,6 +483,27 @@ private struct OverviewPane: View {
                 }
             }
             .controlSize(.large)
+        }
+        CompanionCard(title: "Updates") {
+            FactRow(symbol: "app.badge", title: "Halliday", value: "Version \(updates.version)")
+            Toggle(isOn: Binding(get: { updates.automatic }, set: { updates.setAutomatic($0) })) {
+                VStack(alignment: .leading, spacing: 3) {
+                    Text("Check for updates automatically")
+                    Text("Once a day, from GitHub. Nothing about you or this Mac is sent, and nothing installs without your yes.")
+                        .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+                }
+            }
+            .toggleStyle(.switch)
+            if let found = updates.waiting {
+                HStack(spacing: 10) {
+                    Label("Halliday \(found) is ready to install", systemImage: "arrow.down.circle.fill").foregroundStyle(companionAccent)
+                    Spacer()
+                    Button("Install…") { updates.checkNow() }.controlSize(.large).buttonStyle(.borderedProminent)
+                }
+            } else {
+                Button { updates.checkNow() } label: { Label("Check for updates", systemImage: "arrow.triangle.2.circlepath") }
+                    .controlSize(.large)
+            }
         }
         Text("Halliday keeps running in the headset with this window closed: click Halliday in the Dock (or Window > Companion) to open it again. Drop an .apk file anywhere here to install it.")
             .font(.callout).foregroundStyle(.secondary)

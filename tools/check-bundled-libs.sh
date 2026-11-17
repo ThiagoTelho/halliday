@@ -8,8 +8,9 @@ status=0
 while IFS= read -r -d '' f; do
     file -b "$f" | grep -q "Mach-O" || continue
     # Linked libraries other than the binary's own install name.
-    own=$(otool -D "$f" 2>/dev/null | sed -n 2p)
-    bad=$(otool -L "$f" 2>/dev/null | tail -n +2 | awk '{print $1}' | grep -v -x -F "${own:-none}" \
+    own=$(otool -D "$f" 2>/dev/null | grep -v ':$' | head -1)
+    # (A universal binary lists each architecture under a header line ending in ':'.)
+    bad=$(otool -L "$f" 2>/dev/null | grep -v ':$' | awk '{print $1}' | grep -v -x -F "${own:-none}" \
         | grep -v -E '^(/System/|/usr/lib/|@executable_path/|@loader_path/|@rpath/)' || true)
     if [ -n "$bad" ]; then
         echo "$f loads a library from outside the bundle:"; echo "$bad" | sed 's/^/    /'; status=1
