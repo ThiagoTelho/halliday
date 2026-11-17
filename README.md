@@ -35,17 +35,25 @@
 
 ## Why
 
-Macs are powerful enough for virtual reality, and good headsets exist, but the two have never
-met. There is no VR runtime for macOS, and the platforms that exist elsewhere tie you to one
-company's store, account and data collection.
+Halliday started with [GAV PSVR2 Player](https://github.com/GAVProject/gav-psvr2-player-mac), a
+native macOS app that already plays VR video on the PlayStation VR2. I used it, and I wanted
+more than a video player: my Mac's apps around me, the web in VR and games, in one place, the
+way SteamVR gathers everything VR on Windows. I couldn't find that for the Mac, so I started
+putting it together.
 
-Halliday is a VR platform built for the Mac, in the open:
+Halliday isn't built from scratch, and it isn't the first open VR software to reach the Mac.
+It talks to the headset with knowledge from the open-source PS VR2 driver in
+[Monado](https://gitlab.freedesktop.org/monado/monado), whose authors reverse-engineered Sony's
+protocol. GAV PSVR2 Player showed how to drive the headset well on macOS, and
+[PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit) supplied the commands that turn
+on its cameras. Halliday ports what it uses from these projects (see [Credits](#credits)) and
+builds the rest on top:
 
 - **Your Mac, around you.** Your apps as large floating windows, a browser made for VR, and a
   player for 360° and 3D video, in a calm place of your choosing.
-- **Your headset, set free.** The PlayStation VR2 is an excellent headset that only works with a
-  PlayStation or a Windows PC. Halliday drives it directly from macOS, through Sony's PC adapter:
-  no kernel extension, no root.
+- **The PS VR2 on macOS.** Sony supports the headset only on a PlayStation or a Windows PC. Like
+  GAV PSVR2 Player, Halliday drives it from macOS through Sony's PC adapter, with no kernel
+  extension and no root.
 - **Yours, and only yours.** No account, no store, no tracking. See [Privacy](#privacy).
 - **VR games on the Mac.** Windows VR games installed through GameHub run under Wine with
   Halliday as their VR runtime, in place of SteamVR. Quest apps you own run natively on Apple
@@ -79,7 +87,7 @@ player with **Watch in VR**.
 360°, 180°, fisheye and flat; 2D or 3D, side by side or top and bottom. Your videos are a wall of
 large pictures that come alive under the pointer, with how far you watched and what is left.
 Subtitles (from the file or an `.srt` beside it), audio tracks, HDR, MKV through ffmpeg, a seek
-bar that previews the picture, zoom and tilt, *Continue watching*, and the next video of the
+bar that previews the picture, a screen you can make larger or smaller and tilt, *Continue watching*, and the next video of the
 folder at the end. Videos made for passthrough (a green, blue or black backdrop, or a mask in the
 frame) can put the room behind the picture, with the backdrop found in the video by itself.
 
@@ -175,9 +183,10 @@ needed, seated or standing and the place to stand in, and the controls you'll us
 
 ### The headset itself
 
-Halliday speaks the PS VR2's USB protocol. It tracks the head from the headset's own inside-out
-tracking and its 2000 Hz gyroscope, and predicts it to the moment each row of the panel lights up.
-It corrects for the lenses' distortion and colour fringes, and turns the picture once more for the
+Halliday talks to the PS VR2 over USB with the protocol from Monado's driver. It tracks the head
+from the headset's own inside-out tracking and its 2000 Hz gyroscope, and predicts it to the
+moment each row of the panel lights up, as GAV PSVR2 Player does. It corrects for the lenses'
+distortion and colour fringes with Monado's formulas, and turns the picture once more for the
 newest head pose just before it goes out (late latching). The Sense controllers connect over
 Bluetooth. The headset's cameras see their LEDs, pulsed in step with each exposure, and Halliday
 fuses what they see with each controller's accelerometer, so the hands keep their place between
@@ -226,8 +235,8 @@ through the headset, curved panels, and comfort tuning of sizes and distances.
                               └─◄─► libhalliday_openxr.dylib (Rust): OpenXR apps, Quest apps through Klepton
 ```
 
-- **The headset** is driven directly. Halliday speaks its USB protocol (from the open
-  reverse-engineering work credited below), reads the 6DoF pose that its cameras compute and its
+- **The headset** is driven directly. Halliday speaks its USB protocol (ported from Monado's
+  PS VR2 driver, credited below), reads the 6DoF pose that its cameras compute and its
   IMU, and draws both eyes pre-distorted for the lenses. macOS sees the headset as an ordinary
   4000 × 2040 display at 90 or 120 Hz.
 - **Windows games** under Wine load `vrclient_x64.dll`, Halliday's OpenVR runtime, built on the Mac
@@ -241,8 +250,8 @@ through the headset, curved panels, and comfort tuning of sizes and distances.
   ([HeadsetAdapter.swift](app/Sources/Halliday/HeadsetAdapter.swift)), with its driver in the
   core. The PS VR2 is the first. Adding a headset means a driver and an adapter, not changes
   across the app: the file's header says how.
-- **OpenXR applications** load `libhalliday_openxr.dylib`, a real OpenXR runtime for macOS with
-  Metal swapchains, through the Khronos loader or directly. Klepton's MoltenVR fork loads it to
+- **OpenXR applications** load `libhalliday_openxr.dylib`, Halliday's own OpenXR runtime for
+  macOS with Metal swapchains, through the Khronos loader or directly. Klepton's MoltenVR fork loads it to
   run Quest apps.
 
 ## Privacy
@@ -373,13 +382,24 @@ time, test hardware and Apple's developer membership, which signs and notarizes 
 
 ## Credits
 
-Halliday stands on the reverse-engineering work of the
-[Monado](https://gitlab.freedesktop.org/monado/monado) PS VR2 driver authors,
-[GAV PSVR2 Player for macOS](https://github.com/GAVProject/gav-psvr2-player-mac) and
-[PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit). Its OpenVR runtime follows Valve's
-[OpenVR](https://github.com/ValveSoftware/openvr) headers, and Quest apps run through
-[Klepton](https://github.com/shinyquagsire23/Klepton) and its
-[MoltenVR fork](https://github.com/armax9/Klepton-MoltenVR). See [THIRD-PARTY.md](THIRD-PARTY.md).
+Halliday is built on other people's open work and wouldn't exist without it:
+
+- **[Monado](https://gitlab.freedesktop.org/monado/monado)'s PS VR2 driver.** Jan Schmidt, Joel
+  Valenciano, Beyley Cardellio, Jarett Millard and others reverse-engineered Sony's protocol.
+  Halliday's headset code is ported from their driver: the USB protocol, the lens correction,
+  and the Sense controllers and their LEDs.
+- **[GAV PSVR2 Player for macOS](https://github.com/GAVProject/gav-psvr2-player-mac)**, by
+  Andrey Gerasimov. It is the native macOS app that inspired Halliday, and the reference for how
+  Halliday handles the display, frame pacing, scan-out and passthrough. Halliday's head
+  prediction and video format detection are ported from it.
+- **[PSVR2Toolkit](https://github.com/BnuuySolutions/PSVR2Toolkit)**, for the commands that turn
+  on the headset's cameras.
+- **[OpenVR](https://github.com/ValveSoftware/openvr)**: Halliday's runtime for Windows games
+  follows Valve's headers.
+- **[Klepton](https://github.com/shinyquagsire23/Klepton)** and its
+  [MoltenVR fork](https://github.com/armax9/Klepton-MoltenVR), which run Quest apps on the Mac.
+
+[THIRD-PARTY.md](THIRD-PARTY.md) lists what comes from each project, with its licence.
 
 Halliday is not affiliated with or endorsed by Sony Interactive Entertainment, Valve, Meta,
 GameSir or GameHub. "PlayStation", "PS VR2", "SteamVR", "Quest" and other product names are
