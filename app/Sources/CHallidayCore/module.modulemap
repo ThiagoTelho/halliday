@@ -1,0 +1,5 @@
+module CHallidayCore {
+    header "../../../core/halliday-core/include/halliday_core.h"
+    link "halliday_core"
+    export *
+}

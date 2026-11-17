@@ -1,0 +1,15 @@
+[package]
+name = "halliday-probe"
+description = "PS VR2 diagnostics: list, inspect, stream, record and replay headset data"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[dependencies]
+halliday-core = { path = "../halliday-core" }
+halliday-bridge = { path = "../halliday-bridge" }
+
+[lints]
+workspace = true

@@ -1,0 +1,29 @@
+# Rust
+/core/target/
+/core/halliday-vrclient/target/
+
+# Swift
+/app/.build/
+/app/.swiftpm/
+/build/
+*.app
+
+# Reference checkouts of other projects (cloned by tools/fetch-reference.sh)
+/reference/
+
+# Recorded headset streams can be large; commit only small fixtures
+/recordings/
+
+.DS_Store
+__pycache__/
+
+# Development documents: local only, never published (plans, roadmap, design rules, research,
+# notes from hardware sessions, guidance for coding agents). Public documentation is README.md,
+# PRIVACY.md, THIRD-PARTY.md and docs/extensions.md.
+/CLAUDE.md
+/docs/ROADMAP.md
+/docs/PLAN.md
+/docs/ui.md
+/docs/first-hardware-session.md
+/docs/upstream-issues.md
+/docs/research/

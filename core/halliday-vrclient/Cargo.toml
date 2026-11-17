@@ -1,0 +1,30 @@
+[package]
+name = "halliday-vrclient"
+description = "Halliday's OpenVR runtime for Windows games under Wine (vrclient_x64.dll)"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ThiagoTelho/halliday"
+publish = false
+
+# Its own workspace: it only builds for Windows (x86_64-pc-windows-msvc, see .cargo/config.toml),
+# while the main workspace builds for the Mac.
+[workspace]
+members = [".", "vrtest"]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+halliday-bridge = { path = "../halliday-bridge" }
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "allow"
+
+[profile.dev]
+panic = "abort"
+
+[profile.release]
+panic = "abort"
+lto = true
+opt-level = 2

@@ -1,0 +1,22 @@
+{
+  "id": "org.example.launcher-adapter",
+  "name": "Example Launcher adapter",
+  "version": "1.0.0",
+  "author": "Example",
+  "description": "Answers the made-up Example VR app's launcher and downloads plugins, and starts its player. A starting point for writing an extension.",
+  "halliday": 1,
+  "apps": ["com.example.vr"],
+  "plugins": {
+    "ExampleLauncher": ["launch", "setUser", "exitData", "acknowledgeExit", "addListener", "removeListener"],
+    "ExampleDownloads": ["start", "cancel", "addListener", "removeListener"]
+  },
+  "network": ["cdn.example.com", "*.content.example.com"],
+  "runner": {
+    "java": [
+      { "method": "getSession", "signature": "()Ljava/lang/String;", "answer": "session" },
+      { "method": "sessionEnded", "signature": "(ILjava/lang/String;)V", "answer": "end" },
+      { "method": "logEvent", "signature": "(ILjava/lang/String;)V", "answer": "ignore" }
+    ]
+  },
+  "main": "main.js"
+}

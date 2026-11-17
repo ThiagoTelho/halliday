@@ -1,0 +1,4 @@
+module CVirtualDisplay {
+    header "CGVirtualDisplay.h"
+    export *
+}

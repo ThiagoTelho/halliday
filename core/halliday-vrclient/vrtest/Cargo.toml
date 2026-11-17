@@ -1,0 +1,14 @@
+[package]
+name = "halliday-vrtest"
+description = "Tests Halliday's OpenVR runtime under Wine: a Direct3D 11 'game' that submits a test pattern"
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+publish = false
+
+[[bin]]
+name = "vrtest"
+path = "src/main.rs"
+
+[lints.rust]
+unsafe_op_in_unsafe_fn = "allow"

@@ -1,0 +1,24 @@
+[package]
+name = "halliday-openxr"
+description = "Halliday's OpenXR runtime (ROADMAP W15): a library the OpenXR loader, or an application, finds through its manifest"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+name = "halliday_openxr"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+openxr-sys = "0.14"
+halliday-bridge = { path = "../halliday-bridge" }
+# The native game side of the bridge to Halliday.app (no USB: the app owns the headset).
+halliday-core = { path = "../halliday-core", default-features = false }
+
+[build-dependencies]
+cc = "1"
+
+[lints]
+workspace = true

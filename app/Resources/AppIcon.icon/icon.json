@@ -1,0 +1,53 @@
+{
+  "fill": {
+    "linear-gradient": [
+      "display-p3:0.45,0.66,1.00,1.00",
+      "display-p3:0.13,0.18,0.66,1.00"
+    ]
+  },
+  "groups": [
+    {
+      "layers": [
+        {
+          "image-name": "lenses.svg",
+          "name": "lenses",
+          "glass": true
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.6
+      },
+      "specular": true
+    },
+    {
+      "layers": [
+        {
+          "image-name": "shell.svg",
+          "name": "shell",
+          "glass": true,
+          "opacity": 0.75
+        }
+      ],
+      "shadow": {
+        "kind": "neutral",
+        "opacity": 0.5
+      },
+      "translucency": {
+        "enabled": true,
+        "value": 0.85
+      },
+      "blur-material": 0.5,
+      "specular": true
+    }
+  ],
+  "supported-platforms": {
+    "squares": [
+      "macOS"
+    ]
+  }
+}

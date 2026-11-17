@@ -1,0 +1,26 @@
+[package]
+name = "halliday-core"
+description = "Headset and controller drivers and tracking for Halliday"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lib]
+# staticlib: linked into the Swift app through the C ABI in include/halliday_core.h
+# rlib: used by Rust tools and tests
+crate-type = ["staticlib", "rlib"]
+
+[lints]
+workspace = true
+
+[features]
+default = ["usb"]
+# USB transport through libusb (built from source by rusb, so no Homebrew libusb is needed).
+usb = ["dep:rusb"]
+
+[dependencies]
+halliday-bridge = { path = "../halliday-bridge" }
+rusb = { version = "0.9.4", features = ["vendored"], optional = true }
+thiserror = "2.0.21"

@@ -1,0 +1,21 @@
+[workspace]
+resolver = "3"
+members = ["halliday-core", "halliday-probe", "halliday-openxr", "halliday-bridge"]
+# Built for Windows on its own (make vrclient).
+exclude = ["halliday-vrclient"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/ThiagoTelho/halliday"
+rust-version = "1.85"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[workspace.lints.clippy]
+all = { level = "warn", priority = -1 }
+
+[profile.release]
+debug = 1

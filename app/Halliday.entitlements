@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Halliday, under the hardened runtime (development builds and releases alike).
+  Only what it needs:
+  - apple-events: the Music panel asks Music or Spotify what is playing (Info.plist's
+    NSAppleEventsUsageDescription says why; macOS asks the person first).
+  Screen Recording and Accessibility are permissions the person grants, not entitlements; USB,
+  Bluetooth HID and the GPU need none outside the App Sandbox, which Halliday doesn't use (it moves
+  other apps' windows and reads the headset directly).
+-->
+<plist version="1.0">
+<dict>
+	<key>com.apple.security.automation.apple-events</key>
+	<true/>
+</dict>
+</plist>

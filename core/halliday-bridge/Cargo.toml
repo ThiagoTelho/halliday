@@ -1,0 +1,11 @@
+[package]
+name = "halliday-bridge"
+description = "The memory Halliday shares with a VR game running under Wine"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+rust-version.workspace = true
+
+[lints]
+workspace = true

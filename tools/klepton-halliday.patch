@@ -1,0 +1,712 @@
+diff --git a/source/Makefile b/source/Makefile
+index ade69cd..5a3f5ed 100644
+--- a/source/Makefile
++++ b/source/Makefile
+@@ -47,7 +47,7 @@ RUNTIME_JNI := runtime/kl_jni.c \
+            runtime/jni/kl_jni_ue4.c runtime/jni/kl_jni_electra.c runtime/jni/kl_jni_fmod.c runtime/jni/kl_jni_jkxr.c \
+            runtime/jni/kl_jni_haptics.c \
+            runtime/jni/kl_jni_firebase.c runtime/jni/kl_jni_vivox.c \
+-           runtime/jni/kl_jni_vertigo.c runtime/jni/kl_jni_ghosttown.c
++           runtime/jni/kl_jni_vertigo.c runtime/jni/kl_jni_ghosttown.c runtime/jni/kl_jni_appsession.c
+ 
+ # The Linux process runtime (runtime/linux/) and its door. Part of what ships:
+ # a Linux guest in the visionOS app is the same code as build/m_linux.
+diff --git a/source/runtime/gfx/kl_moltenvr.mm b/source/runtime/gfx/kl_moltenvr.mm
+index e0bf142..be55f89 100644
+--- a/source/runtime/gfx/kl_moltenvr.mm
++++ b/source/runtime/gfx/kl_moltenvr.mm
+@@ -256,6 +256,8 @@ static void init() {
+  if(initialized)return;
+  setvbuf(stdout,nullptr,_IOLBF,0);
+  char library[4096];snprintf(library,sizeof(library),"%s/Library/Application Support/MoltenVR/bin/libmoltenvr_openxr.dylib",getenv("HOME"));
++ // Halliday: another OpenXR runtime, named by KL_OPENXR_RUNTIME (the path of its library).
++ if(const char *other=getenv("KL_OPENXR_RUNTIME"))snprintf(library,sizeof(library),"%s",other);
+  void *handle=dlopen(library,RTLD_NOW|RTLD_LOCAL);if(!handle){fprintf(stderr,"[moltenvr] %s\n",dlerror());std::exit(2);}
+  auto negotiate=(PFN_xrNegotiateLoaderRuntimeInterface)dlsym(handle,"xrNegotiateLoaderRuntimeInterface");if(!negotiate)std::exit(2);
+  XrNegotiateLoaderInfo li{};li.structType=XR_LOADER_INTERFACE_STRUCT_LOADER_INFO;li.structVersion=1;li.structSize=sizeof(li);li.minInterfaceVersion=li.maxInterfaceVersion=1;li.minApiVersion=XR_MAKE_VERSION(1,0,0);li.maxApiVersion=XR_MAKE_VERSION(1,1,0);
+@@ -383,7 +385,62 @@ static void drawLoading(id<MTLCommandBuffer> cmd,id<MTLTexture> dst,id<MTLTextur
+ static simd_float4x4 poseMatrix(XrPosef pose) {
+  auto q=pose.orientation;auto m=simd_matrix4x4(simd_quaternion(q.x,q.y,q.z,q.w));m.columns[3]={pose.position.x,pose.position.y,pose.position.z,1};return m;
+ }
++// Halliday (KL_MOLTENVR_PANEL_DUMP=DIR): each of the guest's panels as the guest drew it,
++// saved once (about five seconds in, and again at thirty) as DIR/panel-<layer>-<n>.ppm
++// (colors) and -alpha.pgm, with what the layer says of itself in the log. For a panel that
++// shows wrong: whether its texture is wrong, or what is made of it.
++extern "C" void *kl_vulkan_debug_rt(int,int*,int*);
++static void dumpPanels(id<MTLCommandBuffer> cmd) {
++ const char *dir=getenv("KL_MOLTENVR_PANEL_DUMP");if(!dir||!*dir)return;
++ static unsigned calls=0;static int round=0;calls++;
++ static unsigned first=getenv("KL_MOLTENVR_PANEL_DUMP_AT")?unsigned(atoi(getenv("KL_MOLTENVR_PANEL_DUMP_AT"))):600;
++ if(!((round==0&&calls>=first)||(round==1&&calls>=3600)))return;
++ int n=round++;
++ for(int i=0;i<64;i++) {
++  int w=0,h=0;id<MTLTexture> texture=(__bridge id<MTLTexture>)kl_vulkan_debug_rt(i,&w,&h);if(!texture||w<1000||texture.textureType!=MTLTextureType2D)continue;
++  MTLPixelFormat f=texture.pixelFormat;bool bgra=f==MTLPixelFormatBGRA8Unorm||f==MTLPixelFormatBGRA8Unorm_sRGB;
++  fprintf(stderr,"[moltenvr] panel dump %d: guest target %d %lux%lu format %lu\n",n,i,(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)f);
++  if(!bgra&&f!=MTLPixelFormatRGBA8Unorm&&f!=MTLPixelFormatRGBA8Unorm_sRGB)continue;
++  NSUInteger tw=texture.width,th=texture.height,stride=tw*4;
++  id<MTLBuffer> buffer=[device newBufferWithLength:stride*th options:MTLResourceStorageModeShared];if(!buffer)continue;
++  id<MTLBlitCommandEncoder> blit=[cmd blitCommandEncoder];[blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(tw,th,1) toBuffer:buffer destinationOffset:0 destinationBytesPerRow:stride destinationBytesPerImage:stride*th];[blit endEncoding];
++  std::string base=std::string(dir)+"/target-"+std::to_string(i)+"-"+std::to_string(n);
++  [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
++   const uint8_t *px=(const uint8_t*)buffer.contents;
++   FILE *c=fopen((base+".ppm").c_str(),"wb"),*a=fopen((base+"-alpha.pgm").c_str(),"wb");
++   if(c&&a) {
++    fprintf(c,"P6\n%lu %lu\n255\n",(unsigned long)tw,(unsigned long)th);fprintf(a,"P5\n%lu %lu\n255\n",(unsigned long)tw,(unsigned long)th);
++    for(NSUInteger k=0;k<tw*th;k++){const uint8_t *p=px+k*4;uint8_t rgb[3]={p[bgra?2:0],p[1],p[bgra?0:2]};fwrite(rgb,1,3,c);fwrite(p+3,1,1,a);}
++   }
++   if(c)fclose(c);if(a)fclose(a);
++  }];
++ }
++ for(int i=0;i<kl_ovrp_overlay_count();i++) {
++  kl_ovrp_overlay ov{};if(!kl_ovrp_overlay_get(i,&ov))continue;
++  int w=0,h=0;void *t=kl_vulkan_layer_mtl_texture(ov.layer_id,ov.stage,0,&w,&h);if(!t)t=kl_glfb_layer_mtl_texture(ov.layer_id,ov.stage,&w,&h);if(!t&&ov.tex)t=kl_vulkan_mtl_for_handle(ov.tex);
++  id<MTLTexture> texture=(__bridge id<MTLTexture>)t;
++  fprintf(stderr,"[moltenvr] panel dump %d: layer %d shape %d stage %d texture %s %lux%lu format %lu type %lu mips %lu, viewport %d,%d %dx%d, size %.2fx%.2f m\n",n,ov.layer_id,ov.shape,ov.stage,texture?"found":"MISSING",(unsigned long)texture.width,(unsigned long)texture.height,(unsigned long)texture.pixelFormat,(unsigned long)texture.textureType,(unsigned long)texture.mipmapLevelCount,ov.viewport[0][0],ov.viewport[0][1],ov.viewport[0][2],ov.viewport[0][3],ov.size[0],ov.size[1]);
++  if(!texture)continue;
++  MTLPixelFormat f=texture.pixelFormat;bool bgra=f==MTLPixelFormatBGRA8Unorm||f==MTLPixelFormatBGRA8Unorm_sRGB;
++  if(!bgra&&f!=MTLPixelFormatRGBA8Unorm&&f!=MTLPixelFormatRGBA8Unorm_sRGB)continue;
++  NSUInteger tw=texture.width,th=texture.height,stride=tw*4;
++  id<MTLBuffer> buffer=[device newBufferWithLength:stride*th options:MTLResourceStorageModeShared];if(!buffer)continue;
++  id<MTLBlitCommandEncoder> blit=[cmd blitCommandEncoder];[blit copyFromTexture:texture sourceSlice:0 sourceLevel:0 sourceOrigin:MTLOriginMake(0,0,0) sourceSize:MTLSizeMake(tw,th,1) toBuffer:buffer destinationOffset:0 destinationBytesPerRow:stride destinationBytesPerImage:stride*th];[blit endEncoding];
++  std::string base=std::string(dir)+"/panel-"+std::to_string(ov.layer_id)+"-"+std::to_string(n);
++  [cmd addCompletedHandler:^(id<MTLCommandBuffer>) {
++   const uint8_t *px=(const uint8_t*)buffer.contents;
++   FILE *c=fopen((base+".ppm").c_str(),"wb"),*a=fopen((base+"-alpha.pgm").c_str(),"wb");
++   if(c&&a) {
++    fprintf(c,"P6\n%lu %lu\n255\n",(unsigned long)tw,(unsigned long)th);fprintf(a,"P5\n%lu %lu\n255\n",(unsigned long)tw,(unsigned long)th);
++    for(NSUInteger k=0;k<tw*th;k++){const uint8_t *p=px+k*4;uint8_t rgb[3]={p[bgra?2:0],p[1],p[bgra?0:2]};fwrite(rgb,1,3,c);fwrite(p+3,1,1,a);}
++   }
++   if(c)fclose(c);if(a)fclose(a);
++  }];
++ }
++}
++
+ static void drawPanels(id<MTLCommandBuffer> cmd,id<MTLTexture> dst,int eye,XrPosef head,const XrCompositionLayerProjectionView &view) {
++ if(eye==0)dumpPanels(cmd);
+  if(!panelPipeline) {
+   NSError *error=nil;id<MTLLibrary> lib=[device newLibraryWithSource:[NSString stringWithUTF8String:kl_reproject_overlay_msl()] options:nil error:&error];
+   MTLRenderPipelineDescriptor *pd=[MTLRenderPipelineDescriptor new];pd.vertexFunction=[lib newFunctionWithName:@"kl_ov_v"];pd.fragmentFunction=[lib newFunctionWithName:@"kl_ov_f"];auto a=pd.colorAttachments[0];a.pixelFormat=pixelFormat;a.blendingEnabled=YES;a.sourceRGBBlendFactor=MTLBlendFactorSourceAlpha;a.destinationRGBBlendFactor=MTLBlendFactorOneMinusSourceAlpha;a.sourceAlphaBlendFactor=MTLBlendFactorOne;a.destinationAlphaBlendFactor=MTLBlendFactorOneMinusSourceAlpha;
+@@ -403,12 +460,17 @@ static void drawPanels(id<MTLCommandBuffer> cmd,id<MTLTexture> dst,int eye,XrPos
+  }
+  [enc endEncoding];
+ }
++// Halliday: the eye pictures keep their alpha while the guest wants the room behind them
++// (set once a frame from kl_openxr_passthrough_wanted).
++extern "C" int kl_openxr_passthrough_wanted(void);
++static bool eyeAlphaKept=false;
+ static void draw(id<MTLCommandBuffer> cmd,id<MTLTexture> dst,id<MTLTexture> src,int eye,int slice,const kl_ovrp_render_pose *record,const kl_ovrp_overlay *overlay=nullptr,const XrFovf *nativeFov=nullptr,const XrQuaternionf *displayRotation=nullptr) {
+  MTLRenderPassDescriptor *rp=[MTLRenderPassDescriptor renderPassDescriptor];rp.colorAttachments[0].texture=dst;rp.colorAttachments[0].loadAction=MTLLoadActionClear;rp.colorAttachments[0].storeAction=MTLStoreActionStore;rp.colorAttachments[0].clearColor=MTLClearColorMake(.015,.02,.035,1);
+  id<MTLRenderCommandEncoder> enc=[cmd renderCommandEncoderWithDescriptor:rp];
+  if(src) {
+   if(src.device.registryID!=device.registryID){fprintf(stderr,"[moltenvr] guest and runtime use different GPUs\n");std::exit(2);}
+   struct Params {simd_float4 rect,uvmap;uint32_t slice,flip,encode,pad;simd_float4 rotation,rendered,display;uint32_t warp;} p{{0,0,1,1},{0,0,1,1},uint32_t(slice),uint32_t(!kl_glfb_eye_mtl_origin_top_left(eye,record?record->stage:0)),uint32_t(pixelFormat!=MTLPixelFormatBGRA8Unorm_sRGB&&pixelFormat!=MTLPixelFormatRGBA8Unorm_sRGB),0};
++  if(eyeAlphaKept&&!overlay)p.pad=1;
+   if(record&&record->viewport[eye][2]>0&&record->viewport[eye][3]>0) {
+    float w=record->viewport_of[0]>0?record->viewport_of[0]:src.width,h=record->viewport_of[1]>0?record->viewport_of[1]:src.height;
+    p.rect={record->viewport[eye][0]/w,record->viewport[eye][1]/h,record->viewport[eye][2]/w,record->viewport[eye][3]/h};
+@@ -506,6 +568,20 @@ extern "C" int kl_view_main(const char *,int) {
+   if(!running){if(std::chrono::steady_clock::now()-started>std::chrono::seconds(90)){fprintf(stderr,"[moltenvr] headset/session timeout\n");break;}usleep(10000);continue;}
+   XrFrameWaitInfo wi{XR_TYPE_FRAME_WAIT_INFO};XrFrameState fs{XR_TYPE_FRAME_STATE};xrcheck(api.xrWaitFrame(session,&wi,&fs),"wait frame");XrFrameBeginInfo bi{XR_TYPE_FRAME_BEGIN_INFO};xrcheck(api.xrBeginFrame(session,&bi),"begin frame");
+   XrSpace base=(haveStage&&kl_ovrp_tracking_origin()!=0)?stageSpace:localSpace;
++  // Halliday (KL_MOLTENVR_LOCAL_FLOOR): the guest's world is one whose y = 0 is the floor
++  // (kl_ovrp.c, "where an EYE-LEVEL origin is"; an OpenXR guest's STAGE is that world as it
++  // is), and LOCAL has the head at y = 0: a guest's scene stood a head's height too high,
++  // its floor above the eyes. So the poses are taken in LOCAL lowered to the floor: where
++  // the wearer was and faced when the session began, at the floor's height.
++  static XrSpace floorSpace{};
++  if(!floorSpace&&haveStage&&getenv("KL_MOLTENVR_LOCAL_FLOOR")) {
++   XrSpaceLocation rel{XR_TYPE_SPACE_LOCATION};
++   if(XR_SUCCEEDED(api.xrLocateSpace(localSpace,stageSpace,fs.predictedDisplayTime,&rel))&&(rel.locationFlags&XR_SPACE_LOCATION_POSITION_VALID_BIT)) {
++    XrReferenceSpaceCreateInfo fi{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};fi.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL;fi.poseInReferenceSpace.orientation.w=1;fi.poseInReferenceSpace.position.y=-rel.pose.position.y;
++    if(XR_SUCCEEDED(api.xrCreateReferenceSpace(session,&fi,&floorSpace)))fprintf(stderr,"[moltenvr] poses taken in LOCAL lowered to the floor, %.3f m under where the head began\n",rel.pose.position.y);
++   }
++  }
++  if(floorSpace)base=floorSpace;
+   XrSpaceLocation head{XR_TYPE_SPACE_LOCATION};
+   XrViewLocateInfo vl{XR_TYPE_VIEW_LOCATE_INFO};vl.viewConfigurationType=XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO;vl.displayTime=fs.predictedDisplayTime;vl.space=base;XrViewState vs{XR_TYPE_VIEW_STATE};XrView views[2]={{XR_TYPE_VIEW},{XR_TYPE_VIEW}};uint32_t n=0;xrcheck(api.xrLocateViews(session,&vl,&vs,2,&n,views),"views");
+   bool tracked=kl_stereo_head(views,n,vs.viewStateFlags,&head.pose);
+@@ -576,11 +652,20 @@ extern "C" int kl_view_main(const char *,int) {
+    }
+    static bool said=false;if(!said){said=true;fprintf(stderr,"[moltenvr] eye-image order exchanged (Syberia stereo test)\n");}
+   }
++  // Halliday: a projection layer's own rectangle (subImage.imageRect) is the part of the
++  // texture that holds the picture. A guest that scales its resolution with the load draws
++  // into a corner and names it; read whole, the eye showed that corner squeezed with stale
++  // frames beside it (seen with an engine that scales its resolution).
++  if(projectionCount>0)for(int e=0;e<2;e++){const float *r=projections[0].rect[e];if(r[2]>r[0]&&r[3]>r[1]){
++   record.viewport_of[0]=record.viewport_of[1]=16384;
++   record.viewport[e][0]=int(lroundf(r[0]*16384));record.viewport[e][1]=int(lroundf(r[1]*16384));
++   record.viewport[e][2]=int(lroundf((r[2]-r[0])*16384));record.viewport[e][3]=int(lroundf((r[3]-r[1])*16384));}}
+   bool image=sources[0]&&sources[1];if(image&&!reported){fprintf(stderr,"[moltenvr] first stereo image: %lux%lu, type %lu, projection layers %d\n",(unsigned long)sources[0].width,(unsigned long)sources[0].height,(unsigned long)sources[0].textureType,projectionCount);reported=true;}
+   XrCompositionLayerProjectionView pv[2]={{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+   XrCompositionLayerQuad quads[32]{}; int quadCount=0;
+   std::vector<XrSwapchain> panelReleases;
+   bool render=fs.shouldRender&&tracked&&n==2;
++  eyeAlphaKept=kl_openxr_passthrough_wanted()!=0;
+   if(render) {
+    id<MTLTexture> video=loadingVideo();
+    unsigned visualShot=getenv("KL_VISUAL_TURN_PROBE")?kl_visual_probe_shot():0;
+@@ -662,7 +747,8 @@ extern "C" int kl_view_main(const char *,int) {
+    for(auto chain:panelReleases){XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};xrcheck(api.xrReleaseSwapchainImage(chain,&ri),"panel release");}
+    for(auto &chain:eyes){XrSwapchainImageReleaseInfo ri{XR_TYPE_SWAPCHAIN_IMAGE_RELEASE_INFO};xrcheck(api.xrReleaseSwapchainImage(chain.handle,&ri),"release image");}if(image)++pictures;
+   }
+-  XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};layer.space=base;layer.viewCount=2;layer.views=pv;std::vector<const XrCompositionLayerBaseHeader*> layers{(XrCompositionLayerBaseHeader*)&layer};for(int i=0;i<quadCount;i++)layers.push_back((XrCompositionLayerBaseHeader*)&quads[i]);XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};ei.displayTime=fs.predictedDisplayTime;ei.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;ei.layerCount=render?layers.size():0;ei.layers=render?layers.data():nullptr;xrcheck(api.xrEndFrame(session,&ei),"end frame");
++  XrCompositionLayerProjection layer{XR_TYPE_COMPOSITION_LAYER_PROJECTION};layer.space=base;layer.viewCount=2;layer.views=pv;
++  if(eyeAlphaKept)layer.layerFlags|=XR_COMPOSITION_LAYER_BLEND_TEXTURE_SOURCE_ALPHA_BIT;std::vector<const XrCompositionLayerBaseHeader*> layers{(XrCompositionLayerBaseHeader*)&layer};for(int i=0;i<quadCount;i++)layers.push_back((XrCompositionLayerBaseHeader*)&quads[i]);XrFrameEndInfo ei{XR_TYPE_FRAME_END_INFO};ei.displayTime=fs.predictedDisplayTime;ei.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;ei.layerCount=render?layers.size():0;ei.layers=render?layers.data():nullptr;xrcheck(api.xrEndFrame(session,&ei),"end frame");
+   if(++frames%600==0)fprintf(stderr,"[moltenvr] frames %llu, stereo %llu, %.1f Hz, overlays %d\n",(unsigned long long)frames,(unsigned long long)pictures,frequency,kl_ovrp_overlay_count());
+  }}
+  kl_view_pace_stop();for(auto &pair:panels)for(auto &c:pair)if(c.handle)api.xrDestroySwapchain(c.handle);for(auto &c:eyes)api.xrDestroySwapchain(c.handle);for(auto &s:inputs.spaces)api.xrDestroySpace(s);for(auto &s:inputs.aimSpaces)api.xrDestroySpace(s);api.xrDestroySpace(localSpace);if(haveStage)api.xrDestroySpace(stageSpace);api.xrDestroySpace(headSpace);api.xrDestroySession(session);api.xrDestroyActionSet(inputs.set);api.xrDestroyInstance(instance);
+diff --git a/source/runtime/gfx/kl_vulkan.c b/source/runtime/gfx/kl_vulkan.c
+index ebe5bb1..2bfe998 100644
+--- a/source/runtime/gfx/kl_vulkan.c
++++ b/source/runtime/gfx/kl_vulkan.c
+@@ -1878,6 +1878,28 @@ static VkPhysicalDevice klvk_sub_phys(const char *where) {
+ // Failure is not fatal anywhere: the capture path reads the VkImage directly
+ // and does not need this at all. A run with no compositor (every host run today)
+ // simply publishes a texture nobody samples.
++static struct { VkImage img; int w, h; unsigned usage; } g_dbg_rt[64];
++static int g_dbg_rt_n;
++// Halliday, KL_VK_TARGET_VIEWS_AS_ARRAY=1 (off unless asked for): a 2D view of one of the
++// guest's own colour targets that it also samples is made a 2D ARRAY view of one layer.
++// An engine may copy every picture it drew into its swapchain with one shader, which
++// samples a sampler2DArray: its eyes' targets are arrays, its menu panels'
++// plain 2D. A Quest's driver samples a 2D view through an array sampler as layer 0; Metal
++// does not (the type must match), and each menu reached its swapchain as one flat colour,
++// its top left texel: the menus showed grey, with nothing on them. An array view of one
++// layer is the same picture to a render pass, and what the shader asks for.
++static int klvk_target_views_as_array(void) {
++    static int v = -1;
++    if (v < 0) {
++        v = kl_env_on("KL_VK_TARGET_VIEWS_AS_ARRAY", 0);
++    }
++    return v;
++}
++static int klvk_sampled_target(VkImage img) {
++    for (int i = 0; i < g_dbg_rt_n; i++)
++        if (g_dbg_rt[i].img == img) return (g_dbg_rt[i].usage & 0x14u) == 0x14u;   // sampled + colour
++    return 0;
++}
+ static void *eye_mtl_texture(klvk_device *d, VkImage img) {
+     if (!d || !img) return NULL;
+ 
+@@ -2891,6 +2913,15 @@ unsigned long long kl_vulkan_xr_image(unsigned w, unsigned h, unsigned layers,
+     return (uint64_t)(uintptr_t)img;
+ }
+ 
++// Halliday: the guest's own colour targets (the first 64 it made), for looking at what it
++// drew before it reached a swapchain (KL_MOLTENVR_PANEL_DUMP).
++void *kl_vulkan_debug_rt(int i, int *w, int *h) {
++    if (i < 0 || i >= g_dbg_rt_n || !kl_vulkan_guest_active()) return NULL;
++    if (w) *w = g_dbg_rt[i].w;
++    if (h) *h = g_dbg_rt[i].h;
++    return eye_mtl_texture(g_devs[0], g_dbg_rt[i].img);
++}
++
+ // The MTLTexture behind an image this file created, for the compositor seam.
+ // NULL when the export is unavailable — the caller reports it, because only the
+ // caller knows which eye it was about.
+@@ -4613,6 +4644,11 @@ static VkResult VKAPI_CALL klvk_CreateImage(VkDevice dev, const VkImageCreateInf
+         fprintf(stderr, "[TRACE] [thr] createRT %#llx %ux%u fmt %d usage %#x tid=%u\n",
+             (unsigned long long)(uintptr_t)(out?*out:0), ci->extent.width, ci->extent.height,
+             (int)ci->format, ci->usage, klvk_tid());
++    if (r == VK_SUCCESS && out && ci && (ci->usage & 0x10u) && g_dbg_rt_n < 64) {   // Halliday: see kl_vulkan_debug_rt
++        g_dbg_rt[g_dbg_rt_n].img = *out; g_dbg_rt[g_dbg_rt_n].w = (int)ci->extent.width;
++        g_dbg_rt[g_dbg_rt_n].usage = ci->usage;
++        g_dbg_rt[g_dbg_rt_n].h = (int)ci->extent.height; g_dbg_rt_n++;
++    }
+     static int logged;
+     if (logged < 4096 && (r != VK_SUCCESS || (ci && ci->mipLevels > 1) || logged < 64)) {
+         logged++;
+@@ -4744,6 +4780,16 @@ static VkResult VKAPI_CALL klvk_CreateImageView(VkDevice dev,
+     static PFN_vkCreateImageView real;
+     if (!real && real_gdpa)
+         real = (PFN_vkCreateImageView)real_gdpa(dev, "vkCreateImageView");
++    VkImageViewCreateInfo as_array;
++    if (ci && ci->viewType == VK_IMAGE_VIEW_TYPE_2D && ci->subresourceRange.layerCount == 1 &&
++        klvk_target_views_as_array() && klvk_sampled_target(ci->image)) {
++        as_array = *ci;
++        as_array.viewType = VK_IMAGE_VIEW_TYPE_2D_ARRAY;
++        ci = &as_array;
++        static int said;
++        if (!said++) VKI("a 2D view of a colour target the guest samples is made a 2D array view of "
++                         "one layer (KL_VK_TARGET_VIEWS_AS_ARRAY): its copy shader samples an array\n");
++    }
+     if (ci) {
+         static int logged;
+         if (logged < 4096) {   // high enough to capture the crashing view
+@@ -9487,6 +9533,18 @@ static VkResult VKAPI_CALL klvk_CreateShaderModule(VkDevice dev,
+         if(solid){static unsigned told; if(__atomic_fetch_add(&told,1,__ATOMIC_RELAXED)<8) VKI("fragment solid probe: replaced color output in %zu-word module\n",ci->codeSize/4);solid_ci=*ci;solid_ci.pCode=solid;solid_ci.codeSize=solid_nw*4;ci=&solid_ci;}
+     }
+     VkResult r = klvk_CreateShaderModule0(dev, ci, alloc, out);
++    {   // Halliday, KL_VK_SHADER_DUMP=<dir>: every shader module's SPIR-V as it is handed on,
++        // named by its order and handle, to read what a pass that draws wrong does.
++        const char *dump = kl_env_str("KL_VK_SHADER_DUMP", NULL);
++        if (dump && *dump && r == VK_SUCCESS && out && ci && ci->pCode) {
++            static unsigned n;
++            char path[1024];
++            snprintf(path, sizeof path, "%s/shader_%03u_%llx.spv", dump,
++                     __atomic_fetch_add(&n, 1, __ATOMIC_RELAXED), (unsigned long long)(uintptr_t)*out);
++            FILE *f = fopen(path, "wb");
++            if (f) { fwrite(ci->pCode, 1, ci->codeSize, f); fclose(f); }
++        }
++    }
+     if (r == VK_SUCCESS && out && ci && ci->pCode && !(ci->codeSize & 3u) && klvk_vin_on()) {
+         klvk_vin_ent in;
+         if (klvk_spirv_vertex_inputs(ci->pCode, ci->codeSize / 4, &in)) {
+diff --git a/source/runtime/jni/kl_jni_appsession.c b/source/runtime/jni/kl_jni_appsession.c
+new file mode 100644
+index 0000000..5fd3ec9
+--- /dev/null
++++ b/source/runtime/jni/kl_jni_appsession.c
+@@ -0,0 +1,179 @@
++// An app in two halves: an interface (a web application in one activity) that
++// starts a player (a NativeActivity) with a description of what to play. Added
++// for Halliday (ROADMAP W15.3), which hosts the interface itself.
++//
++// The player's library asks its activity for the session and reports back
++// through methods of its own. Which methods, and how each is answered, is not
++// written here: whoever starts the runner says so, in a file named by
++// KL_APP_JAVA, a line per method:
++//
++//   <method> <JNI signature> <answer>
++//
++// with one of these answers (Halliday writes the file from the manifest of
++// the app's extension, docs/extensions.md in Halliday):
++//
++//   session   String: the text of the file named by KL_APP_SESSION
++//   end       void: the session is over; the runner ends, with the method's
++//             first int as its status when it has one (0: as it should)
++//   ignore    void: nothing (logged)
++//   false, true, zero   boolean or int
++//   empty     String: ""
++//
++// Intent.getStringExtra(key) is answered for any app from KL_APP_EXTRAS, a
++// file of `key=value` lines. With none of these set, nothing here answers and
++// the runner behaves as it did.
++#include <pthread.h>
++#include <stdio.h>
++#include <stdlib.h>
++#include <string.h>
++#include <unistd.h>
++#include "guest/kl_driver.h"
++#include "kl_jni_int.h"
++
++static klj_val as_session(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    const char *path = getenv("KL_APP_SESSION");
++    char *text = NULL;
++    if (path) {
++        FILE *f = fopen(path, "rb");
++        if (f) {
++            fseek(f, 0, SEEK_END);
++            long size = ftell(f);
++            fseek(f, 0, SEEK_SET);
++            if (size >= 0 && (text = calloc(1, (size_t)size + 1)) != NULL &&
++                fread(text, 1, (size_t)size, f) != (size_t)size) {
++                free(text);
++                text = NULL;
++            }
++            fclose(f);
++        }
++    }
++    KLJ_LOG("activity: session asked for -> %s (%zu bytes)",
++            text ? path : "no session given (KL_APP_SESSION): empty", text ? strlen(text) : 0);
++    void *s = kl_jni_new_string(text ? text : "");
++    free(text);
++    return (klj_val){.l = s};
++}
++
++// For `end` the status is the first argument when the signature starts with
++// an int; set per binding when the table is read (the impl can't see it).
++static klj_val end_with(int code) {
++    KLJ_LOG("activity: session ended (%d)", code);
++    // On a headset the activity now finishes and the interface comes back.
++    // Here the player is all there is: with its session over, the process ends
++    // too, so whoever started it (Halliday) sees it go instead of an empty
++    // picture.
++    fprintf(stderr, "[halliday] session ended: %s\n", code ? "failed" : "finished");
++    fflush(NULL);
++    _exit(code == 0 ? 0 : 3);
++    return (klj_val){0};
++}
++static klj_val as_end_int(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self;
++    return end_with(n > 0 ? (int)a[0].j : 0);
++}
++static klj_val as_end(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    return end_with(0);
++}
++
++static klj_val as_ignore(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    KLJ_LOG_ONCE("activity: a method answered with nothing (KL_APP_JAVA)");
++    return (klj_val){0};
++}
++static klj_val as_false(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    return (klj_val){.j = 0};
++}
++static klj_val as_true(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    return (klj_val){.j = 1};
++}
++static klj_val as_empty(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self; (void)a; (void)n;
++    return (klj_val){.l = kl_jni_new_string("")};
++}
++
++// The table from KL_APP_JAVA, read once.
++static klj_binding *g_table;
++static int g_count;
++static pthread_once_t g_once = PTHREAD_ONCE_INIT;
++
++static void read_table(void) {
++    const char *path = getenv("KL_APP_JAVA");
++    if (!path || !*path) return;
++    FILE *f = fopen(path, "rb");
++    if (!f) {
++        KLJ_LOG("KL_APP_JAVA: %s can't be read", path);
++        return;
++    }
++    int cap = 0;
++    char line[1024];
++    while (fgets(line, sizeof line, f)) {
++        char method[256], sig[512], answer[32];
++        if (sscanf(line, "%255s %511s %31s", method, sig, answer) != 3) continue;
++        klj_impl fn = NULL;
++        if (strcmp(answer, "session") == 0) fn = as_session;
++        else if (strcmp(answer, "end") == 0) fn = strncmp(sig, "(I", 2) == 0 ? as_end_int : as_end;
++        else if (strcmp(answer, "ignore") == 0) fn = as_ignore;
++        else if (strcmp(answer, "false") == 0 || strcmp(answer, "zero") == 0) fn = as_false;
++        else if (strcmp(answer, "true") == 0) fn = as_true;
++        else if (strcmp(answer, "empty") == 0) fn = as_empty;
++        if (!fn) {
++            KLJ_LOG("KL_APP_JAVA: \"%s\" for %s isn't an answer the runner knows", answer, method);
++            continue;
++        }
++        if (g_count == cap) {
++            cap = cap ? cap * 2 : 8;
++            klj_binding *grown = realloc(g_table, (size_t)cap * sizeof *g_table);
++            if (!grown) break;
++            g_table = grown;
++        }
++        g_table[g_count++] = (klj_binding){"", strdup(method), strdup(sig), fn};
++    }
++    fclose(f);
++    KLJ_LOG("KL_APP_JAVA: %d method%s answered", g_count, g_count == 1 ? "" : "s");
++}
++
++// Intent.getStringExtra(key): what else the interface handed over with the
++// session. KL_APP_EXTRAS names a file of `key=value` lines; a key not in it is
++// null, as on Android. Every key asked for is logged, since which ones the
++// player reads is only known by running it.
++static klj_val as_extra(void *env, void *self, const klj_val *a, int n) {
++    (void)env; (void)self;
++    const char *key = n > 0 ? klj_str(a[0].l) : NULL;
++    const char *path = getenv("KL_APP_EXTRAS");
++    void *found = NULL;
++    if (key && path) {
++        FILE *f = fopen(path, "rb");
++        if (f) {
++            static char line[65536];
++            size_t klen = strlen(key);
++            while (!found && fgets(line, sizeof line, f)) {
++                if (strncmp(line, key, klen) == 0 && line[klen] == '=') {
++                    char *value = line + klen + 1;
++                    value[strcspn(value, "\r\n")] = 0;
++                    found = kl_jni_new_string(value);
++                }
++            }
++            fclose(f);
++        }
++    }
++    KLJ_LOG("Intent.getStringExtra(\"%s\") -> %s", key ? key : "", found ? "given" : "null");
++    return (klj_val){.l = found};
++}
++static const klj_binding k_extra = {"", "getStringExtra", "(Ljava/lang/String;)Ljava/lang/String;", as_extra};
++
++// The activity's class is whatever the driver names it (the manifest's, or
++// the default): the names are matched whatever the class.
++const klj_binding *klj_appsession_binding(const char *cls, const char *name, const char *sig) {
++    (void)cls;
++    if (!name || !sig) return NULL;
++    pthread_once(&g_once, read_table);
++    for (int i = 0; i < g_count; i++)
++        if (strcmp(name, g_table[i].name) == 0 && strcmp(sig, g_table[i].sig) == 0) return &g_table[i];
++    const char *extras = getenv("KL_APP_EXTRAS");
++    if (extras && *extras && strcmp(name, k_extra.name) == 0 && strcmp(sig, k_extra.sig) == 0) return &k_extra;
++    return NULL;
++}
+diff --git a/source/runtime/jni/kl_jni_int.h b/source/runtime/jni/kl_jni_int.h
+index 6fab529..8d5695f 100644
+--- a/source/runtime/jni/kl_jni_int.h
++++ b/source/runtime/jni/kl_jni_int.h
+@@ -209,6 +209,7 @@ const klj_binding *klj_firebase_binding(const char *cls, const char *name, const
+ const klj_binding *klj_vivox_binding(const char *cls, const char *name, const char *sig);
+ const klj_binding *klj_vertigo_binding(const char *cls, const char *name, const char *sig);
+ const klj_binding *klj_ghosttown_binding(const char *cls, const char *name, const char *sig);
++const klj_binding *klj_appsession_binding(const char *cls, const char *name, const char *sig);
+ // The UnityPlayer if a lifecycle call has made it, NULL before — for a caller on
+ // another thread, which must not be the one to make it (kl_jni_softinput.c).
+ void *klj_unity_player_made(void);
+diff --git a/source/runtime/kl_jni.c b/source/runtime/kl_jni.c
+index cd4c9ce..4e6ca17 100644
+--- a/source/runtime/kl_jni.c
++++ b/source/runtime/kl_jni.c
+@@ -1540,6 +1540,7 @@ static const klj_binding *klj_find_binding(const char *cls, const char *name,
+     if (!own) own = klj_vivox_binding(cls, name, sig);
+     if (!own) own = klj_vertigo_binding(cls, name, sig);
+     if (!own) own = klj_ghosttown_binding(cls, name, sig);
++    if (!own) own = klj_appsession_binding(cls, name, sig);
+     if (own) return own;
+     // Exact wins outright across EVERY family table, so the answer does not
+     // depend on which file a class landed in; a loose match is only ever the
+diff --git a/source/runtime/kl_target.c b/source/runtime/kl_target.c
+index 95cf531..5faa589 100644
+--- a/source/runtime/kl_target.c
++++ b/source/runtime/kl_target.c
+@@ -87,6 +87,17 @@ static const kl_target *synthesize(const char *tree, const char *libdir) {
+         snprintf(engine_path,sizeof engine_path,"%s/libUE4.so",libdir);
+         if(access(engine_path,R_OK)==0){t.entry_lib="libUE4";t.kind=KL_GUEST_UE4;t.obb=kl_env_str("KL_GUEST_OBB","obb");}
+     }
++    // Halliday, KL_NATIVE_ACTIVITY_LIB=<name>: an app with no entry in the table whose
++    // manifest starts an android.app.NativeActivity (its `android.app.lib_name`, without
++    // "lib" and ".so"). Whoever starts the runner has read the manifest; it boots as the
++    // native kind, from that library.
++    const char *native = kl_env_str("KL_NATIVE_ACTIVITY_LIB", NULL);
++    if (native && *native) {
++        static char s_entry[256];
++        snprintf(s_entry, sizeof s_entry, "lib%s", native);
++        t.entry_lib = s_entry;
++        t.kind = KL_GUEST_NATIVE;
++    }
+     return &t;
+ }
+ 
+diff --git a/source/runtime/libc/kl_pthread.c b/source/runtime/libc/kl_pthread.c
+index 1b883e6..734a174 100644
+--- a/source/runtime/libc/kl_pthread.c
++++ b/source/runtime/libc/kl_pthread.c
+@@ -1209,6 +1209,45 @@ int klb_pthread_attr_setschedparam(bionic_attr *a, const int32_t *priority) {
+     a->prio = *priority;
+     return 0;
+ }
++// The getter, for Halliday (a Quest app's player reads the priority back before
++// raising it): the same 32-bit field the setter wrote.
++int klb_pthread_attr_getschedparam(const bionic_attr *a, int32_t *priority) {
++    *priority = a->prio;
++    return 0;
++}
++// wcsrtombs, for Halliday (the same library). wchar_t is 32 bits on both sides;
++// bionic's mbstate_t is 4 bytes and Darwin's 128, so the guest's is never handed
++// to Darwin: UTF-8 has no shift state to keep between calls.
++size_t klb_wcsrtombs(char *dst, const uint32_t **src, size_t len, void *ps) {
++    (void)ps;
++    const uint32_t *s = *src;
++    size_t n = 0;
++    for (;; s++) {
++        uint32_t c = *s;
++        char b[4];
++        size_t k;
++        if (c < 0x80) { b[0] = (char)c; k = 1; }
++        else if (c < 0x800) { b[0] = (char)(0xC0 | c >> 6); b[1] = (char)(0x80 | (c & 0x3F)); k = 2; }
++        else if (c < 0x10000) {
++            if (c >= 0xD800 && c < 0xE000) { errno = EILSEQ; return (size_t)-1; }
++            b[0] = (char)(0xE0 | c >> 12); b[1] = (char)(0x80 | (c >> 6 & 0x3F)); b[2] = (char)(0x80 | (c & 0x3F)); k = 3;
++        } else if (c < 0x110000) {
++            b[0] = (char)(0xF0 | c >> 18); b[1] = (char)(0x80 | (c >> 12 & 0x3F));
++            b[2] = (char)(0x80 | (c >> 6 & 0x3F)); b[3] = (char)(0x80 | (c & 0x3F)); k = 4;
++        } else { errno = EILSEQ; return (size_t)-1; }
++        if (c == 0) {                       // the terminator is stored, not counted
++            if (dst) { if (n >= len) break; dst[n] = 0; *src = NULL; }
++            return n;
++        }
++        if (dst) {
++            if (n + k > len) break;
++            memcpy(dst + n, b, k);
++        }
++        n += k;
++    }
++    *src = s;
++    return n;
++}
+ int klb_pthread_attr_setstacksize(bionic_attr *a, size_t n) { a->stack_size = n; return 0; }
+ int klb_pthread_attr_getstacksize(const bionic_attr *a, size_t *n) {
+     *n = a->stack_size;
+diff --git a/source/runtime/libc/kl_shim.c b/source/runtime/libc/kl_shim.c
+index 218f927..9fbab90 100644
+--- a/source/runtime/libc/kl_shim.c
++++ b/source/runtime/libc/kl_shim.c
+@@ -2150,6 +2150,7 @@ X(klb_pthread_rwlock_wrlock) X(klb_pthread_rwlock_unlock)
+ X(klb_pthread_attr_init) X(klb_pthread_attr_destroy) X(klb_pthread_attr_setstacksize) X(klb_pthread_attr_getstacksize)
+ X(klb_pthread_attr_setdetachstate) X(klb_pthread_attr_getstack) X(klb_pthread_getattr_np)
+ X(klb_pthread_attr_setschedpolicy) X(klb_pthread_attr_setschedparam)
++X(klb_pthread_attr_getschedparam) X(klb_wcsrtombs)
+ X(klb_pthread_key_create) X(klb_pthread_key_delete) X(klb_pthread_getspecific)
+ X(klb_pthread_setspecific) X(klb_pthread_once)
+ X(klb_pthread_create) X(klb_pthread_join) X(klb_pthread_detach) X(klb_pthread_exit)
+@@ -2527,6 +2528,8 @@ static const kl_entry g_shim[] = {
+     // UE4 reads its OBB through pread64 from several threads, and FORTIFY
+     // rewrites every one of those calls to the _chk form.
+     E("__pread64_chk", klb___pread64_chk), E("__pwrite64_chk", klb___pwrite64_chk),
++    // The same two under their plain names: on a 64-bit guest off_t is 64 bits either way.
++    E("__pread_chk", klb___pread64_chk), E("__pwrite_chk", klb___pwrite64_chk),
+     // ...and the un-fortified name, which nothing in the table can serve:
+     // Darwin does not declare pread64 (it has one 64-bit pread), so the
+     // generator drops it. Only a FORTIFY build reaches the _chk form, so a guest
+@@ -2638,6 +2641,8 @@ static const kl_entry g_shim[] = {
+     E("pthread_attr_destroy", klb_pthread_attr_destroy),
+     E("pthread_attr_setschedpolicy", klb_pthread_attr_setschedpolicy),
+     E("pthread_attr_setschedparam", klb_pthread_attr_setschedparam),
++    E("pthread_attr_getschedparam", klb_pthread_attr_getschedparam),
++    E("wcsrtombs", klb_wcsrtombs),
+     E("pthread_attr_setstacksize", klb_pthread_attr_setstacksize),
+     E("pthread_attr_getstacksize", klb_pthread_attr_getstacksize),
+     E("pthread_attr_setdetachstate", klb_pthread_attr_setdetachstate),
+diff --git a/source/runtime/media/kl_audio.c b/source/runtime/media/kl_audio.c
+index 992b4f1..5c04b99 100644
+--- a/source/runtime/media/kl_audio.c
++++ b/source/runtime/media/kl_audio.c
+@@ -444,6 +444,40 @@ static void nap_ms(unsigned ms) {
+     nanosleep(&ts, NULL);
+ }
+ 
++// ---- the host's volume ----
++//
++// Some outputs have no volume of their own on a Mac (a headset's or a monitor's
++// DisplayPort audio plays everything at full), so the host can turn the guest
++// down here: KL_AUDIO_VOLUME is the level at the start (0 to 1), and
++// KL_AUDIO_VOLUME_FILE names a file holding the level as text, read again by
++// the watchdog four times a second, so the host changes it while the guest
++// plays. The render callback only loads the number and ramps to it.
++static _Atomic float g_volume = 1.0f;
++static const char *g_volume_file;
++
++static void volume_set(double v) {
++    if (!(v >= 0.0)) v = 0.0;
++    if (v > 1.0) v = 1.0;
++    atomic_store_explicit(&g_volume, (float)v, memory_order_relaxed);
++}
++
++static void volume_env(void) {
++    const char *v = kl_env_str("KL_AUDIO_VOLUME", NULL);
++    if (v && *v) volume_set(atof(v));
++    g_volume_file = kl_env_str("KL_AUDIO_VOLUME_FILE", NULL);
++    if (g_volume_file && !*g_volume_file) g_volume_file = NULL;
++}
++
++static void volume_poll(void) {
++    if (!g_volume_file) return;
++    FILE *f = fopen(g_volume_file, "r");
++    if (!f) return;
++    char text[32] = {0};
++    if (fgets(text, sizeof text, f) && (text[0] == '.' || (text[0] >= '0' && text[0] <= '9')))
++        volume_set(atof(text));
++    fclose(f);
++}
++
+ // ---- the render callback ----
+ //
+ // Everything here is a load, a memcpy and a store. No locks, no allocation, no
+@@ -494,6 +528,17 @@ static OSStatus render_cb(void *ref, AudioUnitRenderActionFlags *flags,
+             atomic_fetch_add_explicit(&g_underruns, 1, memory_order_relaxed);
+         }
+     }
++    // The host's volume, eased over this buffer from the level the last one ended at.
++    static float level = 1.0f;   // the render thread's own
++    float aim = atomic_load_explicit(&g_volume, memory_order_relaxed);
++    if (take && (aim != 1.0f || level != 1.0f)) {
++        float step = (aim - level) / (float)take;
++        for (size_t i = 0; i < take; i++) {
++            level += step;
++            for (unsigned c = 0; c < g_out_ch; c++) dst[i * g_out_ch + c] *= level;
++        }
++        level = aim;
++    }
+     atomic_fetch_add_explicit(&g_frames_played, take, memory_order_relaxed);
+     atomic_store_explicit(&g_r, r + take, memory_order_release);
+     return noErr;
+@@ -837,6 +882,8 @@ static void sink_env(void) {
+     // See pacing_reader. LES MILLS BODYCOMBAT.
+     g_smooth   = kl_env_on("KL_AUDIO_SMOOTH", target_is(t, "x4015163475201433"));
+     g_steal_ms = kl_env_int("KL_AUDIO_STEAL_MS", 2000);
++    volume_env();
++    volume_poll();
+     if (g_mix_all)
+         fprintf(stderr, "  [au] KL_AUDIO_MIX_SOURCES=1 — every guest audio stream "
+                         "is mixed into the output, each converted from its own "
+@@ -1355,6 +1402,7 @@ static void *watchdog_thread(void *unused) {
+     pthread_setname_np("klepton-audio-watchdog");
+     for (;;) {
+         nap_ms(250);
++        volume_poll();
+         if (!g_open) continue;
+         // The stuck-interruption escape. The OS deactivated the session on the
+         // way in and is supposed to tell us on the way out; when it does not,
+diff --git a/source/runtime/xr/kl_openxr.c b/source/runtime/xr/kl_openxr.c
+index 7bd4f84..56c5c9d 100644
+--- a/source/runtime/xr/kl_openxr.c
++++ b/source/runtime/xr/kl_openxr.c
+@@ -855,7 +855,8 @@ enum { KLXR_GATE_ALWAYS = 0,      // unconditional
+        KLXR_GATE_VULKAN = 2,      // ...only when MoltenVK is actually reachable
+        KLXR_GATE_USER_PRESENCE = 3,    // ...missioniss only (see below)
+        KLXR_GATE_PERF_METRICS = 4,     // ...not for Moss from Steam (see below)
+-       KLXR_GATE_FRAME_CONTROLLER = 5 };   // ...Moss from Steam only (see below)
++       KLXR_GATE_FRAME_CONTROLLER = 5,     // ...Moss from Steam only (see below)
++       KLXR_GATE_SPACE_WARP = 6 };         // ...when asked for (see below)
+ 
+ static const struct { const char *name; uint32_t version; int gate; } g_extensions[] = {
+     { "XR_KHR_opengl_es_enable",       10, KLXR_GATE_ALWAYS },
+@@ -976,6 +977,13 @@ static const struct { const char *name; uint32_t version; int gate; } g_extensio
+     { "XR_META_performance_metrics",          2, KLXR_GATE_PERF_METRICS },
+     { "XR_EXT_user_presence",                 1, KLXR_GATE_USER_PRESENCE },
+     { "XR_VALVE_frame_controller_interaction", 1, KLXR_GATE_FRAME_CONTROLLER },
++    // XR_FB_space_warp — added for Halliday. Some Quest players list the
++    // extension as REQUIRED and stop without it, then ask for a motion-vector swapchain, are refused (the
++    // format is not one served here), turn space warp off
++    // and draw every frame themselves. So the name is
++    // all it needs, and nothing is synthesised. Offered when KL_XR_SPACE_WARP=1
++    // (whoever starts the runner decides).
++    { "XR_FB_space_warp",                     2, KLXR_GATE_SPACE_WARP },
+ };
+ #define KLXR_EXT_ALL ((uint32_t)(sizeof g_extensions / sizeof g_extensions[0]))
+ 
+@@ -1052,6 +1060,9 @@ static int klxr_ext_gate_open(int gate) {
+         const char *t = kl_driver_target_name();
+         return kl_env_on("KL_XR_USER_PRESENCE", t && !strcmp(t, "missioniss"));
+     }
++    case KLXR_GATE_SPACE_WARP: {
++        return kl_env_on("KL_XR_SPACE_WARP", 0);
++    }
+     case KLXR_GATE_FRAME_CONTROLLER:
+         // The Steam Frame's own controller profile. Moss from Steam binds its jump and attack to that
+         // controller's keys and, of the Touch profile, only the sticks (its other Touch keys are the
+@@ -2004,6 +2015,16 @@ static int klxr_refresh_list(float *out, int cap) {
+ // real panel rate.
+ static float g_xr_refresh_requested;   // Hz, 0 = report the real display rate
+ 
++// Halliday: when the guest last ended a frame with a passthrough layer in it. A compositor
++// that can show the room (Halliday's, through its OpenXR runtime) then keeps the eye
++// picture's alpha and says so on the layer it hands on; one that cannot loses nothing.
++static _Atomic int64_t g_klxr_passthrough_seen_ns;
++static int64_t klxr_now(void);
++int kl_openxr_passthrough_wanted(void) {
++    int64_t seen = g_klxr_passthrough_seen_ns;
++    return seen && klxr_now() - seen < 500000000ll;
++}
++
+ static XrResult klxr_EnumerateDisplayRefreshRatesFB(void *session, uint32_t capacity,
+                                                     uint32_t *count_out, float *rates) {
+     if (!klxr_sess(session)) KLXR_RET(KLXR_ERROR_HANDLE_INVALID);
+@@ -7007,6 +7028,9 @@ static XrResult klxr_EndFrame(void *session, const XrFrameEndInfo *info) {
+             }
+             if (layer->type != XR_TYPE_COMPOSITION_LAYER_QUAD &&
+                 layer->type != XR_TYPE_COMPOSITION_LAYER_CYLINDER_KHR) {
++                // Halliday: a passthrough layer (XR_FB_passthrough) in the frame says the
++                // guest wants the room behind its picture; see kl_openxr_passthrough_wanted.
++                if ((int)layer->type == 1000118003) g_klxr_passthrough_seen_ns = klxr_now();
+                 static int said[8];
+                 static int said_n;
+                 int seen = 0;

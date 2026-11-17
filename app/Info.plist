@@ -1,0 +1,38 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleName</key>
+	<string>Halliday</string>
+	<key>CFBundleDisplayName</key>
+	<string>Halliday</string>
+	<key>CFBundleIdentifier</key>
+	<string>app.halliday.Halliday</string>
+	<key>CFBundleExecutable</key>
+	<string>halliday</string>
+	<key>CFBundleIconFile</key>
+	<string>AppIcon</string>
+	<key>CFBundlePackageType</key>
+	<string>APPL</string>
+	<key>CFBundleVersion</key>
+	<string>0.1.0</string>
+	<key>CFBundleShortVersionString</key>
+	<string>0.1.0</string>
+	<key>LSMinimumSystemVersion</key>
+	<string>14.0</string>
+	<key>NSRemovableVolumesUsageDescription</key>
+	<string>Halliday's Videos and Files show what this disk holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSNetworkVolumesUsageDescription</key>
+	<string>Halliday's Videos and Files show what this network disk holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSDesktopFolderUsageDescription</key>
+	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSDocumentsFolderUsageDescription</key>
+	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSDownloadsFolderUsageDescription</key>
+	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSAppleEventsUsageDescription</key>
+	<string>Halliday's Music panel shows and controls what Music or Spotify is playing while you are in VR.</string>
+	<key>NSHighResolutionCapable</key>
+	<true/>
+</dict>
+</plist>

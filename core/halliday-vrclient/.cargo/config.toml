@@ -1,0 +1,9 @@
+# A Windows DLL built on the Mac with Rust's own linker: no Windows SDK, no C runtime. Imports from
+# kernel32 and opengl32 are declared with `raw-dylib`, so no import libraries are needed either.
+[build]
+target = "x86_64-pc-windows-msvc"
+
+[target.x86_64-pc-windows-msvc]
+linker = "rust-lld"
+# The DLL has no entry point, the test program its own (their build.rs).
+rustflags = ["-C", "linker-flavor=lld-link", "-C", "link-arg=/NODEFAULTLIB"]
