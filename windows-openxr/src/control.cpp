@@ -14,6 +14,7 @@
 #include "motion_bridge.hpp"
 #include "projection_geometry.hpp"
 #include "source_timing_bridge.hpp"
+#include "helper_game_identity.hpp"
 #include "frame_timing.hpp"
 #include "d3d11_prior_staging.hpp"
 #include "d3d12_prior_staging.hpp"
@@ -371,6 +372,12 @@ void controlSessionCreated(XrSession session, ID3D11Device* device) {
     gPriorCapture = true;
     std::strncpy(gHeader->appName, filename ? filename + 1 : executable, 63);
     gHeader->appName[63] = '\0';
+    // Preserve the helper PID for ownership/lifetime. Only its verified live
+    // game parent may supply the application name used by Resume on the host.
+    if(const auto game=halliday::helper_identity::verified_parent_name(gHeader->appName)) {
+        std::memcpy(gHeader->appName,game->data(),game->size());
+        gHeader->appName[game->size()]='\0';
+    }
     // The new session starts with no image, even if the previous SDK session
     // ended between two host ticks. Preserve a slot still owned by a host GPU copy.
     gHeader->latest.store(0);

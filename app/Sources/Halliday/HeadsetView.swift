@@ -440,8 +440,14 @@ final class HeadsetView: NSView {
         return NSCursor(image: image, hotSpot: .zero)
     }()
 
+    /// Only an explicit desktop mouse capture hides the desktop cursor. A
+    /// controller ray, including a game dashboard, never changes its image.
+    var hidesDesktopCursor = false {
+        didSet { if oldValue != hidesDesktopCursor { window?.invalidateCursorRects(for: self) } }
+    }
+
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: Self.invisibleCursor)
+        if hidesDesktopCursor { addCursorRect(bounds, cursor: Self.invisibleCursor) }
     }
 
     override func updateTrackingAreas() {

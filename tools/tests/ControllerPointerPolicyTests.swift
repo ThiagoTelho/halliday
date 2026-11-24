@@ -5,44 +5,31 @@
                 for game in [false, true] {
                     let policy = ControllerPointerPolicy(physicalHeadset: physical,
                         realControllersAvailable: controllers, gamePresenting: game)
-                    // A real controller press reaches its first VR target; it
-                    // must never be consumed to acquire a desktop mouse first.
                     precondition(!policy.capturesMouse(for: .sense))
-                    // A deliberate preview mouse click retains the old mouse
-                    // fallback, including when controllers are also connected.
-                    precondition(policy.capturesMouse(for: .desktopMouse))
-                    precondition(policy.allowsCapture(.explicitDesktopMouse))
-                    precondition(policy.activationCapture(explicitPending: true) == .explicitDesktopMouse)
-                    if physical && (controllers || game) {
-                        precondition(!policy.allowsAutomaticReclaim)
-                        precondition(!policy.allowsCapture(.automatic))
-                        precondition(policy.activationCapture(explicitPending: false) == nil)
-                    } else {
-                        precondition(policy.allowsAutomaticReclaim)
-                        precondition(policy.allowsCapture(.automatic))
-                        precondition(policy.activationCapture(explicitPending: false) == .automatic)
-                    }
+                    precondition(policy.capturesMouse(for: .desktopMouse) == !game)
+                    precondition(policy.allowsCapture(.explicitDesktopMouse) == !game)
+                    precondition(policy.allowsNativeControllerEvents == !game)
+                    precondition(policy.activationCapture(explicitPending: true)
+                        == (game ? nil : .explicitDesktopMouse))
+                    let automatic = !game && (!physical || !controllers)
+                    precondition(policy.allowsAutomaticReclaim == automatic)
+                    precondition(policy.allowsCapture(.automatic) == automatic)
+                    precondition(policy.activationCapture(explicitPending: false)
+                        == (automatic ? .automatic : nil))
                 }
             }
         }
-        let controllerMenu = ControllerPointerPolicy(physicalHeadset: true,
-            realControllersAvailable: true, gamePresenting: false)
-        let pausedGameMenu = ControllerPointerPolicy(physicalHeadset: true,
-            realControllersAvailable: true, gamePresenting: true)
-        let wheelGame = ControllerPointerPolicy(physicalHeadset: true,
-            realControllersAvailable: false, gamePresenting: true)
-        for menu in [controllerMenu, pausedGameMenu, wheelGame] {
-            precondition(!menu.allowsAutomaticReclaim)
-            precondition(!menu.allowsCapture(.automatic))
-            precondition(menu.allowsCapture(.explicitDesktopMouse))
-            // Delayed activation honors one explicit preview request; after
-            // consumption, resignation, unlock or Sense use clears that request,
-            // the same callback is no longer permission to recapture.
-            precondition(menu.activationCapture(explicitPending: true) == .explicitDesktopMouse)
-            precondition(menu.activationCapture(explicitPending: false) == nil)
+
+        // Both gameplay and the local dashboard keep the producer presenting.
+        // A late explicit preview capture cannot reacquire the OS mouse in either.
+        for _ in ["gameplay", "paused dashboard"] {
+            let context = ControllerPointerPolicy(physicalHeadset: true,
+                realControllersAvailable: true, gamePresenting: true)
+            precondition(!context.allowsNativeControllerEvents)
+            precondition(context.activationCapture(explicitPending: true) == nil)
+            precondition(!ControllerPointerPolicy.shouldParkCursor(locked: false,
+                macWindowInteraction: false, inUnavailableDisplay: true, gamePresenting: true))
         }
-        // Parking is for otherwise inaccessible headset/virtual displays, not
-        // an active Mac-window interaction or an explicitly captured mouse.
         precondition(ControllerPointerPolicy.shouldParkCursor(locked: false,
             macWindowInteraction: false, inUnavailableDisplay: true))
         precondition(!ControllerPointerPolicy.shouldParkCursor(locked: true,
@@ -51,6 +38,35 @@
             macWindowInteraction: true, inUnavailableDisplay: true))
         precondition(!ControllerPointerPolicy.shouldParkCursor(locked: false,
             macWindowInteraction: false, inUnavailableDisplay: false))
-        print("PASS: Sense first click bypasses desktop capture; physical controller/game UI cannot auto reclaim; explicit mouse fallback and delayed activation retained in 8 contexts; cleared request cannot recapture; cursor parking respects explicit Mac-window interaction")
+
+        // A pending down canceled by entering the game must not create either
+        // a late click or an unmatched cleanup up, even after returning Home.
+        var queue = NativeMouseEventSequence()
+        queue.begin()
+        let pendingDown = queue.generation
+        precondition(queue.accepts(pendingDown))
+        precondition(queue.end().isEmpty)
+        precondition(!queue.accepts(pendingDown))
+        queue.begin()
+        precondition(!queue.accepts(pendingDown))
+        let next = queue.generation
+        queue.posted(.left, isDown: true)
+        queue.posted(.right, isDown: true)
+        precondition(Set(queue.end()) == Set([.left, .right]))
+        precondition(!queue.accepts(next))
+        precondition(queue.end().isEmpty)
+
+        // A delivered up balances its own down; the transition releases only
+        // the other held button once. Starting an existing interaction is stable.
+        queue.begin()
+        let stable = queue.generation
+        queue.begin()
+        precondition(queue.generation == stable)
+        queue.posted(.left, isDown: true)
+        queue.posted(.right, isDown: true)
+        queue.posted(.left, isDown: false)
+        precondition(queue.end() == [.right])
+        precondition(queue.end().isEmpty)
+        print("PASS: game/dashboard block OS capture, activation and cursor parking in all 8 contexts; pending native events cancel by epoch; only delivered downs receive one balanced cleanup release; Home/explicit desktop fallback remains available")
     }
 }

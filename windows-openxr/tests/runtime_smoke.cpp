@@ -246,6 +246,13 @@ int wmain(int argc,wchar_t** argv) {
     XrSpace local = XR_NULL_HANDLE;
     require(load<PFN_xrCreateReferenceSpace>("xrCreateReferenceSpace")(session,&spaceInfo,&local) == XR_SUCCESS,"create head-origin LOCAL projection space");
     if (std::getenv("HALLIDAY_CHECK_PRIOR_STAGING_ONLY")) {
+        if(const auto* expected=std::getenv("HALLIDAY_EXPECT_CLIENT_NAME")) {
+            require(std::strcmp(fixture.header->appName,expected)==0,"verified helper parent supplies only application name");
+            const auto* owner=halliday::haptics::extension(fixture.header);
+            require(fixture.header->clientPid==GetCurrentProcessId()&&owner&&owner->ownerPid.load()==GetCurrentProcessId(),
+                    "runtime PID and producer lease stay with helper, never parent display identity");
+            std::puts("CHECK PASS: verified helper parent name with unchanged helper PID/producer lease");
+        }
         prior_staging_checks::run(gGipa,gInstance,session,stage,context,fixture.header);
         const auto statsFn=reinterpret_cast<uint32_t(__cdecl*)(HallidayTransferStats*,uint32_t)>(GetProcAddress(runtime,"hallidayGetTransferStats"));
         HallidayTransferStats stats{};

@@ -52,6 +52,32 @@ final class GameBridge {
     private var independentHaptics: GameHapticFeed?
     private var packet: UInt32 = 0
 
+    /// Coherent producer evidence for an explicit game-focus restoration. A
+    /// Windows/unknown client PID is deliberately not exposed as a Mac PID.
+    var focusProducer: GameResumeFocus.Producer? {
+        guard isPresenting else { return nil }
+        guard let bridge else { return nil }
+        let revision = producerState.revision
+        let status = halliday_bridge_client_status(bridge)
+        let epoch = halliday_bridge_client_epoch(bridge)
+        var client = HallidayBridgeClient()
+        halliday_bridge_client(bridge, &client)
+        let name = withUnsafeBytes(of: client.name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        var confirmation = HallidayBridgeClient()
+        halliday_bridge_client(bridge, &confirmation)
+        let confirmedName = withUnsafeBytes(of: confirmation.name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
+        guard status == 1, client.pid > 0, client.initialized != 0, confirmation.initialized != 0,
+              client.pid == confirmation.pid, name == confirmedName, confirmation.frames >= client.frames,
+              revision == producerState.revision,
+              status == halliday_bridge_client_status(bridge),
+              epoch == halliday_bridge_client_epoch(bridge) else { return nil }
+        // Legacy OpenVR uses epoch zero. Its observed ready/PID/frame-reset
+        // revision still retires cached targets; native identity is checked
+        // again immediately before activation, never inferred from this PID.
+        return .init(name: name, pid: client.pid, nativePID: nil,
+                     lease: "independent:\(epoch):\(revision)")
+    }
+
     /// A game is running in Halliday: from its first frame until it shuts VR down or its process
     /// ends (the runtime's heartbeat stops). It may send no frames for a while (loading).
     private(set) var isPresenting = false
@@ -135,6 +161,7 @@ final class GameBridge {
     // The emulated controllers' buttons (right, left).
     var trigger = [false, false]
     var grip = [false, false]
+    private var inputRearm = [GameControllerInputRearm(), GameControllerInputRearm()]
 
     /// Where the game's world sits in Halliday's: its origin on the floor under the user and its
     /// forward the way they face, taken while no game is connected (so a game starts in front
@@ -559,6 +586,13 @@ final class GameBridge {
                 c.axes.1 = (real.trigger, 0)
                 c.axes.2 = (real.grip ? 1 : 0, 0)
             }
+            let input = inputRearm[hand].filter(.init(pressed: c.pressed, touched: c.touched,
+                stick: SIMD2(c.axes.0.0, c.axes.0.1), trigger: c.axes.1.0, grip: c.axes.2.0))
+            c.pressed = input.pressed
+            c.touched = input.touched
+            c.axes.0 = (input.stick.x, input.stick.y)
+            c.axes.1.0 = input.trigger
+            c.axes.2.0 = input.grip
             if i == 1 { state.controllers.1 = c } else { state.controllers.0 = c }
         }
         halliday_bridge_publish_frame_with_motion(b, &state, notifyGame, motionMask)
@@ -691,6 +725,7 @@ final class GameBridge {
         startedAt = nil
         gameProcessID = nil
         setPaused(false)
+        inputRearm = [GameControllerInputRearm(), GameControllerInputRearm()]
         layer = nil
         texture = nil
         transferView = nil
@@ -720,6 +755,7 @@ final class GameBridge {
 
     /// Halliday's own interface is over the game (it should pause) or not.
     func setDashboard(_ shown: Bool) {
+        for hand in inputRearm.indices { inputRearm[hand].setFocused(!shown) }
         if !shown { independentHaptics?.setFocused(true) }
         guard let b = bridge else { return }
         halliday_bridge_set_dashboard(b, shown)

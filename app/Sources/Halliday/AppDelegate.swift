@@ -314,10 +314,40 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// then is the lock re-applied when Halliday becomes active again.
     private var pointerEngaged = false
     private var pendingExplicitDesktopCapture = false
+    private var gameResumeFocusTarget: GameResumeFocus.Target?
+    private var gameMenuFocusRevision: UInt64 = 0
     private var controllerPointerPolicy: ControllerPointerPolicy {
         ControllerPointerPolicy(physicalHeadset: onHeadset,
             realControllersAvailable: !sense.connected.isEmpty, gamePresenting: game?.isPresenting == true)
     }
+    /// Physical HMD output never participates in the desktop focus chain.
+    /// A running game includes its paused Halliday dashboard.
+    private func activateSceneApplication() {
+        guard game?.isPresenting != true, !(window is HeadsetWindow) else { return }
+        NSApp.activate()
+    }
+
+    private func raiseSceneWindowForDesktopInput() {
+        guard game?.isPresenting != true, let window else { return }
+        if window is HeadsetWindow { window.orderFront(nil) }
+        else { window.makeKeyAndOrderFront(nil) }
+    }
+
+    /// Retire desktop ownership before routing another controller report.
+    /// No per-frame native cursor motion or application activation is needed.
+    private func syncControllerDesktopOwnership() {
+        let policy = controllerPointerPolicy
+        let wasOwned = mouseOwner.isOn
+        mouseOwner.setControllerEventsAllowed(policy.allowsNativeControllerEvents)
+        if !policy.allowsNativeControllerEvents {
+            pointerEngaged = false
+            focusWasEngaged = false
+            pendingExplicitDesktopCapture = false
+            setPointerLock(false)
+            if wasOwned { mouseOwnershipChanged(false) }
+        }
+    }
+
     /// Halliday's output is the headset's display (its window is the borderless `HeadsetWindow`).
     private var onHeadset = false
     private var lastControlTap: CFTimeInterval = 0
@@ -586,7 +616,10 @@ if !open, passthroughForVideo {
         }
         view.onFrame = { [weak self] head in self?.frameTick(head: head) }
         window.contentView = view
-        window.makeKeyAndOrderFront(nil)
+        if window is HeadsetWindow {
+            window.ignoresMouseEvents = true
+            window.orderFront(nil)
+        } else { window.makeKeyAndOrderFront(nil) }
         if headsetScreen != nil {
             log("[display] Halliday's window on \(window.screen?.localizedName ?? "no screen") at \(window.frame), \(window.screen?.maximumFramesPerSecond ?? 0) Hz")
         }
@@ -617,7 +650,7 @@ if !open, passthroughForVideo {
         log("[keys] click a VR window to use it; Control twice, Option+Esc or a click on empty space returns to Halliday")
         // Tests (`open -g … --args --no-activate`): stay in the background, so the user's typing in
         // another app never lands in Halliday.
-        if !CommandLine.arguments.contains("--no-activate") { NSApp.activate() }
+        if !CommandLine.arguments.contains("--no-activate") { activateSceneApplication() }
         // Moving windows onto the virtual display must always be the user's explicit choice (M),
         // and Halliday must never come back by itself after a restart or log-in.
         NSApp.disableRelaunchOnLogin()
@@ -900,6 +933,7 @@ if !open, passthroughForVideo {
     /// otherwise focus is only taken when the window had to be recovered, so activating Halliday
     /// through its browser window doesn't steal the keyboard from it.
     private func bringPreviewIntoView(front: Bool = false) {
+        guard game?.isPresenting != true else { return }
         guard let window, window.styleMask.contains(.titled) else { return } // headset output: not a preview
         var recovered = false
         if window.isMiniaturized {
@@ -918,7 +952,7 @@ if !open, passthroughForVideo {
             log("[display] brought the Halliday window back onto \(main.localizedName)")
             recovered = true
         }
-        if front || recovered { window.makeKeyAndOrderFront(nil) }
+        if front || recovered { raiseSceneWindowForDesktopInput() }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
@@ -942,7 +976,7 @@ if !open, passthroughForVideo {
         // (Not when the click that activated Halliday was on the companion: its mouse is the Mac's.)
         if onHeadset, !mouseOwner.isOn, !companionIsFront {
             pointerEngaged = true
-            window?.makeKeyAndOrderFront(nil)
+            raiseSceneWindowForDesktopInput()
             window?.makeFirstResponder(view)
         }
         // The lock only takes effect while Halliday is the active app, and activation happens a
@@ -972,8 +1006,9 @@ if !open, passthroughForVideo {
             pointerEngaged = false; focusWasEngaged = false
             pendingExplicitDesktopCapture = false
         }
-        guard force || on != pointerLocked, let view else { return }
+        guard (force && on) || on != pointerLocked, let view else { return }
         pointerLocked = on
+        view.hidesDesktopCursor = on
         if on {
             if let center = view.globalCenter {
                 view.skipNextDelta = true
@@ -983,7 +1018,7 @@ if !open, passthroughForVideo {
         } else {
             CGAssociateMouseAndMouseCursorPosition(1)
             // Never leave the Mac's cursor on the headset's display, where it can't be seen.
-            if onHeadset, !mouseOwner.isOn {
+            if onHeadset, !mouseOwner.isOn, !controllerPointerPolicy.gamePresenting {
                 CGWarpMouseCursorPosition(MouseOwner.desktopParkingPoint)
             }
         }
@@ -2014,8 +2049,8 @@ if !open, passthroughForVideo {
         }
         // Typing is an explicit keyboard request; it does not capture the OS
         // mouse when a controller operates the VR field.
-        NSApp.activate()
-        window?.makeKeyAndOrderFront(nil)
+        activateSceneApplication()
+        raiseSceneWindowForDesktopInput()
         window?.makeFirstResponder(view)
     }
 
@@ -2637,8 +2672,8 @@ if !open, passthroughForVideo {
             return
         }
         let engaged = pointerEngaged || pointerLocked || focusWasEngaged
-        NSApp.activate()
-        window?.makeKeyAndOrderFront(nil)
+        activateSceneApplication()
+        raiseSceneWindowForDesktopInput()
         window?.makeFirstResponder(view)
         if engaged {
             pointerEngaged = true
@@ -3263,8 +3298,8 @@ if !open, passthroughForVideo {
                 mouseOwner.stop(reason: "address bar")
                 mouseOwnershipChanged(false)
             } else {
-                NSApp.activate()
-                window?.makeKeyAndOrderFront(nil)
+                activateSceneApplication()
+                raiseSceneWindowForDesktopInput()
                 window?.makeFirstResponder(view)
             }
             updateBrowserBar()
@@ -3274,7 +3309,7 @@ if !open, passthroughForVideo {
             b?.configureXR(ipd: ipd, fovLeft: Optics.fov(.left), fovRight: Optics.fov(.right), eyeSize: Settings.shared.vrPageEye)
         }
         b.window.orderFront(nil) // on screen so it gets a window number, then moved onto the virtual display
-        window?.makeKeyAndOrderFront(nil)
+        raiseSceneWindowForDesktopInput()
         browserOpening = true
         lastDockClock = 0 // the dock shows it as open right away
         Task { @MainActor in
@@ -3303,6 +3338,7 @@ if !open, passthroughForVideo {
         // spot that was clicked is a known direction: the pointer goes there and the click counts,
         // as the user expects. In the headset view the first click only captures.
         if source == .sense {
+            syncControllerDesktopOwnership()
             pointerEngaged = false
             setPointerLock(false)
         }
@@ -3347,6 +3383,9 @@ if !open, passthroughForVideo {
             blockedClick()
             return true
         }
+        // In-game dashboard panels were already handled above. A ray that
+        // misses them must not fall through to a captured Mac window.
+        guard controllerPointerPolicy.allowsNativeControllerEvents else { return false }
         guard let wm = windowManager, wm.checkInputPermission(), mouseOwner.start() else { return true }
         mouseOwnershipChanged(true)
         mouseOwner.press(hit, rightButton: rightButton)
@@ -3392,6 +3431,20 @@ if !open, passthroughForVideo {
         GameLibrary.shared.refresh()
         game?.onChange = { [weak self] presenting in
             guard let self, let game = self.game else { return }
+            self.syncControllerDesktopOwnership()
+            self.gameResumeFocusTarget = nil
+            self.gameMenuFocusRevision &+= 1
+            if presenting, let producer = game.focusProducer {
+                // Cache a real game identity early, before a VR menu or a
+                // later same-name game in another bottle could confuse it.
+                Task { @MainActor [weak self, weak game] in
+                    let candidate = await GameResumeFocus.discover(producer: producer)
+                    guard let self, let game, self.game === game,
+                          game.focusProducer == producer else { return }
+                    self.gameResumeFocusTarget = GameResumeFocus.preferRemembered(
+                        self.gameResumeFocusTarget, discovered: candidate, producer: producer)
+                }
+            }
             self.updateGameAudio()
             let name = GameLibrary.shared.displayName(forExecutable: game.appName)
             if presenting {
@@ -3495,6 +3548,20 @@ if !open, passthroughForVideo {
     /// is told and keeps running; the mouse, clicks and keys are Halliday's until it goes back.
     private func setGameAway(_ on: Bool) {
         guard let game, on != gameAway, !on || game.isPresenting else { return }
+        gameMenuFocusRevision &+= 1
+        let focusRevision = gameMenuFocusRevision
+        if on, let producer = game.focusProducer, gameResumeFocusTarget?.producer != producer {
+            // Discover away from the compositor; opening the dashboard never
+            // activates an app. A newer menu/game transition retires this result.
+            Task { @MainActor [weak self, weak game] in
+                let candidate = await GameResumeFocus.discover(producer: producer)
+                guard let self, let game, self.game === game, self.gameAway,
+                      self.gameMenuFocusRevision == focusRevision,
+                      game.focusProducer == producer else { return }
+                self.gameResumeFocusTarget = GameResumeFocus.preferRemembered(
+                    self.gameResumeFocusTarget, discovered: candidate, producer: producer)
+            }
+        }
         gameAway = on
         game.setPaused(on)
         if on {
@@ -3542,6 +3609,39 @@ if !open, passthroughForVideo {
             launcherOpen = false
         }
         Sounds.play(on ? .open : .close)
+        if !on, game.isPresenting { restoreGameFocusAfterResume() }
+    }
+
+    /// Explicit Resume (button, PS tap or final Esc), once. A correctly focused
+    /// game is left alone; controllers never continuously reclaim desktop focus.
+    private func restoreGameFocusAfterResume() {
+        guard let game, !gameAway, let producer = game.focusProducer else { return }
+        let request = GameResumeFocus.Request(producer: producer, revision: gameMenuFocusRevision,
+            originalFrontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        Task { @MainActor [weak self, weak game] in
+            guard let self, let game else { return }
+            var target = self.gameResumeFocusTarget
+            if target?.producer != producer {
+                let candidate = await GameResumeFocus.discover(producer: producer)
+                target = GameResumeFocus.preferRemembered(self.gameResumeFocusTarget,
+                    discovered: candidate, producer: producer)
+            }
+            guard self.game === game, let currentProducer = game.focusProducer,
+                  let target else { return }
+            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            // A user-selected Mac app while discovery was running wins over
+            // this older Resume request; there is no recurring focus reclaim.
+            guard request.accepts(producer: currentProducer, revision: self.gameMenuFocusRevision,
+                presenting: game.isPresenting, dashboard: self.gameAway,
+                frontmostPID: frontmost, targetPID: target.identity.pid) else { return }
+            self.gameResumeFocusTarget = target
+            let current = NativeProcessIdentity.capture(pid: target.identity.pid,
+                expectedBasename: URL(fileURLWithPath: target.identity.executable).lastPathComponent)
+            guard GameResumeFocus.shouldActivate(target, producer: producer,
+                frontmostPID: frontmost, currentIdentity: current) else { return }
+            let restored = NSRunningApplication(processIdentifier: target.identity.pid)?.activate() ?? false
+            log("[input] explicit Resume game focus \(restored ? "restored" : "unavailable") for native process \(target.identity.pid)")
+        }
     }
 
     /// Sets where the controllers point without a button on them: a button on a panel is
@@ -3637,8 +3737,8 @@ if !open, passthroughForVideo {
             self.window = window
             // (Test runs stay in the background: `--no-activate`.)
             if CommandLine.arguments.contains("--no-activate") { window.orderFront(nil) } else {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate()
+                raiseSceneWindowForDesktopInput()
+                activateSceneApplication()
             }
             window.makeFirstResponder(view)
             log("[display] desktop mode: Halliday on the Mac's screen, the headset's display left black")
@@ -3651,7 +3751,7 @@ if !open, passthroughForVideo {
             self.window = headsetWindow
             desktopWindow?.orderOut(nil)
             headsetWindow.setFrame(screen.frame, display: true)
-            headsetWindow.makeKeyAndOrderFront(nil)
+            headsetWindow.orderFront(nil)
             headsetWindow.makeFirstResponder(view)
             log("[display] back on the headset")
         }
@@ -3818,7 +3918,8 @@ if !open, passthroughForVideo {
         w.contentView = view
         onHeadset = true
         self.window = w
-        w.makeKeyAndOrderFront(nil)
+        w.ignoresMouseEvents = true
+        w.orderFront(nil)
         w.makeFirstResponder(view)
         // The preview window goes: the companion is Halliday's window on the Mac now.
         preview?.orderOut(nil)
@@ -3943,14 +4044,15 @@ if !open, passthroughForVideo {
             companion = c
             return c
         }()
-        c.show(activating: activating)
+        c.show(activating: activating && game?.isPresenting != true)
     }
 
     /// The mouse and the keyboard back to Halliday in the headset (the companion's button).
     private func backToHeadset() {
         guard onHeadset, !mouseOwner.isOn else { return }
+        guard game?.isPresenting != true else { setGameAway(true); return }
         pointerEngaged = true
-        window?.makeKeyAndOrderFront(nil)
+        raiseSceneWindowForDesktopInput()
         window?.makeFirstResponder(view)
         setPointerLock(true, force: true, intent: .explicitDesktopMouse)
     }
@@ -4354,6 +4456,7 @@ if !open, passthroughForVideo {
     private func frameTick(head: HeadPose) {
         guard let view, let renderer else { return }
         lastHead = head
+        syncControllerDesktopOwnership()
         updateSense(head: head)
         updateCameras()
         updateAutomaticVRPolicy()
@@ -4671,7 +4774,8 @@ if !open, passthroughForVideo {
         let unavailable = [windowManager?.virtualDisplayBounds, game?.framesDisplayBounds, headsetBounds]
             .contains(where: { $0?.contains(location) == true })
         guard ControllerPointerPolicy.shouldParkCursor(locked: pointerLocked,
-            macWindowInteraction: mouseOwner.isOn, inUnavailableDisplay: unavailable) else { return }
+            macWindowInteraction: mouseOwner.isOn, inUnavailableDisplay: unavailable,
+            gamePresenting: game?.isPresenting == true) else { return }
         view?.skipNextDelta = true
         CGWarpMouseCursorPosition(MouseOwner.desktopParkingPoint)
     }
@@ -4694,7 +4798,7 @@ if !open, passthroughForVideo {
     func mouseOwnershipChanged(_ owned: Bool) {
         // While Halliday owns the mouse, the preview window lets clicks through to the windows
         // behind it (the redirected events land on the real windows' positions).
-        window?.ignoresMouseEvents = owned
+        window?.ignoresMouseEvents = owned || window is HeadsetWindow
         view?.pointerFromTap = owned
         // The tap positions the real cursor itself while a window is in use.
         if owned { setPointerLock(false) }
@@ -4707,8 +4811,8 @@ if !open, passthroughForVideo {
                 return
             }
             // Back to Halliday: take the keyboard back from the window's app too.
-            NSApp.activate()
-            window?.makeKeyAndOrderFront(nil)
+            activateSceneApplication()
+            raiseSceneWindowForDesktopInput()
             window?.makeFirstResponder(view)
             pointerEngaged = true
             setPointerLock(true)
@@ -4727,11 +4831,11 @@ if !open, passthroughForVideo {
     }
 }
 
-/// The window on the headset's display. A borderless window refuses the keyboard unless it says
-/// otherwise: without it, no key or click reached Halliday.
+/// A physical headset is an output surface. Controller UI is dispatched locally;
+/// it must never become the Mac's key/main window or hide its desktop cursor.
 final class HeadsetWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 /// The preview window. It can cover the whole screen, menu bar included, without being a macOS

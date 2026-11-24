@@ -50,6 +50,9 @@ final class MouseOwner: @unchecked Sendable {
     private var tap: CFMachPort?
     private var thread: Thread?
     private var on = false
+    private var controllerEventsAllowed = true
+    private var eventSequence = NativeMouseEventSequence()
+    private var postedButtonPoints: [NativeMouseEventSequence.Button: CGPoint] = [:]
     /// The window a left button press went to; drags and the release stay with it.
     private var pressedWindow: CGWindowID?
     /// Same for the right button (context menus).
@@ -92,9 +95,13 @@ final class MouseOwner: @unchecked Sendable {
 
     /// Starts owning the mouse. Needs the Accessibility permission.
     func start() -> Bool {
+        lock.lock(); let allowed = controllerEventsAllowed; lock.unlock()
+        guard allowed else { return false }
         guard ensureTap() else { return false }
         lock.lock()
+        guard !on else { lock.unlock(); return true }
         on = true
+        eventSequence.begin()
         pressedWindow = nil
         pendingDown = false
         lastControlTap = 0
@@ -106,17 +113,47 @@ final class MouseOwner: @unchecked Sendable {
     }
 
     /// Stops owning the mouse and puts the cursor back on the main display. Safe from any thread.
-    func stop(reason: String) {
+    func stop(reason: String, preserveCursor: Bool = false) {
         lock.lock()
         guard on else { lock.unlock(); return }
         on = false
         pressedWindow = nil
+        pressedRightWindow = nil
+        pendingDown = false
+        panelPressed = false
+        let releases = eventSequence.end().compactMap { button in
+            postedButtonPoints[button].map { (button, $0) }
+        }
+        postedButtonPoints.removeAll()
         let tap = self.tap
         lock.unlock()
         if let tap { CGEvent.tapEnable(tap: tap, enable: false) }
-        CGWarpMouseCursorPosition(parkPoint)
-        CGAssociateMouseAndMouseCursorPosition(1)
+        // Cancel queued downs first; balance only events already delivered.
+        // These finite releases are cleanup, never controller input to a game.
+        for (button, point) in releases {
+            let right = button == .right
+            let up = CGEvent(mouseEventSource: nil, mouseType: right ? .rightMouseUp : .leftMouseUp,
+                             mouseCursorPosition: point, mouseButton: right ? .right : .left)
+            up?.setIntegerValueField(.eventSourceUserData, value: Self.ownEventMarker)
+            up?.post(tap: .cgSessionEventTap)
+        }
+        if !preserveCursor {
+            CGWarpMouseCursorPosition(parkPoint)
+            CGAssociateMouseAndMouseCursorPosition(1)
+        }
         log("[mouse] back to Halliday (\(reason))")
+    }
+
+    /// Game input and Halliday's game dashboard never address Mac windows.
+    /// Disabling also retires an older window interaction and its queued events.
+    func setControllerEventsAllowed(_ allowed: Bool) {
+        lock.lock(); controllerEventsAllowed = allowed; lock.unlock()
+        if !allowed { stop(reason: "VR game owns controller input", preserveCursor: true) }
+    }
+
+    private var mayPostControllerEvents: Bool {
+        lock.lock(); defer { lock.unlock() }
+        return on && controllerEventsAllowed
     }
 
     /// Stops and tells the delegate (used from the tap thread).
@@ -133,6 +170,7 @@ final class MouseOwner: @unchecked Sendable {
     /// that began it). The physical release then comes through the tap.
     func press(_ hit: PointerHit, rightButton: Bool = false) {
         lock.lock()
+        guard on && controllerEventsAllowed else { lock.unlock(); return }
         if rightButton { pressedRightWindow = hit.window.windowID } else { pressedWindow = hit.window.windowID }
         pendingDown = true
         lock.unlock()
@@ -145,7 +183,7 @@ final class MouseOwner: @unchecked Sendable {
         let down = CGEvent(mouseEventSource: nil, mouseType: rightButton ? .rightMouseDown : .leftMouseDown,
                            mouseCursorPosition: hit.screenPoint, mouseButton: rightButton ? .right : .left)
         down?.setIntegerValueField(.mouseEventClickState, value: 1)
-        repost(down, after: delay) { [weak self] in self?.setPendingDown(false) }
+        repost(down, after: delay)
     }
 
     // --- A controller instead of the mouse ---
@@ -158,6 +196,7 @@ final class MouseOwner: @unchecked Sendable {
     /// The trigger (or the grip, for the right button) was let go: the release of the press
     /// `press` posted, where the pointer is now.
     func controllerRelease(rightButton: Bool) {
+        guard mayPostControllerEvents else { return }
         lock.lock()
         let pressed = rightButton ? pressedRightWindow : pressedWindow
         let pending = pendingDown
@@ -176,7 +215,7 @@ final class MouseOwner: @unchecked Sendable {
     /// The controller's pointer, once a frame while a window is in use: the page under it sees
     /// the mouse move (its hover, its cursor), or a drag while the trigger is held.
     func controllerMoved() {
-        guard isOn, let hit = InputState.shared.hit() else { return }
+        guard mayPostControllerEvents, let hit = InputState.shared.hit() else { return }
         if let last = controllerPoint, abs(last.x - hit.screenPoint.x) < 0.5, abs(last.y - hit.screenPoint.y) < 0.5 { return }
         controllerPoint = hit.screenPoint
         lock.lock(); let held = pressedWindow != nil, pending = pendingDown; lock.unlock()
@@ -188,7 +227,7 @@ final class MouseOwner: @unchecked Sendable {
 
     /// The stick over a window: its page scrolls (points, up and right positive).
     func controllerScroll(dx: Double, dy: Double) {
-        guard let hit = InputState.shared.hit(),
+        guard mayPostControllerEvents, let hit = InputState.shared.hit(),
               let scroll = CGEvent(scrollWheelEvent2Source: nil, units: .pixel, wheelCount: 2,
                                    wheel1: Int32(dy.rounded()), wheel2: Int32((-dx).rounded()), wheel3: 0) else { return }
         scroll.location = hit.screenPoint
@@ -247,17 +286,38 @@ final class MouseOwner: @unchecked Sendable {
         CFRunLoopRun()
     }
 
-    private func setPendingDown(_ v: Bool) {
-        lock.lock(); pendingDown = v; lock.unlock()
+    private func setPendingDown(_ value: Bool) {
+        lock.lock(); pendingDown = value; lock.unlock()
     }
 
-    private func repost(_ event: CGEvent?, after delay: Double, then: (@Sendable () -> Void)? = nil) {
+    private func repost(_ event: CGEvent?, after delay: Double) {
         guard let event else { return }
+        lock.lock(); let generation = eventSequence.generation; lock.unlock()
         event.setIntegerValueField(.eventSourceUserData, value: Self.ownEventMarker)
         let box = EventBox(event)
-        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) {
+        DispatchQueue.global(qos: .userInteractive).asyncAfter(deadline: .now() + delay) { [weak self] in
+            guard let self else { return }
+            self.lock.lock()
+            guard self.controllerEventsAllowed, self.eventSequence.accepts(generation) else { self.lock.unlock(); return }
+            let button: NativeMouseEventSequence.Button?
+            let isDown: Bool
+            switch box.event.type {
+            case .leftMouseDown: button = .left; isDown = true
+            case .rightMouseDown: button = .right; isDown = true
+            case .leftMouseUp: button = .left; isDown = false
+            case .rightMouseUp: button = .right; isDown = false
+            default: button = nil; isDown = false
+            }
+            if let button {
+                self.eventSequence.posted(button, isDown: isDown)
+                if isDown {
+                    self.postedButtonPoints[button] = box.event.location
+                    self.pendingDown = false
+                }
+                else { self.postedButtonPoints.removeValue(forKey: button) }
+            }
             box.event.post(tap: .cgSessionEventTap)
-            then?()
+            self.lock.unlock()
         }
     }
 
@@ -361,7 +421,7 @@ final class MouseOwner: @unchecked Sendable {
                 // Another window covers this point: raise ours (in the background), then click.
                 raise(hit.window)
                 setPendingDown(true)
-                repost(event.copy(), after: 0.15) { [weak self] in self?.setPendingDown(false) }
+                repost(event.copy(), after: 0.15)
                 return nil
             }
             return event
@@ -394,7 +454,7 @@ final class MouseOwner: @unchecked Sendable {
             if !isFrontmost(hit) {
                 raise(hit.window)
                 setPendingDown(true)
-                repost(event.copy(), after: 0.15) { [weak self] in self?.setPendingDown(false) }
+                repost(event.copy(), after: 0.15)
                 return nil
             }
             return event
@@ -483,21 +543,39 @@ final class MouseOwner: @unchecked Sendable {
     /// Activates the window's app and raises the window, on a background queue: Accessibility
     /// calls go to the other app and can stall if it is busy.
     private func raise(_ w: WindowSnapshot) {
+        lock.lock(); let generation = eventSequence.generation; lock.unlock()
         // Halliday's own windows (the browser): Accessibility on our own process runs AppKit right
         // here, off the main thread, which AppKit aborts on. Raise them directly on the main
         // thread instead (queued: the tap thread never waits for it).
         if w.pid == ProcessInfo.processInfo.processIdentifier {
             let number = Int(w.windowID)
-            DispatchQueue.main.async {
+            DispatchQueue.main.async { [weak self] in
+                guard self?.acceptsNativeAction(generation) == true else { return }
                 NSApp.activate()
                 NSApp.windows.first { $0.windowNumber == number }?.makeKeyAndOrderFront(nil)
             }
             return
         }
-        axQueue.async {
-            NSRunningApplication(processIdentifier: w.pid)?.activate()
-            AXWindow.find(pid: w.pid, windowID: w.windowID, frame: w.frame)?.raise()
+        axQueue.async { [weak self] in
+            guard let self, self.acceptsNativeAction(generation) else { return }
+            let target = AXWindow.find(pid: w.pid, windowID: w.windowID, frame: w.frame)
+            // App activation and the game's routing transition are serialized
+            // on MainActor. A background check followed by activate() could
+            // otherwise steal focus just after the game retired this epoch.
+            DispatchQueue.main.async { [weak self] in
+                guard let self, self.acceptsNativeAction(generation) else { return }
+                NSRunningApplication(processIdentifier: w.pid)?.activate()
+                self.axQueue.async { [weak self] in
+                    guard self?.acceptsNativeAction(generation) == true else { return }
+                    target?.raise()
+                }
+            }
         }
+    }
+
+    private func acceptsNativeAction(_ generation: UInt64) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return controllerEventsAllowed && eventSequence.accepts(generation)
     }
 }
 

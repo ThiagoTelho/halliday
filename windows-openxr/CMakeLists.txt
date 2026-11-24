@@ -7,6 +7,9 @@ set(CMAKE_RUNTIME_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY "${CMAKE_BINARY_DIR}/bin")
 
 if(WIN32)
+  add_executable(helper_game_identity_windows_test tests/helper_game_identity_windows_test.cpp)
+  target_include_directories(helper_game_identity_windows_test PRIVATE src)
+  target_link_options(helper_game_identity_windows_test PRIVATE -static)
   add_library(halliday_openxr SHARED
     src/entrypoints.cpp src/runtime.cpp src/system.cpp src/graphics.cpp
     src/swapchain.cpp src/frame.cpp src/space.cpp src/input.cpp src/path.cpp
@@ -72,6 +75,9 @@ if(WIN32)
   endif()
 else()
   enable_testing()
+  add_executable(helper_game_identity_policy_test tests/helper_game_identity_policy_test.cpp)
+  target_include_directories(helper_game_identity_policy_test PRIVATE src)
+  add_test(NAME helper_game_identity_policy COMMAND helper_game_identity_policy_test)
   add_executable(pose_math_test tests/pose_math_test.cpp)
   target_include_directories(pose_math_test PRIVATE include src)
   add_test(NAME pose_math COMMAND pose_math_test)

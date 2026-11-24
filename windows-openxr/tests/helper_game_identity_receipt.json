@@ -1,0 +1,76 @@
+{
+  "scope": "Name-only verified Windows helper-parent attribution; exact owner/timing protocol unchanged",
+  "metadata_contract": {
+    "changed": "client.name/appName may be verified parent basename for exact OpenXRHelper32/64.exe only",
+    "unchanged": [
+      "client.pid",
+      "haptic owner PID",
+      "producer epoch",
+      "frame index",
+      "source timing",
+      "ordinary executable name"
+    ],
+    "no_new_abi": true,
+    "unverifiable_parent": "retain helper name; host Resume fails closed"
+  },
+  "portable_cpu_policy": "PASS: generic games/ordinary self preservation, launcher/helper rejection, missing/stale/reused/equal creation/PID/session/live guards",
+  "actual_owned_cpu_process_chains": [
+    {
+      "case": "helper64",
+      "passed": true
+    },
+    {
+      "case": "helper32",
+      "passed": true
+    },
+    {
+      "case": "steam-denied",
+      "passed": true
+    },
+    {
+      "case": "helper-denied",
+      "passed": true
+    },
+    {
+      "case": "launcher-denied",
+      "passed": true
+    },
+    {
+      "case": "ordinary-unchanged",
+      "passed": true
+    }
+  ],
+  "actual_gpu_control_regression": {
+    "passed": true,
+    "runtime_sha256": "007248ddb13d5ae2e37ee6a164ef24f136f6e48c689da70c7e385ea423523319",
+    "source_dimensions": [
+      80,
+      72
+    ],
+    "submissions": 24,
+    "publications": 18,
+    "warmup_reset": 6,
+    "verified": [
+      "real owned parent -> OpenXRHelper64 process relation",
+      "actual new DLL publishes parent name",
+      "client.pid and haptic owner remain helper current PID",
+      "exact selected prior pixel and display-time/epoch/index metadata",
+      "normal cleanup removes private bridge"
+    ],
+    "provider": "CrossOver D3DMetal apple_gptk",
+    "mapped_d3d11_text_fnv32": "dc86fe33",
+    "mapped_dxgi_text_fnv32": "b2b8fad8"
+  },
+  "isolation": {
+    "owned_disposable_prefix": true,
+    "copied_config_unchanged": true,
+    "own_bridge_removed": true,
+    "own_server_shutdown_confirmed": true,
+    "no_game_hid_tcc_or_runtime_registration": true
+  },
+  "limits": [
+    "Synthetic correctness validation, not measured game FPS/latency.",
+    "Missing/reused identity conditions are CPU policy cases; no forced OS PID reuse was attempted.",
+    "Physical Resume/focus acceptance remains a separate host/UI check."
+  ]
+}
