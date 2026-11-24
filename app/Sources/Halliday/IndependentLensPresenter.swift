@@ -14,7 +14,13 @@ final class IndependentLensPresenter: @unchecked Sendable {
         var nativeSequence: UInt64 = 0
         var generated = false
         var trackingGeneration: UInt64 = 0
-        func ending(at time: Double) -> Scene { var value = self; value.ended = time; return value }
+        var predictionGuard: GameSpacewarp.PredictionGuard? = nil
+        func ending(at time: Double) -> Scene {
+            var value = self; value.ended = time
+            if let predictionGuard, predictionGuard.sequence == nativeSequence,
+               !predictionGuard.hasPredictionAfterGPUCompletion { value.generated = false }
+            return value
+        }
     }
     /// Output ownership is explicit, allowing the same production presenter to
     /// be checked with an offscreen Metal texture instead of a physical display.

@@ -1,0 +1,170 @@
+{
+  "scope": "Bounded public-source CPU, Swift compiler and headless Metal correctness checks; generated images only. No game, app, headset, USB/HID, encoder, installation or user setting changes.",
+  "passed": true,
+  "source_sha256": {
+    "app/Sources/Halliday/GameSpacewarp.swift": "484dc52542420301ae5d00054c7bb53673da9befdc87852d788927a190d00016",
+    "app/Resources/spacewarp/composition.metal": "5a0468ea5a90ab3dda3f9656e7acb56972a1fd65c5726e0f34eca05f89f27996",
+    "app/Resources/spacewarp/discontinuity.metal": "b4692798b841c9ec6d28ff131a8e3b615bb23c09bc778effd1f8215423897f2b",
+    "app/Sources/Halliday/GameOpticalFlow.swift": "057e6c5907198fc79ed6c572d5a46e046365fba00d881e3b781caa4821fc7584",
+    "app/Sources/Halliday/GameSpacewarpCadence.swift": "5924ad90604699427e76f6b5bc0b63b3e2c332a7645e1ac445466bb98abd2f1e",
+    "app/Sources/Halliday/Renderer.swift": "25be1f62d8b1edf3c354ef69c3bc0f16ec5824ee56351e589acb77497d9fd76d",
+    "app/Sources/Halliday/IndependentLensPresenter.swift": "002aadd77f7ae5c1d3b776d79cd790fa589a0c0ad6938e9950cc58f51b4a61a3",
+    "tools/tests/GameSpacewarpMetalTests.swift": "34f0a2eab2c663db43f0b25e3d795e0b881e28ae423e64b3cf45c4b392b9f714"
+  },
+  "commands": [
+    "make spacewarp-check",
+    "tools/test-game-spacewarp-metal.sh --build-only",
+    "tools/test-game-spacewarp-metal.sh --run",
+    "tools/test-game-spacewarp-static-metal.sh --build-only",
+    "tools/test-game-spacewarp-static-metal.sh --run",
+    "swiftc -typecheck -swift-version 6 -target arm64-apple-macos14.0 app/Sources/Halliday/*.swift (with repository module/framework search paths)"
+  ],
+  "execution_note": "The two GPU suites were compiled with the checked-in scripts; their exact resulting executables were invoked with repository resource and result paths. Sandbox GPU visibility required an explicitly authorized headless Metal execution. No app was launched.",
+  "cpu": {
+    "cadence_45_to_90_and_60_to_120": true,
+    "per_image_source_time": true,
+    "settings": true,
+    "amd_pinned_hashes_and_mit_notices": true,
+    "production_source_order_and_classification": {
+      "source_records_owned_texture_and_exact_metadata": true,
+      "no_flow_preparation_in_real_scene_encoding": true,
+      "real_commit_precedes_separate_flow_encoding_and_commit": true,
+      "pending_consumed_once_and_checked_against_current_source": true,
+      "reset_cancels_unsubmitted_source": true,
+      "both_real_render_paths_use_real_first_commit": true,
+      "latched_lens_completion_registered_before_real_commit": true,
+      "production_does_not_wait_for_flow": true,
+      "synchronous_snapshot_protects_cpu_replaced_source": true,
+      "flow_alignment_rotation_only_scene_depth_unchanged": true,
+      "prediction_result_bound_to_completed_scene_sequence": true,
+      "renderer_binds_ticket_without_waiting": true
+    }
+  },
+  "swift6_full_typecheck": {
+    "passed": true,
+    "diagnostics": "One pre-existing unused view binding warning in AppDelegate.updateDock; no errors."
+  },
+  "metal": {
+    "passed": true,
+    "checks": [
+      "static bit identity; real-frame priming; no synthetic feedback; repeated sequence",
+      "opposing stereo objects predict forward within two pixels; continuous flow may conservatively shrink an occlusion boundary, without arbitrary background painting",
+      "one-eye AMD cut suppresses the entire stereo pair without CPU readback",
+      "unchanged real eye stays bit exact despite nonzero flow while changing eye still predicts forward",
+      "15-degree combined head rotation plus translation cancelled before flow; max error 1 LSB; current metadata retained",
+      "independent noncommuting eye rotations, translations and asymmetric zoom align before flow; max error 1 LSB",
+      "BGRA sRGB raw view, per-eye linear transfer, canonical vertical flip",
+      "reset, unprimed history, cross-queue rejection, absent-provider safe fallback",
+      "SBS seam remains isolated under opposing large flow; nonfinite flow falls back safely",
+      "queued command buffers preserve independent real histories and consumed outputs",
+      "8continuous translations retain prediction; low-amplitude static/dither and valid head-alignment regressions remain unchanged",
+      "same-pose large image snap suppresses both eye intermediates bit-exactly; next continuous pair reprimes without stale motion",
+      "spatial scene replacement without pose change retains exact new pixels",
+      "partial opaque UI appearance falls back as a whole pair; no local tiled fallback seams",
+      "one-eye-only new menu forces both real eyes; exact per-pair completion ticket reports real output",
+      "authentic AMD\u2192composition moves opposite-eye textured objects forward, centroid within3 pixels of \u00b18-pixel forecast",
+      "genuine AMD provider integrated in full-size ordered GPU pipeline; repeated frames reuse motion"
+    ],
+    "static_case_count": 9,
+    "static_max_rgb_error": 0,
+    "static_changed_pixels_over_one_level_max": 0,
+    "static_cases": [
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 0,
+        "head_locked_menu_camera_yaw_jitter_deg": 0,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 2,
+        "head_locked_menu_camera_yaw_jitter_deg": 0,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 2016,
+        "height": 2048,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 2016,
+        "height": 2048,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+        "animated_indicator": false,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+        "animated_indicator": true,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 512,
+        "height": 512,
+        "pattern": 2,
+        "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+        "animated_indicator": true,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      },
+      {
+        "eye_width": 2016,
+        "height": 2048,
+        "pattern": 1,
+        "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+        "animated_indicator": true,
+        "frames": 10,
+        "changed_pixels_over_one_level_max": 0,
+        "max_rgb_error": 0
+      }
+    ]
+  },
+  "limits": [
+    "Image-only extrapolation, not AMD FSR Frame Generation or depth/motion-vector ASW.",
+    "This public source was not physically retested in a headset; retained local acceptance of an earlier development build is not a new public-build comfort measurement.",
+    "No game FPS, optical latency, sustained physical presentation smoothness or universal detection of all scene cuts is inferred.",
+    "The source-wiring assertions cover Renderer/presenter classification; the headless GPU suites execute GameSpacewarp and authentic AMD directly, not the entire physical presentation chain."
+  ]
+}

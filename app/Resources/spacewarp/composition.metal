@@ -51,13 +51,15 @@ float4 eye_sample(texture2d<float, access::sample> image, float2 p, uint eye, ui
 kernel void spacewarp_align(texture2d<float, access::sample> previous [[texture(0)]],
                             texture2d<float, access::read> current [[texture(1)]],
                             texture2d<float, access::write> target [[texture(2)]],
+                            texture2d<float, access::sample> previousLinear [[texture(3)]],
                             constant AlignConstants &u [[buffer(0)]],
                             device atomic_uint *sourceChange [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
     if (any(p >= u.dimensions.xy)) return;
     uint eye = p.x / u.dimensions.z;
-    // Compare real images before camera compensation. In an opaque head-locked
-    // UI, camera jitter is not evidence that its unchanged pixels should move.
-    if (any(previous.read(p).rgb != current.read(p).rgb)) {
+    // Compare real images before camera compensation. Quantization/dither of
+    // at most two encoded levels is not evidence of scene motion. This gate
+    // affects displacement eligibility, never the colour of a real frame.
+    if (any(abs(previous.read(p).rgb - current.read(p).rgb) > float3(2.0 / 255.0 + 1e-6))) {
         uint tile = source_change_index(uint2(p.x % u.dimensions.z, p.y), eye, u.dimensions.z, u.dimensions.y);
         if (atomic_load_explicit(sourceChange + tile, memory_order_relaxed) == 0)
             atomic_fetch_or_explicit(sourceChange + tile, 1u, memory_order_relaxed);
@@ -77,8 +79,12 @@ kernel void spacewarp_align(texture2d<float, access::sample> previous [[texture(
     if (r.z < -1e-4) {
         float2 t = r.xy / -r.z;
         float2 prevUV((t.x - pt.x) / (pt.y - pt.x), (pt.z - t.y) / (pt.z - pt.w));
-        if (all(prevUV >= 0) && all(prevUV <= 1))
-            colour = float4(eye_sample(previous, prevUV * float2(u.dimensions.zy), eye, u.dimensions.z).rgb, 1);
+        if (all(prevUV >= 0) && all(prevUV <= 1)) {
+            bool encoded = (u.dimensions.w & (1u << eye)) != 0;
+            float3 sample = encoded ? eye_sample(previousLinear, prevUV * float2(u.dimensions.zy), eye, u.dimensions.z).rgb
+                                    : eye_sample(previous, prevUV * float2(u.dimensions.zy), eye, u.dimensions.z).rgb;
+            colour = float4(encoded ? encode_srgb(sample) : sample, 1);
+        }
     }
     target.write(colour, p);
 }
@@ -90,10 +96,6 @@ float2 source_flow(texture2d<float, access::read> flow, int2 cell, uint eye, con
     if (!all(isfinite(v)) || length(v) > max(64.0, float(u.dimensions.z) * 0.25)) return float2(0);
     return v;
 }
-int2 flow_cell(float2 pixel, constant SynthesisConstants &u) {
-    return int2(floor(pixel / (u.scaleAlpha.xy * float(u.grid.w))));
-}
-float error_rgb(float3 a, float3 b) { return max(max(abs(a.x-b.x), abs(a.y-b.y)), abs(a.z-b.z)); }
 bool inside_eye(float2 p, constant SynthesisConstants &u) {
     return all(p >= 0.5) && p.x <= float(u.dimensions.z)-0.5 && p.y <= float(u.dimensions.y)-0.5;
 }
@@ -105,72 +107,39 @@ bool real_source_changed(float2 p, uint eye, constant SynthesisConstants &u,
     return atomic_load_explicit(sourceChange + index, memory_order_relaxed) != 0;
 }
 
-// Motion belongs to CURRENT blocks. Pull candidates from nearby current blocks
-// so a moving foreground can reach beyond its current silhouette. Photometric
-// consistency and the head-alignment mask reject unreliable correspondences.
-// No depth is invented: overlap favours supported moving colour, and genuinely
-// unseen/disoccluded content falls back to nearby stable/current colour.
+// Continuous sampling of the current-indexed field. One inverse lookup is
+// causal: no adjacent block competes to paint its colour over this pixel.
+float2 interpolated_flow(texture2d<float, access::read> flow, float2 at,
+                         uint eye, constant SynthesisConstants &u) {
+    float2 gridPoint = at / (u.scaleAlpha.xy * float(u.grid.w)) - 0.5;
+    int2 corner = int2(floor(gridPoint));
+    float2 fraction = fract(gridPoint);
+    float2 top = mix(source_flow(flow,corner,eye,u),source_flow(flow,corner+int2(1,0),eye,u),fraction.x);
+    float2 bottom = mix(source_flow(flow,corner+int2(0,1),eye,u),source_flow(flow,corner+int2(1,1),eye,u),fraction.x);
+    return mix(top,bottom,fraction.y);
+}
+
 kernel void spacewarp_extrapolate(texture2d<float, access::sample> current [[texture(0)]],
                                   texture2d<float, access::sample> alignedPrevious [[texture(1)]],
                                   texture2d<float, access::read> flow [[texture(2)]],
                                   texture2d<uint, access::read> sceneChange [[texture(3)]],
                                   texture2d<float, access::write> target [[texture(4)]],
+                                  texture2d<float, access::sample> currentLinear [[texture(5)]],
                                   constant SynthesisConstants &u [[buffer(0)]],
                                   device atomic_uint *sourceChange [[buffer(1)]], uint2 p [[thread_position_in_grid]]) {
     if (any(p >= u.dimensions.xy)) return;
     uint eye = p.x / u.dimensions.z;
     float2 at(float(p.x % u.dimensions.z)+0.5, float(p.y)+0.5);
-    float3 original = eye_sample(current, at, eye, u.dimensions.z).rgb;
-    if (atomic_load_explicit(sourceChange + eye, memory_order_relaxed) == 0 || sceneChange.read(uint2(eye,0)).x != 0) {
-        target.write(float4(original,1), p); return;
+    float4 original = eye_sample(current,at,eye,u.dimensions.z);
+    if (atomic_load_explicit(sourceChange + eye,memory_order_relaxed)==0 || sceneChange.read(uint2(eye,0)).x!=0) {
+        target.write(float4(original.rgb,1),p); return;
     }
-    int2 cell = flow_cell(at,u);
-    float2 candidates[9]; uint count = 0;
-    for (int y=-1; y<=1; ++y) for (int x=-1; x<=1; ++x) {
-        float2 v = source_flow(flow,cell+int2(x,y),eye,u);
-        bool duplicate = false;
-        for (uint i=0; i<count; ++i) if (distance(v,candidates[i])<0.5) { duplicate=true; break; }
-        if (!duplicate) candidates[count++] = v;
-    }
-    if (count == 1 && length(candidates[0]) < 0.25) { target.write(float4(original,1),p); return; }
-    // Match temporal support before trusting camera-compensated block flow.
-    // A forecast may reach outside a moving silhouette, so check its CURRENT
-    // source location too; a target-only mask would clip it. A change only at
-    // the older correspondence must not launch stationary colours elsewhere.
-    bool changedTarget = real_source_changed(at,eye,u,sourceChange);
-    bool changing = changedTarget;
-    for (uint i=0; i<count && !changing; ++i) {
-        float2 s = at - u.scaleAlpha.z * candidates[i];
-        changing = real_source_changed(s,eye,u,sourceChange);
-    }
-    if (!changing) { target.write(float4(original,1),p); return; }
-    float3 best = original; float bestScore = -1; float2 largest(0);
-    for (uint i=0; i<count; ++i) {
-        float2 v = candidates[i]; if (length(v)>length(largest)) largest=v;
-        float2 s = at - u.scaleAlpha.z*v;
-        if (!inside_eye(s,u) || !inside_eye(s-v,u)) continue;
-        if (!changedTarget && !real_source_changed(s,eye,u,sourceChange)) continue;
-        float2 actual = source_flow(flow,flow_cell(s,u),eye,u);
-        if (distance(actual,v)>max(1.5,0.15*length(v))) continue;
-        float4 prior = eye_sample(alignedPrevious,s-v,eye,u.dimensions.z);
-        float3 colour = eye_sample(current,s,eye,u.dimensions.z).rgb;
-        float error = error_rgb(colour,prior.rgb);
-        if (prior.a < 0.99 || error > 0.20) continue;
-        float score = min(length(v),32.0) * 0.01 + (1-error)*0.1;
-        if (score>bestScore) { bestScore=score; best=colour; }
-    }
-    if (bestScore<0 && changedTarget && length(largest)>0.25) {
-        // A trailing silhouette has no exact inverse sample. Seek a nearby
-        // stationary colour away from its motion; otherwise retain current.
-        float2 away=-normalize(largest);
-        for (uint step=0; step<6; ++step) {
-            float2 s = at + away*float(1u<<step);
-            if (!inside_eye(s,u)) continue;
-            if (length(source_flow(flow,flow_cell(s,u),eye,u))>0.5) continue;
-            float4 prior=eye_sample(alignedPrevious,s,eye,u.dimensions.z);
-            float3 colour=eye_sample(current,s,eye,u.dimensions.z).rgb;
-            if (prior.a>0.99 && error_rgb(colour,prior.rgb)<0.10) { best=colour; break; }
-        }
-    }
-    target.write(float4(best,1),p);
+    float2 velocity = interpolated_flow(flow,at,eye,u);
+    float2 source = at-u.scaleAlpha.z*velocity;
+    bool supported = real_source_changed(at,eye,u,sourceChange) || real_source_changed(source,eye,u,sourceChange);
+    if (!supported || !inside_eye(source,u)) { target.write(float4(original.rgb,1),p); return; }
+    bool encoded = (u.dimensions.w & (1u << eye)) != 0;
+    float3 sample = encoded ? eye_sample(currentLinear,source,eye,u.dimensions.z).rgb
+                            : eye_sample(current,source,eye,u.dimensions.z).rgb;
+    target.write(float4(encoded ? encode_srgb(sample) : sample,1),p);
 }

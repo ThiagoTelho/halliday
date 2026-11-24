@@ -24,19 +24,31 @@ depth buffer, motion-vector integration or graphics-API-specific mod is needed.
   SPIR-V to Metal 3.2. The feature requires macOS 15; preparation failure keeps
   real images and ordinary head reprojection without blocking the display actor.
 - Two real images retain their exact source pose, FOV, eye geometry, UV direction
-  and colour interpretation. Previous colour is camera-aligned using the existing
-  compositor's constant-depth model; optical flow estimates residual image motion.
-- The independent MIT synthesis pass forecasts at most half a real-frame interval.
+  and colour interpretation. Previous colour is aligned using camera rotation and
+  the submitted per-eye FOV, without an invented translation depth; optical flow
+  estimates residual image motion.
+- The independent MIT synthesis pass bilinearly interpolates the motion field
+  and pulls one sample from the current real image. It filters tagged sRGB colour
+  in linear light, without fastest-neighbour selection or distant background painting.
+  It forecasts at most half a real-frame interval.
   No future frame is queued, no extra head prediction is added, and generated
   images never enter real-image history. Latest-head reprojection still runs for
   every physical refresh. There is no CPU readback/wait in production encoding.
 - Source-identical eyes retain exact current pixels before camera compensation
-  can manufacture false motion in a head-locked menu. Per-eye16×16 source-change
+  can manufacture false motion in a head-locked menu. Per-eye 16×16 source-change
   maps also protect unchanged background when a small UI indicator animates.
   Candidates need temporal change at the target or current source location;
-  an older-only correspondence cannot invent motion elsewhere. Scene cuts and unsupported
-  regions conservatively retain current colour. Histories reset on source/geometry,
+  an older-only correspondence cannot invent motion elsewhere. A low-resolution
+  GPU guard also checks broad replacements, snap changes and new menu regions,
+  including changes absent from camera metadata. Cut evidence in either eye
+  retains the exact current real pair for both eyes; it does not paint local
+  fallback tiles or mix stereo phases. The next continuous pair can re-prime.
+  Histories reset on source/geometry,
   cadence, clock, pose, session and effect-state discontinuities.
+- Real scene submission precedes optical-flow preparation in a separate ordered
+  command buffer, so full analysis is outside the real scene completion barrier.
+  The presenter reads an exact-sequence prediction result only after GPU completion,
+  classifying a cut fallback as real without a CPU wait.
 - Once a bounded forecast has been displayed, a missed source retains that exact
   phase instead of reverting to older real pixels. It never starts or advances a
   first forecast from stale motion. See [cadence rationale](spacewarp-cadence.md).
@@ -56,14 +68,22 @@ comfortable gameplay or resolve every previous headset report of judder/artifact
 
 CPU: `tools/test-game-spacewarp-cadence.sh`,
 `tools/test-game-spacewarp-source-time.sh`,
-`tools/test-game-spacewarp-settings.sh` and the offline shader hash/notice check
+`tools/test-game-spacewarp-settings.sh`, the real-first source-order contract
+`tools/tests/test_spacewarp_real_first_order.py`, and the offline shader hash/notice check
 `tools/test-amd-optical-flow-provenance.py` (`make spacewarp-check`).
 
-Opt-in GPU: `tools/test-game-optical-flow-metal.sh`,
-`tools/test-game-spacewarp-metal.sh`, and
-`tools/test-game-spacewarp-static-metal.sh`. The bounded compositor fixture is
+Metal fixtures compile only by default. Explicit bounded GPU execution:
+`tools/test-game-optical-flow-metal.sh --run`,
+`tools/test-game-spacewarp-metal.sh --run`, and
+`tools/test-game-spacewarp-static-metal.sh --run`. The bounded compositor fixture is
 `tools/test-game-spacewarp-preview.py --app <built-app> --output <new-build/validation-folder>`.
 These fixtures use generated images and do not start games, a headset or AppDelegate.
+
+The [current public-source regression](validation/spacewarp-guards.json) covers
+continuous moving pairs, same-pose snap/replacement, partial and one-eye menu
+changes, paired real fallback, next-pair recovery, stereo isolation, and exact
+static pixels, including 2016×2048 per eye. These are bounded headless Metal
+correctness checks, not gameplay or headset measurements.
 
 The saved [GPU pixel comparison](validation/spacewarp-static-pixels.json) records
 unchanged stereo colour with ±0.05° camera jitter at 2016×2048 per eye: maximum

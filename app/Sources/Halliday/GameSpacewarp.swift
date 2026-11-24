@@ -49,6 +49,23 @@ final class GameSpacewarp: @unchecked Sendable {
 
     typealias FlowProvider = @Sendable (MTLTexture, MTLTexture, MTLCommandBuffer) -> Motion?
 
+    struct PredictionGuard: @unchecked Sendable {
+        let sequence: UInt64
+        fileprivate let result: MTLBuffer
+        /// Only read after completion of the ordered command buffer consuming
+        /// this prediction. Each pair owns its result; no reused readback slot.
+        var flagsAfterGPUCompletion: SIMD2<UInt32> {
+            let p = result.contents().assumingMemoryBound(to: UInt32.self)
+            return SIMD2(p[0], p[1])
+        }
+        var hasPredictionAfterGPUCompletion: Bool {
+            let f = flagsAfterGPUCompletion; return f.x == 0 && f.y == 0
+        }
+    }
+    private struct GuardConstants {
+        var dimensions: SIMD4<UInt32>, grid: SIMD4<UInt32>
+        var scaleResidualMotion: SIMD4<Float>, coverage: SIMD4<Float>
+    }
     private struct CanonicalConstants {
         var dimensions: SIMD4<UInt32>
         var flags: SIMD4<UInt32>
@@ -74,6 +91,7 @@ final class GameSpacewarp: @unchecked Sendable {
         let aligned: MTLTexture
         let output: MTLTexture
         let sourceChange: MTLBuffer
+        let guardTiles: MTLTexture, guardEyeCuts: MTLTexture, guardCuts: MTLTexture
     }
 
     private let device: MTLDevice
@@ -81,6 +99,7 @@ final class GameSpacewarp: @unchecked Sendable {
     private let canonicalPipeline: MTLComputePipelineState
     private let alignmentPipeline: MTLComputePipelineState
     private let synthesisPipeline: MTLComputePipelineState
+    private let guardTilesPipeline: MTLComputePipelineState, guardReducePipeline: MTLComputePipelineState, guardPairPipeline: MTLComputePipelineState
     private let lock = NSLock()
     private var queue: MTLCommandQueue?
     private var bank: Bank?
@@ -88,6 +107,8 @@ final class GameSpacewarp: @unchecked Sendable {
     private var sequence: UInt64?
     private var descriptor: Descriptor?
     private var motion: Motion?
+    private var guardTicket: PredictionGuard?
+    var currentPredictionGuard: PredictionGuard? { lock.lock(); defer { lock.unlock() }; return guardTicket }
 
     var historyReady: Bool { lock.lock(); defer { lock.unlock() }; return motion != nil }
     var currentDescriptor: Descriptor? { lock.lock(); defer { lock.unlock() }; return descriptor }
@@ -106,6 +127,13 @@ final class GameSpacewarp: @unchecked Sendable {
         canonicalPipeline = try pipeline("spacewarp_canonical")
         alignmentPipeline = try pipeline("spacewarp_align")
         synthesisPipeline = try pipeline("spacewarp_extrapolate")
+        let guardLibrary = try device.makeLibrary(source: String(contentsOf: folder.appendingPathComponent("discontinuity.metal"), encoding: .utf8), options: nil)
+        guard let tileFunction = guardLibrary.makeFunction(name: "spacewarp_guard_tiles"),
+              let reduceFunction = guardLibrary.makeFunction(name: "spacewarp_guard_reduce"),
+              let pairFunction = guardLibrary.makeFunction(name: "spacewarp_guard_pair") else { throw Failure.kernel("discontinuity guard") }
+        guardTilesPipeline = try device.makeComputePipelineState(function: tileFunction)
+        guardReducePipeline = try device.makeComputePipelineState(function: reduceFunction)
+        guardPairPipeline = try device.makeComputePipelineState(function: pairFunction)
     }
 
     func reset() {
@@ -141,7 +169,7 @@ final class GameSpacewarp: @unchecked Sendable {
         }
         // Advance real history even when flow cannot be produced; never retain
         // metadata for an image slot that has already been overwritten.
-        descriptor = nextDescriptor; sequence = next; motion = nil
+        descriptor = nextDescriptor; sequence = next; motion = nil; guardTicket = nil
         guard let previousDescriptor, let provider else { return true }
         func alignment(_ eye: Int) -> EyeAlignment {
             let currentEye = nextDescriptor.eyeViews?.view(eye)
@@ -161,10 +189,14 @@ final class GameSpacewarp: @unchecked Sendable {
         guard let clear = cb.makeBlitCommandEncoder() else { return true }
         clear.fill(buffer: bank.sourceChange, range: 0..<bank.sourceChange.length, value: 0)
         clear.endEncoding()
-        guard encode(alignmentPipeline, textures: [previous, current, bank.aligned], constants: &align,
+        guard let previousLinear = previous.makeTextureView(pixelFormat: .rgba8Unorm_srgb),
+              encode(alignmentPipeline, textures: [previous, current, bank.aligned, previousLinear], constants: &align,
+                     outputIndex: 2,
                      sourceChange: bank.sourceChange, into: cb),
               let made = provider(bank.aligned, current, cb), valid(made, source: current) else { return true }
-        motion = made
+        guard let guarded = encodeGuard(current: current, previous: bank.aligned, rawPrevious: previous, motion: made,
+                                        sequence: next, bank: bank, cb: cb) else { return true }
+        motion = guarded
         return true
     }
 
@@ -180,18 +212,46 @@ final class GameSpacewarp: @unchecked Sendable {
             grid: SIMD4(UInt32(motion.motion.width / 2), UInt32(motion.motion.height),
                         UInt32(motion.analysisSizePerEye.x), UInt32(motion.blockSize)),
             scaleAlpha: SIMD4(motion.vectorScaleToSource.x, motion.vectorScaleToSource.y, min(0.5, alpha), 0))
-        guard encode(synthesisPipeline, textures: [current, bank.aligned, motion.motion, motion.sceneChange, bank.output],
-                     constants: &constants, sourceChange: bank.sourceChange, into: cb) else { return nil }
+        guard let currentLinear = current.makeTextureView(pixelFormat: .rgba8Unorm_srgb),
+              encode(synthesisPipeline, textures: [current, bank.aligned, motion.motion, motion.sceneChange, bank.output, currentLinear],
+                     constants: &constants, outputIndex: 4, sourceChange: bank.sourceChange, into: cb) else { return nil }
         return bank.output
     }
 
-    private func clearHistory() { sequence = nil; descriptor = nil; motion = nil; index = 0 }
+    private func clearHistory() { sequence = nil; descriptor = nil; motion = nil; guardTicket = nil; index = 0 }
+    private func encodeGuard(current: MTLTexture, previous: MTLTexture, rawPrevious: MTLTexture, motion: Motion,
+                             sequence: UInt64, bank: Bank, cb: MTLCommandBuffer) -> Motion? {
+        var constants = GuardConstants(dimensions: dimensions(current),
+            grid: SIMD4(UInt32(motion.motion.width/2),UInt32(motion.motion.height),UInt32(motion.analysisSizePerEye.x),UInt32(motion.blockSize)),
+            scaleResidualMotion: SIMD4(motion.vectorScaleToSource.x,motion.vectorScaleToSource.y,0.16,0.08),
+            coverage: SIMD4(0.60,0.70,0.65,0))
+        guard encode(guardTilesPipeline,textures:[current,previous,motion.motion,bank.guardTiles,rawPrevious],constants:&constants,outputIndex:3,
+                     sourceChange:bank.sourceChange,into:cb), let reduce = cb.makeComputeCommandEncoder() else { return nil }
+        reduce.label = "Spacewarp pair discontinuity reduction"
+        reduce.setComputePipelineState(guardReducePipeline)
+        for (i,t) in [bank.guardTiles,motion.sceneChange,bank.guardEyeCuts].enumerated() { reduce.setTexture(t,index:i) }
+        reduce.setBytes(&constants,length:MemoryLayout<GuardConstants>.stride,index:0)
+        reduce.dispatchThreadgroups(MTLSize(width:2,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:256,height:1,depth:1))
+        reduce.endEncoding()
+        guard let pair=cb.makeComputeCommandEncoder() else{return nil}
+        pair.setComputePipelineState(guardPairPipeline);pair.setTexture(bank.guardEyeCuts,index:0);pair.setTexture(bank.guardCuts,index:1)
+        pair.dispatchThreads(MTLSize(width:1,height:1,depth:1),threadsPerThreadgroup:MTLSize(width:1,height:1,depth:1));pair.endEncoding()
+        // Diagnostic/classification delivery never blocks source presentation.
+        // The synthesis kernel consumes guardCuts directly on the GPU.
+        guard let result = device.makeBuffer(length:256,options:.storageModeShared),let blit=cb.makeBlitCommandEncoder() else { return nil }
+        blit.copy(from:bank.guardEyeCuts,sourceSlice:0,sourceLevel:0,sourceOrigin:MTLOrigin(),sourceSize:MTLSize(width:2,height:1,depth:1),
+                  to:result,destinationOffset:0,destinationBytesPerRow:256,destinationBytesPerImage:256)
+        blit.endEncoding(); guardTicket = PredictionGuard(sequence:sequence,result:result)
+        return Motion(motion:motion.motion,sceneChange:bank.guardCuts,analysisSizePerEye:motion.analysisSizePerEye,
+                      vectorScaleToSource:motion.vectorScaleToSource,blockSize:motion.blockSize)
+    }
     private func sameQueue(_ cb: MTLCommandBuffer) -> Bool {
         if let queue, queue !== cb.commandQueue { return false }
         queue = cb.commandQueue; return true
     }
     private func dimensions(_ texture: MTLTexture) -> SIMD4<UInt32> {
-        SIMD4(UInt32(texture.width), UInt32(texture.height), UInt32(texture.width / 2), 0)
+        SIMD4(UInt32(texture.width), UInt32(texture.height), UInt32(texture.width / 2),
+              ((descriptor?.colourSpaces.x ?? 0) > 0 ? 1 : 0) | ((descriptor?.colourSpaces.y ?? 0) > 0 ? 2 : 0))
     }
     private func valid(_ d: Descriptor) -> Bool {
         func finite(_ v: SIMD4<Float>) -> Bool { v.x.isFinite && v.y.isFinite && v.z.isFinite && v.w.isFinite }
@@ -233,13 +293,20 @@ final class GameSpacewarp: @unchecked Sendable {
         let changeBytes = (2 + 2 * columns * rows) * MemoryLayout<UInt32>.stride
         guard let sourceChange = device.makeBuffer(length: changeBytes, options: .storageModePrivate) else { throw Failure.allocation }
         sourceChange.label = "Spacewarp real source changes per eye and tile"
+        func uintTexture(_ width: Int, _ height: Int) throws -> MTLTexture {
+            let d=MTLTextureDescriptor.texture2DDescriptor(pixelFormat:.r32Uint,width:width,height:height,mipmapped:false)
+            d.storageMode = .private; d.usage=[.shaderRead,.shaderWrite]
+            guard let t=device.makeTexture(descriptor:d) else { throw Failure.allocation }; return t
+        }
         return try Bank(histories: [texture("Spacewarp real A"), texture("Spacewarp real B")],
                         aligned: texture("Spacewarp head-aligned previous"), output: texture("Spacewarp predicted"),
-                        sourceChange: sourceChange)
+                        sourceChange: sourceChange,guardTiles:uintTexture(columns*2,rows),guardEyeCuts:uintTexture(2,1),guardCuts:uintTexture(2,1))
     }
     private func encode<T: BitwiseCopyable>(_ pipeline: MTLComputePipelineState, textures: [MTLTexture], constants: inout T,
-                           sourceChange: MTLBuffer? = nil, into cb: MTLCommandBuffer) -> Bool {
-        guard let encoder = cb.makeComputeCommandEncoder(), let target = textures.last else { return false }
+                           outputIndex: Int? = nil, sourceChange: MTLBuffer? = nil, into cb: MTLCommandBuffer) -> Bool {
+        let output = outputIndex ?? textures.count - 1
+        guard textures.indices.contains(output), let encoder = cb.makeComputeCommandEncoder() else { return false }
+        let target = textures[output]
         encoder.label = "Spacewarp " + pipeline.label.orEmpty
         encoder.setComputePipelineState(pipeline)
         for (i, texture) in textures.enumerated() { encoder.setTexture(texture, index: i) }

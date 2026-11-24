@@ -426,6 +426,17 @@ final class Renderer {
     private var spacewarpGeometry: SpacewarpGeometry?
     private var spacewarpSourcePose: (sequence: UInt64, orientation: SIMD4<Float>, position: SIMD3<Float>, eyes: ProjectionEyeViews?)?
     private var spacewarpPredictionKey: SIMD2<UInt64>?
+    /// Owned until its ordered preparation command buffer has been submitted.
+    /// The bridge uploads the next real image on this same queue, so it cannot
+    /// overwrite this source before canonicalization has consumed its pixels.
+    private struct PendingSpacewarpSource {
+        let processor: GameSpacewarp
+        let texture: MTLTexture
+        let sequence: UInt64
+        let descriptor: GameSpacewarp.Descriptor
+    }
+    private var pendingSpacewarpSource: PendingSpacewarpSource?
+    private var scenePredictionGuard: GameSpacewarp.PredictionGuard?
     private(set) var spacewarpSourceFrames: UInt64 = 0
     private(set) var spacewarpGeneratedFrames: UInt64 = 0
     var spacewarpPrepared: Bool { spacewarpPreparation.ready != nil }
@@ -436,6 +447,7 @@ final class Renderer {
     }
 
     private func resetSpacewarp() {
+        pendingSpacewarpSource = nil
         if spacewarpEligible {
             spacewarpPreparation.ready?.reset()
             processedGameKey = nil
@@ -482,6 +494,7 @@ final class Renderer {
             discontinuity = discontinuity || sameFrameChangedPose || jumped || eyesJumped || ((prior.eyes == nil) != (original.eyeViews == nil))
         }
         if discontinuity {
+            pendingSpacewarpSource = nil
             processor.reset(); spacewarpCadence.reset(); spacewarpPredictionKey = nil
             processedGameKey = nil
         }
@@ -498,15 +511,17 @@ final class Renderer {
             let descriptor = GameSpacewarp.Descriptor(orientation: original.renderOrientation.vector,
                 position: original.renderPosition, tangentsLeft: original.renderedTangents.left,
                 tangentsRight: original.renderedTangents.right, flipped: original.uvRect.w < 0,
-                colourSpaces: original.colourSpaces, reprojectionDepth: Self.reprojectionDepth,
+                colourSpaces: original.colourSpaces, reprojectionDepth: 0,
                 eyeViews: original.eyeViews)
-            if processor.prepare(source: original.texture, sequence: original.imageSequence,
-                                 descriptor: descriptor, commandBuffer: cb) { spacewarpSourceFrames &+= 1 }
-            else { spacewarpCadence.reset(); processor.reset() }
+            // Real-first: this frame's scene/lens must not wait for AMD flow.
+            // Preparation is submitted separately after its scene buffer.
+            pendingSpacewarpSource = PendingSpacewarpSource(processor: processor,
+                texture: original.texture, sequence: original.imageSequence, descriptor: descriptor)
             return original
         case .predict(let phase):
             guard let generated = processor.synthesize(alpha: phase, commandBuffer: cb),
                   let srgb = generated.makeTextureView(pixelFormat: .rgba8Unorm_srgb) else { return original }
+            scenePredictionGuard = processor.currentPredictionGuard
             var result = original
             result.texture = generated
             result.srgbTexture = srgb
@@ -525,6 +540,34 @@ final class Renderer {
         case .original:
             return original
         }
+    }
+
+    /// Commit the real scene before encoding its optional history/flow work.
+    /// In the latched path, the real buffer's completion can now launch the
+    /// independent lens queue without waiting for the later flow buffer.
+    /// FIFO on `queue` also orders a future bridge upload and synthesis after
+    /// this source's canonical copy; no CPU wait or detached source read exists.
+    @discardableResult
+    private func commitSceneAndPrepareSpacewarp(_ scene: MTLCommandBuffer) -> MTLCommandBuffer? {
+        scene.commit()
+        guard let pending = pendingSpacewarpSource else { return nil }
+        pendingSpacewarpSource = nil
+        guard spacewarpEligible, Settings.shared.gameSpacewarpEnabled,
+              spacewarpSourcePose?.sequence == pending.sequence,
+              let processor = spacewarpPreparation.ready, processor === pending.processor,
+              let flow = queue.makeCommandBuffer() else {
+            resetSpacewarp(); return nil
+        }
+        flow.label = "Spacewarp preparation after real scene"
+        guard processor.prepare(source: pending.texture, sequence: pending.sequence,
+                                descriptor: pending.descriptor, commandBuffer: flow) else {
+            resetSpacewarp(); return nil
+        }
+        // Metal retains resources referenced by the encoders through GPU
+        // completion. The pending record holds the exact source while encoding.
+        flow.commit()
+        spacewarpSourceFrames &+= 1
+        return flow
     }
     private struct GameImageKey: Equatable {
         let source: ObjectIdentifier
@@ -984,8 +1027,12 @@ final class Renderer {
             done?(cb.gpuEndTime)
         }
         if let drawable { cb.present(drawable) }
-        cb.commit()
-        if drawable == nil { cb.waitUntilCompleted() }
+        let flow = commitSceneAndPrepareSpacewarp(cb)
+        if drawable == nil {
+            cb.waitUntilCompleted()
+            // Snapshot callers may replace shared source pixels immediately.
+            flow?.waitUntilCompleted()
+        }
         stats.cpu(CACurrentMediaTime() - cpuStart)
     }
 
@@ -993,6 +1040,7 @@ final class Renderer {
     private func drawScene(head: HeadPose, calibration: [Float], cb: MTLCommandBuffer, output target: (width: Int, height: Int))
         -> (MTLTexture, (width: Int, height: Int)?, Bool) {
         updateMeshes(calibration: calibration)
+        scenePredictionGuard = nil
         for hook in beforeFrame { hook(cb) }
         // Runs on the same GPU queue before reprojection and lens correction;
         // a repeated game frame reuses its already processed texture.
@@ -1273,7 +1321,7 @@ final class Renderer {
         let started = Int64(begin * 1e9)
         let completedScene = IndependentLensPresenter.Scene(texture: scene, rendered: rendered,
             startedNs: started, ended: 0, nativeSequence: projection?.imageSequence ?? 0,
-            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration)
+            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration, predictionGuard: scenePredictionGuard)
         cb.label = "Admitted compositor scene"
         cb.addCompletedHandler { cb in
             let successful = encoded && cb.status == .completed && cb.gpuEndTime > 0
@@ -1281,8 +1329,8 @@ final class Renderer {
             presenter.completed(ticket, scene: successful ? completedScene.ending(at: cb.gpuEndTime) : nil)
             sceneCompleted?(successful, cb.gpuEndTime)
         }
-        // Publish the admitted scene only after its GPU commands complete.
-        cb.commit()
+        // Real scene first; history/flow preparation follows on the same queue.
+        commitSceneAndPrepareSpacewarp(cb)
         stats.cpuWork(CACurrentMediaTime() - begin)
         return true
     }

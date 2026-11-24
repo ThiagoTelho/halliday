@@ -291,6 +291,8 @@ system-game-audio-check:
 .PHONY: spacewarp-check
 spacewarp-check:
 	bash tools/test-game-spacewarp-cadence.sh
+	bash tools/test-game-spacewarp-source-time.sh
+	python3 tools/tests/test_spacewarp_real_first_order.py
 	bash tools/test-game-spacewarp-settings.sh
 	python3 tools/test-amd-optical-flow-provenance.py
 
