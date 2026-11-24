@@ -46,11 +46,14 @@ final class MouseLook: PoseSource {
         if moveKeys.contains("d") { move.x += 1 }
         if moveKeys.contains("e") { move.y += 1 }
         if moveKeys.contains("q") { move.y -= 1 }
+        var velocity = SIMD3<Float>.zero
         if move != .zero {
             let heading = simd_quatf(angle: yaw, axis: [0, 1, 0])
-            position += heading.act(simd_normalize(move)) * 1.5 * dt
+            velocity = heading.act(simd_normalize(move)) * 1.5
+            position += velocity * dt
         }
-        return HeadPose(position: position, orientation: orientation, angularVelocity: .zero, slamAgeNs: 0, predicted: false)
+        return HeadPose(position: position, orientation: orientation, angularVelocity: .zero, slamAgeNs: 0,
+                        predicted: false, linearVelocity: velocity, motionFlags: 1)
     }
 
     func recenter() {

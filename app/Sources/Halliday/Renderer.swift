@@ -52,6 +52,9 @@ struct SceneUniforms {
     var seeFishLeft: simd_float4x4
     var seeFishRight: simd_float4x4
     var seeFish: SIMD4<Float>
+    var projFromWorldOther: simd_float4x4
+    /// w < 0 retains the common-camera desktop fallback.
+    var projShiftOther: SIMD4<Float>
 }
 
 /// Halliday's pointer beam (Night Glass "saber"): from `start` to `end`, landing on a surface or
@@ -112,9 +115,19 @@ struct ProjectionLayer {
     /// (WebXR, videos and the interface) retain their original sampling.
     var gameImage = false
     var imageSequence: UInt64 = 0
+    /// Reception time of this real game image, separate from its predicted head pose.
+    var imageTime: Double = 0
     var gameHalfRate = false
-    var sourceFrameInterval = 1.0 / 90
+    var sourceFrameInterval: Double = 0
+    /// Changes when cadence changes even if no new real image has arrived.
     var gameCadenceEpoch: UInt64 = 0
+    /// Runtime-submitted quads in declaration order, drawn after game-image processing.
+    var composition: OpenXRComposition? = nil
+    var eyeViews: ProjectionEyeViews? = nil
+    /// Explicit diagnostics only. Immutable source identity survives FSR copies.
+    var renderedTangents: (left: SIMD4<Float>, right: SIMD4<Float>) {
+        eyeViews.map { ($0.left.tangents, $0.right.tangents) } ?? tangents
+    }
 }
 
 /// Must match `LayerData` in Shaders.swift.
@@ -517,6 +530,9 @@ final class Renderer {
     private var bakeTime: Float = 0
     private var lastBakeFinished = 0.0
     private static let bakeSize = (width: 4096, height: 2048), bakeStrips = 64
+    /// Encoded work, for the offscreen compositor oracle (no timing/recording).
+    private(set) var environmentBakePasses: UInt64 = 0
+    private(set) var environmentGeometryPasses: UInt64 = 0
 
     /// The Forest's fireflies this frame (xyz in meters, w brightness), worked out once here rather
     /// than per pixel; `firefly_count` in the shader must match.
@@ -567,6 +583,7 @@ final class Renderer {
         pass.colorAttachments[0].loadAction = whole ? .dontCare : .load
         pass.colorAttachments[0].storeAction = .store
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        environmentBakePasses &+= 1
         enc.setRenderPipelineState(pipeline)
         var uniforms = SIMD4<Float>(Float(environment), bakeTime, 1.65, 0)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
@@ -614,6 +631,14 @@ final class Renderer {
     var recenterProgress: Float = 0
     /// The pointer beam; nil hides it (the cursor ring alone is drawn, as before).
     var saber: Saber?
+
+    /// An immersive game owns its pointer. Halliday's menu beam and independent
+    /// head-direction ring must both disappear, including while the game loads.
+    /// Only an explicit mouse-enabled game overlay can supply a host beam there.
+    func setInterfacePointer(_ menu: Saber?, direction: SIMD3<Float>, gameActive: Bool, gameOverlay: Saber?) {
+        cursorDirection = gameActive ? nil : direction
+        saber = gameActive ? gameOverlay : menu
+    }
     /// The colored boxes around the origin (front red, left green, right blue, behind yellow), for
     /// checking tracking and orientation. Off by default (`--reference-boxes`).
     var showReferenceBoxes = false
@@ -713,6 +738,9 @@ final class Renderer {
             let t = desktopTanHalfWidth, v = t * Float(desktop.height) / Float(desktop.width)
             tangents = SIMD4(-t, t, v, -v)
         }
+        let submittedEye = projection?.eyeViews?.view(eye == .left ? 0 : 1)
+        let submittedOther = desktop != nil ? projection?.eyeViews?.right : nil
+        let projectionOrigin = desktop != nil ? head.position : eyePos
         return SceneUniforms(
             tanLRUD: tangents,
             eyePosition: SIMD4(eyePos, 1),
@@ -720,9 +748,10 @@ final class Renderer {
             params: SIMD4(Float(layerCount), Float(desktop?.width ?? eyeTexture.height), Float(CACurrentMediaTime() - startTime), shownDimming),
             cursor: cursorDirection.map { SIMD4($0, 1) } ?? .zero,
             highlight: SIMD4(Float(highlight ?? -1), sceneBrightness, 0, 0),
-            projFromWorld: projection.map { simd_float4x4($0.renderOrientation.inverse) } ?? matrix_identity_float4x4,
+            projFromWorld: submittedEye.map { simd_float4x4($0.orientation.inverse) }
+                ?? projection.map { simd_float4x4($0.renderOrientation.inverse) } ?? matrix_identity_float4x4,
             projUV: projection?.uvRect ?? .zero,
-            projTan: projection.map { eye == .left ? $0.tangents.left : $0.tangents.right } ?? .zero,
+            projTan: projection.map { eye == .left ? $0.renderedTangents.left : $0.renderedTangents.right } ?? .zero,
             projFlags: SIMD4(projection == nil ? 0 : 1, eye == .left ? 0 : 1, scene3D == nil ? 0 : 1, gameLayers == nil && gameAway == 0 ? 0 : 1),
             videoFromWorld: sphere.map { simd_float4x4($0.orientation.inverse) } ?? matrix_identity_float4x4,
             videoParams: sphere.map { SIMD4(Float($0.projection + 1), Float($0.stereo), $0.fisheyeFovDeg * .pi / 180, $0.zoom) } ?? .zero,
@@ -735,17 +764,20 @@ final class Renderer {
             saberParams: SIMD4(saberEnergy, saberPress, saber?.fromHand == false ? 1 : 0, environmentFade),
             envParams: SIMD4(showReferenceBoxes ? 1 : 0, recenterProgress,
                              Float(environment == 4 && environmentTexture == nil ? 0 : environment), environmentYaw),
-            projShift: projection.map { SIMD4(head.position - $0.renderPosition, Self.reprojectionDepth) } ?? .zero,
-            projTanOther: desktop != nil ? (projection?.tangents.right ?? .zero) : .zero,
+            projShift: submittedEye.map { SIMD4(projectionOrigin - $0.position, Self.reprojectionDepth) }
+                ?? projection.map { SIMD4(head.position - $0.renderPosition, Self.reprojectionDepth) } ?? .zero,
+            projTanOther: desktop != nil ? (projection?.renderedTangents.right ?? .zero) : .zero,
             gameFade: gameFade, gameBackgroundFade: gameBackgroundFade,
-            gameAway: SIMD4(gameAway, projection?.seeThrough == true ? 1 : 0,
+            gameAway: SIMD4(gameAway, projection?.seeThrough == true || projection?.composition != nil ? 1 : 0,
                 Float(projection?.colourSpaces.x ?? 0), Float(projection?.colourSpaces.y ?? 0)),
             seeFromWorld: simd_float4x4(SIMD4(seeFromWorld.columns.0, 0), SIMD4(seeFromWorld.columns.1, 0),
                                         SIMD4(seeFromWorld.columns.2, 0), SIMD4(0, 0, 0, 1)),
             seeParams: SIMD4(cameraPicture == nil ? 0 : seeThrough, Self.cameraFocal,
                              eye == .left ? Self.cameraCentre.left : Self.cameraCentre.right, Self.cameraCentre.y),
             seeFishLeft: Self.fisheyeMatrix(0), seeFishRight: Self.fisheyeMatrix(1),
-            seeFish: SIMD4(cameraFisheyes && Self.fisheyes.count > 1 ? 1 : 0, Self.fisheyes.first?.k2 ?? 0, Self.fisheyes.dropFirst().first?.k2 ?? 0, 0))
+            seeFish: SIMD4(cameraFisheyes && Self.fisheyes.count > 1 ? 1 : 0, Self.fisheyes.first?.k2 ?? 0, Self.fisheyes.dropFirst().first?.k2 ?? 0, 0),
+            projFromWorldOther: submittedOther.map { simd_float4x4($0.orientation.inverse) } ?? matrix_identity_float4x4,
+            projShiftOther: submittedOther.map { SIMD4(projectionOrigin - $0.position, Self.reprojectionDepth) } ?? SIMD4(0, 0, 0, -1))
     }
 
     // --- Passthrough (ROADMAP W11 E.4) ---
@@ -840,9 +872,15 @@ final class Renderer {
         // Runs on the same GPU queue before reprojection and lens correction;
         // a repeated game frame reuses its already processed texture.
         let sourceProjection = projection
-        if let sourceProjection { projection = gameProjection(sourceProjection, cb: cb) }
+        if let sourceProjection, sourceProjection.composition == nil || sourceProjection.composition?.projectionIndex != nil {
+            projection = gameProjection(sourceProjection, cb: cb)
+        }
         defer { projection = sourceProjection }
-        bakeEnvironment(cb)
+        // scene_fs never reads the place or its geometry while a projection or
+        // surrounding video is active (its `surround` branch, including glass).
+        // Keep the bake/cache clock intact; a visible place resumes normally.
+        let surroundingsVisible = projection == nil && videoSphere == nil
+        if surroundingsVisible { bakeEnvironment(cb) }
         // Eased values (design board 9, "quick": 120 ms): the hover glow of the highlighted layer,
         // the cross-fade of panels whose texture changed, the saber between its states.
         let now = CACurrentMediaTime()
@@ -898,7 +936,7 @@ final class Renderer {
         }
         let desktop = desktopView && sceneTexture !== eyeTexture ? (width: sceneTexture.width, height: sceneTexture.height) : nil
         // 1a. The 3D place's geometry, per eye, into color and distance targets the scene pass reads.
-        if let scene = scene3D { drawGeometry(scene, cb: cb, head: head, target: sceneTexture, desktop: desktop) }
+        if surroundingsVisible, let scene = scene3D { drawGeometry(scene, cb: cb, head: head, target: sceneTexture, desktop: desktop) }
         let sp = MTLRenderPassDescriptor()
         sp.colorAttachments[0].texture = sceneTexture
         sp.colorAttachments[0].loadAction = .dontCare
@@ -925,6 +963,8 @@ final class Renderer {
             enc.setFragmentTexture(scene3D != nil ? meshTargets?.distance ?? placeholder : placeholder, index: 2 * maxLayers + 4)
             enc.setFragmentTexture(cameraPicture ?? placeholder, index: 2 * maxLayers + 5)
             enc.setFragmentTexture(projection?.srgbTexture ?? projection?.texture ?? placeholder, index: 2 * maxLayers + 6)
+            OpenXRComposition.bind(projection?.composition, to: enc, headPosition: head.position,
+                                   headOrientation: head.orientation, placeholder: placeholder)
             let size = Double(eyeTexture.height)
             var lights = Self.fireflies(time: Float(CACurrentMediaTime() - startTime))
             enc.setFragmentBytes(&lights, length: lights.count * MemoryLayout<SIMD4<Float>>.stride, index: 2)
@@ -1071,6 +1111,7 @@ final class Renderer {
             return true
         }
         func end() { lock.lock(); count -= 1; lock.unlock() }
+        func snapshotCount() -> Int { lock.lock(); defer { lock.unlock() }; return count }
     }
 
     /// The lens pass: what it needs, so it can be encoded on any thread.
@@ -1147,6 +1188,7 @@ final class Renderer {
         pass.depthAttachment.clearDepth = 1
         pass.depthAttachment.storeAction = .dontCare
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        environmentGeometryPasses &+= 1
         enc.setRenderPipelineState(meshPipeline)
         enc.setDepthStencilState(meshDepthState)
         enc.setFragmentSamplerState(sampler, index: 0)

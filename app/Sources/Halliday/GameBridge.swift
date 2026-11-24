@@ -20,22 +20,25 @@ import ScreenCaptureKit
 @MainActor
 final class GameBridge {
     /// Halliday's OpenVR runtime folder (what `openvrpaths.vrpath` points at).
-    nonisolated static let folder: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Halliday/OpenVR")
+    nonisolated static let folder = RuntimePaths.support.appendingPathComponent("OpenVR")
 
-    /// Full game-image target; a reduced render scale is an explicit user choice.
+    /// Native-sized common target, scaled only when the user requests it.
     static let eyeSize = (width: UInt32(GameImagePlan.targetWidth), height: UInt32(GameImagePlan.targetHeight))
     let imageRenderPercent: Int
     private(set) var halfFrameRate: Bool
     private var frameCadence: GameFrameCadence
     private var cadenceEpoch: UInt64 = 1
+    /// Verified physical display rate; the independent host can change cadence in place.
     var physicalDisplayHz: Float { frameCadence.physicalHz }
     var supportsLiveDisplayRate: Bool { bridge != nil }
     private static var nextImageSequence: UInt64 = 0
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
-    private var bridge: OpaquePointer?
+    private var bridgeLease: GameBridgeLease?
+    private var bridge: OpaquePointer? { bridgeLease?.pointer }
+    private var producerState = GameProducerState()
+    private var producerWatchdog = GameProducerWatchdog()
     private var buffer: MTLBuffer?
     private var texture: MTLTexture?
     private var reading = false
@@ -43,6 +46,10 @@ final class GameBridge {
     private var lastFrameTime = 0.0
     private var lastFrameIndex: UInt64 = 0
     private var layer: ProjectionLayer?
+    private var transferView: MTLTexture?
+    private var panelTextures: [UInt32: (raw: MTLTexture, srgb: MTLTexture?)] = [:]
+    private var projectionIPD: Float = 0.063
+    private var independentHaptics: GameHapticFeed?
     private var packet: UInt32 = 0
 
     /// A game is running in Halliday: from its first frame until it shuts VR down or its process
@@ -64,10 +71,12 @@ final class GameBridge {
     private var connectedExe: String?
     /// Called when a game starts or stops running.
     var onChange: ((Bool) -> Void)?
+    /// Queued by the app so the current tick finishes before its mapping retires.
+    var onStaleProducer: ((GameBridge) -> Void)?
 
     // Frames through a window (GameFrames.swift), when the runtime presents them there.
     private var framesDisplay: GameFramesDisplay?
-    private var framesDisplayRequested = false
+    private(set) var framesDisplayRequested = false
     private var capture: GameFrameCapture?
     private var captureStarting = false
     private var captureRetry = 0.0
@@ -136,6 +145,7 @@ final class GameBridge {
         let forward = head.orientation.act(SIMD3<Float>(0, 0, -1))
         originTurn = simd_quatf(angle: atan2(-forward.x, -forward.z), axis: [0, 1, 0])
         originPlace = SIMD3(head.position.x, -floorLift, head.position.z)
+        if clientConnected, let bridge { halliday_bridge_reference_changed(bridge) }
     }
 
     /// How far the user stands above the game's floor beyond their real height (negative:
@@ -162,8 +172,8 @@ final class GameBridge {
         var position: SIMD3<Float>
         var orientation: simd_quatf
         var trigger: Float
-        /// Digital contact stays separate from analog travel.
-        var triggerPressed = false
+        /// Digital click is independent of the measured analog travel.
+        var triggerPressed: Bool = false
         var grip: Bool
         var stick: SIMD2<Float>
         var stickClick: Bool
@@ -173,6 +183,7 @@ final class GameBridge {
         var lower: Bool
         var upper: Bool
         var menu: Bool
+        /// Existing measured room motion, separate from the calibrated aim pose.
         var motion: GameControllerMotion = .stationary
     }
     /// Right, left (as `trigger`), set every frame by the app while a controller is held and a
@@ -207,9 +218,10 @@ final class GameBridge {
     private var loggedKeys: Set<UInt16> = []
 
     /// `displayHz`: the headset display's rate, told to games (90 without one).
-    init?(device: MTLDevice, queue: MTLCommandQueue, displayHz: Float = 90) {
+    init?(device: MTLDevice, queue: MTLCommandQueue, displayHz: Float = 90, ipd: Float = 0.063) {
         self.device = device
         self.queue = queue
+        projectionIPD = ipd
         imageRenderPercent = Settings.shared.gameRenderPercent
         halfFrameRate = Settings.shared.gameHalfFrameRate
         frameCadence = GameFrameCadence(physicalHz: displayHz, halfFrameRate: halfFrameRate)
@@ -222,7 +234,7 @@ final class GameBridge {
         let l = tangents(.left), r = tangents(.right)
         let render = GameImagePlan.renderSize(percent: imageRenderPercent)
         var config = HallidayBridgeConfig(eye_width: UInt32(render.width), eye_height: UInt32(render.height),
-                                          display_hz: frameCadence.gameHz, ipd: 0.063,
+                                          display_hz: frameCadence.gameHz, ipd: ipd,
                                           tangents: ((l.0, l.1, l.2, l.3), (r.0, r.1, r.2, r.3)))
         // The runtime appends to its log in every game process: start it afresh with Halliday,
         // after noting the games that tried to start while Halliday wasn't running.
@@ -238,16 +250,65 @@ final class GameBridge {
             log("[game] couldn't create the bridge file in \(Self.folder.path)")
             return nil
         }
-        bridge = b
+        bridgeLease = GameBridgeLease(pointer: b, release: { halliday_bridge_close($0) })
+        log("[game] render size \(render.width)×\(render.height) per eye (\(imageRenderPercent)%); image target \(GameImagePlan.targetWidth)×\(GameImagePlan.targetHeight)")
+        log("[game] render cadence \(frameCadence.gameHz) Hz; display and pose publication \(frameCadence.physicalHz) Hz")
         buffer = device.makeBuffer(bytesNoCopy: base, length: Int(halliday_bridge_file_size()), options: .storageModeShared, deallocator: nil)
         log("[game] OpenVR runtime ready in \(Self.folder.path) (a game finds it through openvrpaths.vrpath in its Wine prefix)")
+
     }
 
     func close() {
+        producerState.invalidateCallbacks()
+        if let bridge { halliday_bridge_retire(bridge) }
         stopCapture()
-        if let b = bridge { halliday_bridge_close(b) }
-        bridge = nil
+        independentHaptics?.close()
+        independentHaptics = nil
+        buffer = nil
+        bridgeLease = nil
     }
+
+    private func producerSample(_ bridge: OpaquePointer) -> GameProducerWatchdog.Sample? {
+        let status = halliday_bridge_client_status(bridge)
+        let epoch = halliday_bridge_client_epoch(bridge)
+        var client = HallidayBridgeClient()
+        halliday_bridge_client(bridge, &client)
+        guard status == halliday_bridge_client_status(bridge),
+              epoch == halliday_bridge_client_epoch(bridge) else { return nil }
+        return .init(status: status, pid: client.pid, epoch: epoch,
+                     heartbeat: client.heartbeat, frames: client.frames, calls: client.calls)
+    }
+
+    /// The queued recovery must still name the exact silent producer. Replace
+    /// its whole mapping; never clear shared ownership underneath a live client.
+    func confirmStaleProducerRecovery() -> Bool {
+        guard let bridge else { producerWatchdog.reset(); return false }
+        let sample = producerSample(bridge)
+        guard producerWatchdog.confirm(sample, at: CACurrentMediaTime()), let sample else { return false }
+        log("[game] retiring stalled producer PID \(sample.pid), epoch \(sample.epoch), lease \(sample.status): no heartbeat, calls or frames for 5 s; creating a fresh bridge")
+        return true
+    }
+
+    /// Reconfiguration creates new host files only after all current clients leave.
+    var canReconfigureImage: Bool {
+        guard !isPresenting, connectedExe == nil, !reading, !captureStarting,
+              overlaysReading.isEmpty, !skyboxReading else { return false }
+        if let bridge {
+            var client = HallidayBridgeClient()
+            halliday_bridge_client(bridge, &client)
+            if client.initialized != 0, lastBeatTime == 0 || CACurrentMediaTime() - lastBeatTime < 2 { return false }
+        }
+        return true
+    }
+
+    /// Stage the source-built modules before configuring a Windows bottle.
+    /// Original-runtime selection is restored by WindowsOpenXRSupport.configure.
+    func prepareWindowsOpenXR(_ backend: WindowsOpenXRSupport.Backend) throws {
+        guard backend != .external else { return }
+        try WindowsOpenXRSupport.stage(backend)
+    }
+
+    var nativeGameDisplayHz: Float { frameCadence.gameHz }
 
     /// Changes only the game's wake cadence. The public mapping, client/session,
     /// physical display, poses and image dimensions keep their existing lifetimes.
@@ -263,7 +324,7 @@ final class GameBridge {
     }
 
     /// Call only after the physical display confirms its new mode. Images,
-    /// mapping and game session retain their existing lifetimes.
+    /// mapping, producer epoch and XR session retain their existing lifetimes.
     @discardableResult
     func setPhysicalDisplayHz(_ hz: Float) -> Bool {
         guard hz.isFinite, (20...240).contains(hz) else { return false }
@@ -287,16 +348,20 @@ final class GameBridge {
         halliday_bridge_frame_shown(bridge, UInt64(frameCadence.gameInterval * 1e9), false)
     }
 
-    /// Never replace a mapping while a client, capture or GPU read still uses it.
-    var canReconfigureImage: Bool {
-        guard !isPresenting, connectedExe == nil, !reading, !captureStarting,
-              overlaysReading.isEmpty, !skyboxReading else { return false }
-        if let bridge {
-            var client = HallidayBridgeClient()
-            halliday_bridge_client(bridge, &client)
-            if client.initialized != 0, lastBeatTime == 0 || CACurrentMediaTime() - lastBeatTime < 2 { return false }
+    func prepareNativeAlyx(backend: NativeOpenXRSupport.Backend = NativeOpenXRSupport.selectedBackend) throws {
+        guard canReconfigureImage else { throw LaunchFailure("Close the current VR game before starting Alyx.") }
+        try NativeOpenXRSupport.stage(backend)
+        log("[game] native OpenXR ready on the shared game bridge")
+    }
+
+    func setHapticOutput(connected: @escaping GameHapticFeed.Connected,
+                         output: @escaping GameHapticFeed.Output) {
+        independentHaptics?.close()
+        if bridge != nil {
+            independentHaptics = GameHapticFeed(bridgePath: Self.folder.appendingPathComponent("halliday-bridge.shm"),
+                connected: connected, output: output)
+            independentHaptics?.setFocused(!paused)
         }
-        return true
     }
 
     /// Puts the DLL from the app's bundle at `OpenVR/bin/` (OpenVR 1.0 loaders) and
@@ -357,57 +422,19 @@ final class GameBridge {
 
     /// Points a Wine prefix's OpenVR at Halliday: writes `openvrpaths.vrpath` in every user's
     /// `AppData/Local/openvr` (keeping a copy of one that was there). Returns the files written.
-    static func install(prefix: URL) throws -> [URL] {
-        let fm = FileManager.default
-        let users = prefix.appendingPathComponent("drive_c/users")
-        let names = try fm.contentsOfDirectory(atPath: users.path).filter { $0 != "Public" && !$0.hasPrefix(".") }
-        let z = prefix.appendingPathComponent("dosdevices/z:")
-        if (try? fm.destinationOfSymbolicLink(atPath: z.path)) != "/" {
-            log("[game] warning: \(z.path) doesn't point at / : the game may not reach Halliday's folder")
-        }
-        let json: [String: Any] = [
-            "jsonid": "vrpathreg", "version": 1,
-            "runtime": [windowsPath(folder)],
-            "config": [windowsPath(folder.appendingPathComponent("config"))],
-            "log": [windowsPath(folder.appendingPathComponent("logs"))],
-        ]
-        let data = try JSONSerialization.data(withJSONObject: json, options: [.prettyPrinted, .sortedKeys])
-        try fm.createDirectory(at: folder.appendingPathComponent("config"), withIntermediateDirectories: true)
-        try fm.createDirectory(at: folder.appendingPathComponent("logs"), withIntermediateDirectories: true)
-        var written: [URL] = []
-        for name in names {
-            let dir = users.appendingPathComponent(name).appendingPathComponent("AppData/Local/openvr")
-            let file = dir.appendingPathComponent("openvrpaths.vrpath")
-            try fm.createDirectory(at: dir, withIntermediateDirectories: true)
-            let backup = dir.appendingPathComponent("openvrpaths.vrpath.before-halliday")
-            if fm.fileExists(atPath: file.path), !fm.fileExists(atPath: backup.path),
-               let old = try? Data(contentsOf: file), !String(decoding: old, as: UTF8.self).contains("Halliday") {
-                try fm.copyItem(at: file, to: backup)
-            }
-            try data.write(to: file, options: .atomic)
-            written.append(file)
-        }
-        return written
+    static func install(prefix: URL, runtime: URL? = nil) throws -> [URL] {
+        // CrossOver's explicit setup passes its prepared automatic root. Generic GameHub
+        // and --install-openvr callers retain the ordinary self-contained runtime.
+        let selected = runtime ?? folder
+        return try OpenVRRegistration.install(prefix: prefix, runtime: selected)
     }
 
     /// A Mac folder as Windows programs in a Wine prefix see it (through `Z:`, which is `/`).
-    nonisolated static func windowsPath(_ url: URL) -> String { "Z:" + url.path.replacingOccurrences(of: "/", with: "\\") }
+    nonisolated static func windowsPath(_ url: URL) -> String { OpenVRRegistration.windowsPath(url) }
 
-    /// Undoes `install(prefix:)`: puts back the file kept from before, or removes Halliday's.
+    /// Restores the recorded settings only while this registration still belongs to Halliday.
     static func uninstall(prefix: URL) throws {
-        let fm = FileManager.default
-        let users = prefix.appendingPathComponent("drive_c/users")
-        for name in try fm.contentsOfDirectory(atPath: users.path) where name != "Public" && !name.hasPrefix(".") {
-            let dir = users.appendingPathComponent(name).appendingPathComponent("AppData/Local/openvr")
-            let file = dir.appendingPathComponent("openvrpaths.vrpath")
-            let backup = dir.appendingPathComponent("openvrpaths.vrpath.before-halliday")
-            if fm.fileExists(atPath: backup.path) {
-                if fm.fileExists(atPath: file.path) { try fm.removeItem(at: file) }
-                try fm.moveItem(at: backup, to: file)
-            } else if let data = try? Data(contentsOf: file), String(decoding: data, as: UTF8.self).contains("Halliday") {
-                try fm.removeItem(at: file)
-            }
-        }
+        try OpenVRRegistration.uninstall(prefix: prefix, runtime: folder)
     }
 
     // MARK: - Every frame
@@ -442,8 +469,8 @@ final class GameBridge {
             if dt > 0.002, dt < 0.1 { interval += (dt - interval) * 0.05 }
         }
         lastTick = now
-        // A late callback must not change the negotiated game cadence. Publish
-        // timing before waking a game; poses and controllers still update every tick.
+        // The negotiated physical refresh remains authoritative when a UI/GPU
+        // callback is late; a missed callback must not change the game's Hz.
         let gameInterval = frameCadence.gameInterval
         halliday_bridge_frame_shown(b, UInt64(gameInterval * 1e9), false)
         if !clientConnected { recenter(head: head) }
@@ -452,7 +479,9 @@ final class GameBridge {
         let given = ahead ?? head
         state.head = Self.pose(toGame.act(given.position - originPlace), toGame * given.orientation,
             angular: GameControllerMotion.angularInGame(body: given.angularVelocity,
-                bodyOrientation: given.orientation, originTurn: originTurn))
+                bodyOrientation: given.orientation, originTurn: originTurn),
+            linear: toGame.act(given.linearVelocity))
+        var motionMask = given.motionFlags & 3
         // Numbered, so a frame's pose tells when it was published (`poseAges`).
         stamp = stamp >= 0xFF_FFFF ? 1 : stamp + 1
         state.head.stamp = Float(stamp)
@@ -482,8 +511,10 @@ final class GameBridge {
             }
             hands[i] = (at, turn)
             let motion = realHands[hand]?.motion.inGame(originTurn: originTurn, now: now)
+            let validity = realHands[hand]?.motion.validity(originTurn: originTurn, now: now) ?? 0
+            motionMask |= validity << UInt32((i+1)*2)
             c.pose = Self.pose(toGame.act(at - originPlace), toGame * turn,
-                angular: motion?.angular ?? .zero, linear: motion?.linear ?? .zero)
+                               angular: motion?.angular ?? .zero, linear: motion?.linear ?? .zero)
             c.connected = 1
             c.packet = packet
             var pressed: UInt64 = 0, touched: UInt64 = 0
@@ -526,17 +557,41 @@ final class GameBridge {
             }
             if i == 1 { state.controllers.1 = c } else { state.controllers.0 = c }
         }
-        halliday_bridge_publish_frame(b, &state, notifyGame)
+        halliday_bridge_publish_frame_with_motion(b, &state, notifyGame, motionMask)
 
         var client = HallidayBridgeClient()
         halliday_bridge_client(b, &client)
+        let publicEpoch = halliday_bridge_client_epoch(b)
+        if producerWatchdog.observe(producerSample(b), at: now) {
+            onStaleProducer?(self)
+            return nil
+        }
+        let publicChanged = producerState.observe(ready: client.initialized != 0,
+            pid: client.pid, epoch: publicEpoch, frames: client.frames)
+        if publicChanged {
+            if let exe = connectedExe, !isPresenting, client.initialized == 0 {
+                GameLibrary.shared.recordLaunch(exe: exe, minutes: nil, problem: Self.lastRuntimeProblem()
+                    ?? "It connected to Halliday and stopped before its first frame.")
+            }
+            finishPresentation()
+            lastFrames = 0
+            framesAtLastTick = 0
+            lastHeartbeat = 0
+            lastBeatTime = 0
+            lastFrameTime = 0
+            quitAcknowledged = 0
+            connectedExe = nil
+            appName = ""
+        }
         // (An OpenXR application has no VR_Init: it is here from its first frame, and until
         // then the head stays at its world's origin, which is where its LOCAL space begins.)
         clientConnected = client.initialized != 0 || isPresenting
         if client.heartbeat != lastHeartbeat {
             lastHeartbeat = client.heartbeat
             lastBeatTime = now
-            prepareFramesDisplay(b)
+            // Independent OpenXR already publishes complete CPU frame slots;
+            // only legacy OpenVR negotiates the captured presentation window.
+            if client.initialized != 0 && publicEpoch == 0 { prepareFramesDisplay(b) }
         }
         // Only while it beats: a game that crashed or was killed never shut VR down, and its
         // `initialized` stays set (it was taken for a new launch that stopped at once, again and
@@ -544,7 +599,7 @@ final class GameBridge {
         if client.initialized != 0, connectedExe == nil, !isPresenting, lastHeartbeat != 0, now - lastBeatTime < 2 {
             connectedExe = withUnsafeBytes(of: client.name) { String(decoding: $0.prefix { $0 != 0 }, as: UTF8.self) }
         }
-        if client.frames != lastFrames {
+        if client.initialized != 0, client.frames > 0, client.frames != lastFrames {
             lastFrames = client.frames
             lastFrameTime = now
             if !isPresenting {
@@ -574,21 +629,8 @@ final class GameBridge {
             let beating = lastHeartbeat != 0 && now - lastBeatTime < 2
             let alive = beating ? client.initialized != 0 || framesArriving : now - lastFrameTime < 1
             if !alive {
-                if let startedAt {
-                    GameLibrary.shared.recordLaunch(exe: appName, minutes: Int(Date().timeIntervalSince(startedAt) / 60), problem: nil)
-                }
-                isPresenting = false
-                aims = [nil, nil]
-                pointing = nil
-                startedAt = nil
-                gameProcessID = nil
-                setPaused(false)
-                layer = nil
-                lastFrameIndex = 0
-                stopCapture()
-                clearScene()
                 log("[game] \(appName) stopped")
-                onChange?(false)
+                finishPresentation()
             }
         }
         // Intentional half-rate repeats are not missed game frames. Compare the producer only
@@ -597,6 +639,13 @@ final class GameBridge {
         if notifyGame { framesAtLastTick = client.frames }
         if late { halliday_bridge_frame_shown(b, UInt64(gameInterval * 1e9), true) }
         guard isPresenting else { return nil }
+        if publicEpoch != 0 {
+            // Independent OpenXR publishes projection frames only. A previous
+            // OpenVR client may have left a window, grid, fade or overlays here.
+            if !reading { takeFrame(b) }
+            return View(projection: framesArriving ? layer : nil, layers: [], skybox: nil,
+                        fade: .zero, backgroundFade: .zero)
+        }
         takeWindowFrame(b, now: now, pid: client.pid)
         if !reading { takeFrame(b) }
 
@@ -624,17 +673,50 @@ final class GameBridge {
     private var lastScene: (HallidayBridgeScene, [HallidayBridgeOverlay])?
     private var lastShown = ""
 
-    /// Asks the game to quit (OpenVR's `VREvent_Quit`).
-    func requestQuit() {
-        guard let b = bridge, isPresenting else { return }
+    private func finishPresentation() {
+        producerState.invalidateCallbacks()
+        let wasPresenting = isPresenting
+        if let startedAt {
+            GameLibrary.shared.recordLaunch(exe: appName, minutes: Int(Date().timeIntervalSince(startedAt) / 60), problem: nil)
+        }
+        isPresenting = false
+        aims = [nil, nil]
+        pointing = nil
+        startedAt = nil
+        gameProcessID = nil
+        setPaused(false)
+        layer = nil
+        texture = nil
+        transferView = nil
+        panelTextures.removeAll()
+        lastFrameIndex = 0
+        stopCapture()
+        captureStarting = false
+        captureRetry = 0
+        presentState = 0
+        lastNumber = 0
+        windowFrames = 0
+        windowGaps = 0
+        windowStatsStart = 0
+        if framesDisplay == nil { framesDisplayRequested = false }
+        clearScene()
+        if wasPresenting { onChange?(false) }
+    }
+
+    /// Asks the active runtime to quit through its normal OpenVR/OpenXR lifecycle.
+    @discardableResult func requestQuit() -> Bool {
+        guard let b = bridge, isPresenting else { return false }
         log("[game] asking \(appName) to quit")
         halliday_bridge_request_quit(b)
+        return true
     }
 
     /// Halliday's own interface is over the game (it should pause) or not.
     func setDashboard(_ shown: Bool) {
+        if !shown { independentHaptics?.setFocused(true) }
         guard let b = bridge else { return }
         halliday_bridge_set_dashboard(b, shown)
+        if shown { independentHaptics?.setFocused(false) }
     }
 
     /// Halliday comes up over the game, or goes back to it: the game is told (dashboard and input
@@ -772,7 +854,7 @@ final class GameBridge {
             }
             return
         }
-        guard !overlaysReading.contains(i), let buffer else { return }
+        guard !overlaysReading.contains(i), let buffer, let lease = bridgeLease, lease.pointer == b else { return }
         var pic = HallidayBridgePicture()
         guard halliday_bridge_claim_picture(b, Int32(i), overlaySeen[i] ?? 0, &pic) else { return }
         overlaySeen[i] = pic.seq
@@ -791,9 +873,8 @@ final class GameBridge {
         if texture.mipmapLevelCount > 1 { blit.generateMipmaps(for: texture) }
         blit.endEncoding()
         overlaysReading.insert(i)
-        let address = Int(bitPattern: b)
-        cb.addCompletedHandler { [weak self] _ in
-            halliday_bridge_release_picture(OpaquePointer(bitPattern: address), Int32(i))
+        cb.addCompletedHandler { [weak self, lease] _ in
+            halliday_bridge_release_picture(lease.pointer, Int32(i))
             Task { @MainActor in self?.overlaysReading.remove(i) }
         }
         cb.commit()
@@ -814,7 +895,7 @@ final class GameBridge {
     /// The skybox, as a picture around the viewer (equirectangular; a stereo pair top/bottom).
     private func skybox(_ scene: HallidayBridgeScene, b: OpaquePointer) -> VideoSphere? {
         guard scene.skybox != 0 else { return nil }
-        if !skyboxReading, let buffer {
+        if !skyboxReading, let buffer, let lease = bridgeLease, lease.pointer == b {
             var pic = HallidayBridgePicture()
             if halliday_bridge_claim_picture(b, -1, skyboxSeen, &pic) {
                 skyboxSeen = pic.seq
@@ -828,9 +909,8 @@ final class GameBridge {
                               destinationLevel: 0, destinationOrigin: MTLOrigin())
                     blit.endEncoding()
                     skyboxReading = true
-                    let address = Int(bitPattern: b)
-                    cb.addCompletedHandler { [weak self] _ in
-                        halliday_bridge_release_picture(OpaquePointer(bitPattern: address), -1)
+                    cb.addCompletedHandler { [weak self, lease] _ in
+                        halliday_bridge_release_picture(lease.pointer, -1)
                         Task { @MainActor in self?.skyboxReading = false }
                     }
                     cb.commit()
@@ -865,7 +945,8 @@ final class GameBridge {
 
     private func keysFor(_ hand: Int) -> Set<UInt16> { (hand == 1) == shiftHeld ? heldKeys : [] }
 
-    private static func pose(_ p: SIMD3<Float>, _ q: simd_quatf, angular: SIMD3<Float>, linear: SIMD3<Float> = .zero) -> HallidayBridgePose {
+    private static func pose(_ p: SIMD3<Float>, _ q: simd_quatf, angular: SIMD3<Float>,
+                             linear: SIMD3<Float> = .zero) -> HallidayBridgePose {
         var pose = HallidayBridgePose()
         pose.position = (p.x, p.y, p.z)
         pose.valid = 1
@@ -878,13 +959,40 @@ final class GameBridge {
     /// Copies the newest frame into the side-by-side texture on the GPU (no CPU copy: the bridge's
     /// memory is wrapped as a Metal buffer), and releases the slot when the copy is done.
     private func takeFrame(_ b: OpaquePointer) {
+        guard let lease = bridgeLease, lease.pointer == b else { return }
         var f = HallidayBridgeFrame()
         guard halliday_bridge_begin_read(b, &f) else { return }
         // Older than the one shown: the window brought it already (or a game that started again
         // counts from 1: `lastFrameIndex` is reset when a game stops).
         guard f.frame_index > lastFrameIndex, let buffer else { halliday_bridge_end_read(b); return }
-        lastFrameIndex = f.frame_index
+        var geometry = HallidayBridgeProjectionGeometry()
+        let geometryStatus = halliday_bridge_projection_geometry(b, f.slot, f.frame_index, &geometry)
+        guard geometryStatus == 0 || geometryStatus == 1 else { halliday_bridge_end_read(b); return }
+        var eyeViews: ProjectionEyeViews?
+        if geometryStatus == 1 {
+            func decode(_ view: HallidayBridgeProjectionView) -> ProjectionEyeView {
+                let q = simd_quatf(ix: view.orientation.0, iy: view.orientation.1, iz: view.orientation.2, r: view.orientation.3)
+                return ProjectionEyeView(
+                    position: originPlace + originTurn.act(SIMD3(view.position.0, view.position.1, view.position.2)),
+                    orientation: originTurn * simd_normalize(q),
+                    tangents: SIMD4(view.tangents.0, view.tangents.1, view.tangents.2, view.tangents.3))
+            }
+            let decoded = ProjectionEyeViews(left: decode(geometry.views.0), right: decode(geometry.views.1))
+            guard decoded.isValid else { halliday_bridge_end_read(b); return }
+            eyeViews = decoded
+        }
+        guard let prepared = preparePanels(b, frame: f) else {
+            halliday_bridge_end_read(b); return
+        }
+        var submitted = false
+        defer {
+            if !submitted {
+                for copy in prepared.copies { halliday_bridge_release_picture(b, Int32(copy.index)) }
+            }
+        }
         let w = Int(f.width), h = Int(f.height)
+        let colourSpaces = SIMD2<UInt32>(halliday_bridge_frame_color_space(b, f.slot, 0),
+                                         halliday_bridge_frame_color_space(b, f.slot, 1))
         // Each eye's part of its image, in pixels; rows counted from the first row in memory.
         let bounds = [f.bounds.0, f.bounds.1]
         func region(_ e: Int) -> (x: Int, y: Int, w: Int, h: Int) {
@@ -897,14 +1005,17 @@ final class GameBridge {
         let ew = min(regions[0].w, regions[1].w), eh = min(regions[0].h, regions[1].h)
         // Direct3D's BGRA formats keep their byte order: the texture's format reads them right.
         let format: MTLPixelFormat = f.bgra != 0 ? .bgra8Unorm : .rgba8Unorm
-        if texture?.width != ew * 2 || texture?.height != eh || texture?.pixelFormat != format {
+        if texture?.width != ew * 2 || texture?.height != eh || texture?.pixelFormat != format ||
+            texture?.usage.contains(.pixelFormatView) != true {
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: ew * 2, height: eh, mipmapped: false)
-            d.usage = [.shaderRead]
+            d.usage = [.shaderRead, .pixelFormatView]
             d.storageMode = .private
             texture = device.makeTexture(descriptor: d)
+            transferView = texture?.makeTextureView(pixelFormat: f.bgra != 0 ? .bgra8Unorm_srgb : .rgba8Unorm_srgb)
             log("[game] frames of \(w)×\(h) (\(f.bottom_up != 0 ? "OpenGL" : "Direct3D 11"), \(f.bgra != 0 ? "BGRA" : "RGBA")), each eye shown \(ew)×\(eh)")
         }
-        guard let texture, let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else {
+        guard let texture, (transferView != nil || (colourSpaces.x != 2 && colourSpaces.y != 2)),
+              let cb = queue.makeCommandBuffer(), let blit = cb.makeBlitCommandEncoder() else {
             halliday_bridge_end_read(b)
             return
         }
@@ -916,17 +1027,99 @@ final class GameBridge {
                       sourceBytesPerImage: w * 4 * eh, sourceSize: MTLSize(width: ew, height: eh, depth: 1),
                       to: texture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin(x: e * ew, y: 0, z: 0))
         }
+        for copy in prepared.copies {
+            let p = copy.picture
+            blit.copy(from: buffer, sourceOffset: Int(p.offset), sourceBytesPerRow: Int(p.width) * 4,
+                      sourceBytesPerImage: Int(p.width) * Int(p.height) * 4,
+                      sourceSize: MTLSize(width: Int(p.width), height: Int(p.height), depth: 1),
+                      to: copy.texture, destinationSlice: 0, destinationLevel: 0, destinationOrigin: MTLOrigin())
+        }
         blit.endEncoding()
-        let address = Int(bitPattern: b) // the bridge outlives the copy: closed only at quit
-        cb.addCompletedHandler { [weak self] _ in
-            halliday_bridge_end_read(OpaquePointer(bitPattern: address))
+        let panelIndices = prepared.copies.map(\.index)
+        cb.addCompletedHandler { [weak self, lease, panelIndices] _ in
+            halliday_bridge_end_read(lease.pointer)
+            for index in panelIndices { halliday_bridge_release_picture(lease.pointer, Int32(index)) }
             Task { @MainActor in self?.reading = false }
         }
         cb.commit()
+        submitted = true
+        lastFrameIndex = f.frame_index
         // OpenGL rows run bottom-up, Direct3D's top-down; bounds with v min > v max ask for a flip.
         let flipped = (f.bottom_up != 0) == (bounds[0].1 <= bounds[0].3)
-        layer = projectionLayer(texture: texture, flipped: flipped, pose: f.pose)
+        layer = projectionLayer(texture: texture, flipped: flipped, pose: f.pose, eyeViews: eyeViews)
         layer?.seeThrough = f.see_through != 0
+        layer?.srgbTexture = transferView
+        layer?.colourSpaces = colourSpaces
+        layer?.composition = prepared.composition
+    }
+
+    private struct PanelCopy {
+        let index: UInt32
+        let picture: HallidayBridgePicture
+        let texture: MTLTexture
+    }
+    private struct PreparedPanels {
+        let composition: OpenXRComposition?
+        let copies: [PanelCopy]
+    }
+    /// Claim every matching quad image before scheduling any GPU writes. If a
+    /// newer producer image replaced one, retain the previous complete frame.
+    private func preparePanels(_ b: OpaquePointer, frame: HallidayBridgeFrame) -> PreparedPanels? {
+        var batch = HallidayBridgePanelBatch()
+        var records = [HallidayBridgePanel](repeating: HallidayBridgePanel(), count: 8)
+        let status = records.withUnsafeMutableBufferPointer {
+            halliday_bridge_layer_batch(b, frame.slot, frame.frame_index, &batch, $0.baseAddress, 8)
+        }
+        guard status >= 0 else { return nil }
+        guard status == 1 else { return PreparedPanels(composition: nil, copies: []) }
+        // Ordinary opaque projection frames keep the established fast path,
+        // including its exact colour/filtering behavior and processing cache.
+        if batch.count == 0, batch.projection_order != UInt32.max, batch.projection_flags & 1 == 0 {
+            return PreparedPanels(composition: nil, copies: [])
+        }
+        var copies: [PanelCopy] = []
+        var panels: [(order: UInt32, panel: OpenXRComposition.Panel)] = []
+        var complete = false
+        defer {
+            if !complete { for copy in copies { halliday_bridge_release_picture(b, Int32(copy.index)) } }
+        }
+        func alpha(_ flags: UInt32) -> OpenXRComposition.AlphaMode {
+            flags & 1 == 0 ? .opaque : flags & 2 != 0 ? .straight : .premultiplied
+        }
+        for record in records.prefix(Int(batch.count)) {
+            var picture = HallidayBridgePicture()
+            guard halliday_bridge_claim_panel(b, record.picture_index, record.picture_seq, &picture) else { return nil }
+            let format: MTLPixelFormat = record.bgra == 0 ? .rgba8Unorm : .bgra8Unorm
+            var cached = panelTextures[record.picture_index]
+            if cached?.raw.width != Int(picture.width) || cached?.raw.height != Int(picture.height) || cached?.raw.pixelFormat != format {
+                let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: format, width: Int(picture.width), height: Int(picture.height), mipmapped: false)
+                d.usage = [.shaderRead, .pixelFormatView]; d.storageMode = .private
+                if let raw = device.makeTexture(descriptor: d) {
+                    cached = (raw, raw.makeTextureView(pixelFormat: record.bgra == 0 ? .rgba8Unorm_srgb : .bgra8Unorm_srgb))
+                    panelTextures[record.picture_index] = cached
+                } else { cached = nil }
+            }
+            guard let cached, record.color_space != 2 || cached.srgb != nil else {
+                halliday_bridge_release_picture(b, Int32(record.picture_index)); return nil
+            }
+            copies.append(PanelCopy(index: record.picture_index, picture: picture, texture: cached.raw))
+            let p = record.pose
+            let position = SIMD3(p.position.0, p.position.1, p.position.2)
+            let orientation = simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3)
+            let headLocked = record.anchor == 1
+            panels.append((record.order, OpenXRComposition.Panel(texture: cached.raw, srgbTexture: cached.srgb,
+                position: headLocked ? position : originPlace + originTurn.act(position),
+                orientation: headLocked ? orientation : originTurn * orientation,
+                size: SIMD2(record.width_m, record.height_m),
+                eyeVisibility: OpenXRComposition.EyeVisibility(rawValue: record.eye_visibility) ?? .both,
+                alphaMode: alpha(record.flags), colourSpace: record.color_space, headLocked: headLocked)))
+        }
+        panels.sort { $0.order < $1.order }
+        let projectionIndex = batch.projection_order == UInt32.max ? nil : panels.filter { $0.order < batch.projection_order }.count
+        let composition = OpenXRComposition(panels: panels.map(\.panel), projectionIndex: projectionIndex,
+            projectionAlphaMode: alpha(batch.projection_flags))
+        complete = true
+        return PreparedPanels(composition: composition, copies: copies)
     }
 
     // MARK: - Frames through a window
@@ -945,16 +1138,18 @@ final class GameBridge {
             log("[game] no Screen Recording permission: the game's frames are copied (slower) instead of captured from a window")
             return
         }
-        let address = Int(bitPattern: b)
+        guard let lease = bridgeLease, lease.pointer == b else { return }
+        let revision = producerState.revision
         Task { @MainActor [weak self] in
+            guard let self, self.bridgeLease === lease, self.producerState.accepts(revision) else { return }
             guard let display = await GameFramesDisplay.make() else {
                 log("[game] couldn't make the display for game frames: they are copied instead")
                 return
             }
-            guard let self, self.bridge != nil else { return }
+            guard self.bridgeLease === lease, self.producerState.accepts(revision) else { return }
             self.framesDisplay = display
             let origin = display.bounds.origin
-            halliday_bridge_set_present(OpaquePointer(bitPattern: address), true, Int32(origin.x), Int32(origin.y))
+            halliday_bridge_set_present(lease.pointer, true, Int32(origin.x), Int32(origin.y))
         }
     }
 
@@ -984,24 +1179,31 @@ final class GameBridge {
         }
         guard let capture else {
             guard !captureStarting, now >= captureRetry else { return }
+            guard let lease = bridgeLease, lease.pointer == b else { return }
             captureStarting = true
             let (w, h) = (Int(status.width), Int(status.height))
+            let revision = producerState.revision
             Task { @MainActor [weak self] in
-                defer { self?.captureStarting = false }
+                defer {
+                    if self?.producerState.accepts(revision) == true { self?.captureStarting = false }
+                }
+                guard let self, self.bridgeLease === lease, self.producerState.accepts(revision) else { return }
                 guard let window = await GameFrameCapture.findWindow(pid: pid) else {
-                    self?.captureRetry = CACurrentMediaTime() + 0.5
+                    if self.producerState.accepts(revision) { self.captureRetry = CACurrentMediaTime() + 0.5 }
                     return
                 }
+                guard self.bridgeLease === lease, self.producerState.accepts(revision) else { return }
                 let c = GameFrameCapture()
                 do {
                     try await c.start(window: window, width: w, height: h)
-                    guard let self, self.isPresenting else { c.stop(); return }
+                    guard self.bridgeLease === lease, self.producerState.accepts(revision), self.isPresenting else { c.stop(); return }
                     self.capture = c
                     if let pid = window.owningApplication?.processID { self.gameProcessID = pid }
                     log("[game] capturing the frames window \(window.windowID) (\(w)×\(h))")
                 } catch {
+                    guard self.bridgeLease === lease, self.producerState.accepts(revision) else { return }
                     log("[game] couldn't capture the frames window: \(error.localizedDescription)")
-                    self?.captureRetry = CACurrentMediaTime() + 1
+                    self.captureRetry = CACurrentMediaTime() + 1
                 }
             }
             return
@@ -1086,21 +1288,28 @@ final class GameBridge {
         }
     }
 
-    private func projectionLayer(texture: MTLTexture, flipped: Bool, pose p: HallidayBridgePose) -> ProjectionLayer {
+    private func projectionLayer(texture: MTLTexture, flipped: Bool, pose p: HallidayBridgePose,
+                                 eyeViews: ProjectionEyeViews? = nil) -> ProjectionLayer {
         notePoseAge(p)
         Self.nextImageSequence &+= 1
         func tangents(_ eye: Eye) -> SIMD4<Float> {
             let fov = Optics.fov(eye)
             return SIMD4(tan(fov.left), tan(fov.right), tan(fov.up), tan(fov.down))
         }
-        return ProjectionLayer(texture: texture,
+        var projection = ProjectionLayer(texture: texture,
                                uvRect: flipped ? SIMD4(0, 1, 1, -1) : SIMD4(0, 0, 1, 1),
                                renderOrientation: originTurn * simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
                                tangents: (tangents(.left), tangents(.right)),
                                gameImage: true, imageSequence: Self.nextImageSequence,
-                               gameHalfRate: halfFrameRate, sourceFrameInterval: frameCadence.gameInterval,
-                               gameCadenceEpoch: cadenceEpoch)
+                               imageTime: CACurrentMediaTime(), gameHalfRate: halfFrameRate,
+                               sourceFrameInterval: frameCadence.gameInterval, gameCadenceEpoch: cadenceEpoch)
+        if let eyeViews, !eyeViews.matchesLegacy(position: projection.renderPosition, orientation: projection.renderOrientation,
+            ipd: projectionIPD, leftTangents: projection.tangents.left, rightTangents: projection.tangents.right) {
+            projection.eyeViews = eyeViews
+            projection.tangents = (eyeViews.left.tangents, eyeViews.right.tangents)
+        }
+        return projection
     }
 
     // MARK: - Pointing at the game's overlays

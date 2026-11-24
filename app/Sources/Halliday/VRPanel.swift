@@ -169,13 +169,13 @@ class VRPanel {
     }
 
     /// Places the panel `distance` m from the head, `below` degrees under eye level, facing the
-    /// eyes, in the direction the head looks (yaw only).
-    func place(head: HeadPose, distance: Float, below degrees: Float) {
+    /// eyes, in the direction the head looks (yaw only). `yawOffset` is radians to the left.
+    func place(head: HeadPose, distance: Float, below degrees: Float, yawOffset: Float = 0) {
         self.distance = distance
         layer.glide = nil
         layer.width = NightGlass.meters(size.width, at: distance)
         let fwd = head.orientation.act(SIMD3<Float>(0, 0, -1))
-        let yaw = simd_quatf(angle: atan2(-fwd.x, -fwd.z), axis: [0, 1, 0])
+        let yaw = simd_quatf(angle: atan2(-fwd.x, -fwd.z) + yawOffset, axis: [0, 1, 0])
         let pitch = degrees * .pi / 180
         // Tilted back so it faces the eyes from below.
         layer.orientation = yaw * simd_quatf(angle: -pitch, axis: [1, 0, 0])

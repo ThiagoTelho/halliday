@@ -116,6 +116,17 @@ final class Settings {
         didSet { defaults.set(gameHalfFrameRate, forKey: "gameHalfFrameRate"); onChange?() }
     }
 
+    enum NativeOpenXRBackend: String, CaseIterable, Identifiable, Sendable {
+        case halliday = "halliday"
+        var id: String { rawValue }
+        var title: String { "Halliday" }
+    }
+
+    /// Native games use Halliday's source-built runtime.
+    var nativeOpenXRBackend: NativeOpenXRBackend {
+        didSet { defaults.set(nativeOpenXRBackend.rawValue, forKey: "nativeOpenXRBackend"); onChange?() }
+    }
+
     /// Percentage of the full game image rendered by the game, in five-percent steps.
     static let gameRenderPercentRange = 50...100
     var gameRenderPercent: Int {
@@ -154,6 +165,7 @@ final class Settings {
         gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
         gameHalfFrameRate = defaults.bool(forKey: "gameHalfFrameRate")
+        nativeOpenXRBackend = defaults.string(forKey: "nativeOpenXRBackend").flatMap(NativeOpenXRBackend.init(rawValue:)) ?? .halliday
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)
         let sharpness = defaults.object(forKey: "gameSharpness")

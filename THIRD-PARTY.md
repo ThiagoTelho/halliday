@@ -7,6 +7,23 @@ Nothing from Sony is included or distributed: no driver binaries, firmware or SD
 
 The app carries the licence of everything it includes in `Halliday.app/Contents/Resources/Licenses/`.
 
+## Windows OpenXR preview
+
+The optional Windows runtime adapts the MIT-licensed BasaltVR frontend at commit
+`c104bc0b489384745157bc42e357f08d17e41638` (https://github.com/frenchbaguetteman/BasaltVR).
+Its Halliday transport and graphics adaptations are in `windows-openxr/`. The copied files
+retain their notices; the complete license is `windows-openxr/LICENSE-BasaltVR`.
+Khronos OpenXR headers retain their MIT notices and `LICENSE-Khronos-MIT`. The statically
+linked LLVM-MinGW runtime notices are included in `LICENSE-LLVM-MinGW`. These texts also
+ship with the separate CrossOver preview bundle.
+
+The Windows Vulkan backend also uses Khronos Vulkan-Headers (Copyright 2015–2026
+The Khronos Group Inc.), offered under Apache-2.0 OR MIT. This distribution uses
+the MIT option and includes the upstream text in
+`windows-openxr/LICENSE-Khronos-Vulkan-MIT` and the Preview's license folder.
+The Vulkan frontend/readback adaptation uses Halliday's own native implementation;
+no VRmin project source was copied.
+
 ## AMD FidelityFX Super Resolution 1
 
 https://github.com/GPUOpen-Effects/FidelityFX-FSR
@@ -15,7 +32,6 @@ Optional game-image processing uses AMD's MIT-licensed FSR 1 EASU upscaler and
 RCAS sharpener (v1.20210629), translated to Metal with separate bounds for each
 eye. The source and full AMD notice ship in `Contents/Resources/fsr1/`.
 The additional colour-preparation pass is local Halliday integration code.
-
 
 ## Monado
 
@@ -121,6 +137,22 @@ OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
 SOFTWARE.
 ```
 
+## Native Alyx frame bridge (VeRantyx)
+
+The ordinary native Alyx bridge in `native-alyx/frame-bridge/` adapts the MIT
+bridge from [armax9/VeRantyx release v0.3.2-native-moltenvr](https://github.com/armax9/VeRantyx/releases/tag/v0.3.2-native-moltenvr),
+commit `df680b6a8bedf8284d9a2c637274d67aeb658fe0`, derived from
+[Ag3497120/VeRantyx](https://github.com/Ag3497120/VeRantyx) (copyright 2026 Ag3497120).
+The copied controller, loading, upload, warp and shared-frame code retains its
+original behavior; Halliday isolates the wire layout and uses its coherent
+copied-slot reader. Exact original file hashes and local adaptations are in
+`native-alyx/frame-bridge/SOURCE.json`.
+
+The complete MIT notice is `native-alyx/frame-bridge/Native-Alyx-Bridge-MIT.txt`;
+that notice and the upstream `OpenVR-BSD.txt` accompany the executable. The
+Khronos loader-negotiation header retains its Apache-2.0 OR MIT notice, with
+the MIT option used alongside the existing OpenXR header notices above.
+
 ## OpenVR
 
 https://github.com/ValveSoftware/openvr
@@ -219,21 +251,6 @@ The updater behind Halliday's opt-in update checks. Not part of Halliday's sourc
 the XPC services only sandboxed apps need. MIT licensed (Copyright (c) 2006-2013 Andy Matuschak and
 others; its own notices are in its `LICENSE`, also in the bundle's `Licenses/`).
 
-## Windows OpenXR runtime
-
-The Windows ABI, lifecycle, action-space and initial D3D11 frontend derive from
-[BasaltVR](https://github.com/frenchbaguetteman/BasaltVR), revision
-`c104bc0b489384745157bc42e357f08d17e41638` (MIT). Its copyright notice is retained
-in `windows-openxr/LICENSE-BasaltVR`. The original network/video transport and
-graphics-provider patches are not included.
-
-Checked-in OpenXR headers retain the Khronos MIT notice in
-`windows-openxr/LICENSE-Khronos-MIT`; they came from Monado revision
-`ae43b1893e4544189bb6333c79e19dc3ecfee673`. No Monado runtime source is included.
-Public Vulkan SDK headers retain `windows-openxr/LICENSE-Khronos-Vulkan-MIT`.
-Windows builds use an independently installed LLVM-MinGW toolchain; its runtime
-notice is recorded in `windows-openxr/LICENSE-LLVM-MinGW`.
-
 ## LLVM compiler-rt
 
 https://github.com/llvm/llvm-project/tree/main/compiler-rt
@@ -241,3 +258,9 @@ https://github.com/llvm/llvm-project/tree/main/compiler-rt
 The x86-64 stack probe `__chkstk` in `core/halliday-vrclient/src/lib.rs` follows compiler-rt's
 `chkstk.S`. Licensed under the Apache License 2.0 with LLVM Exceptions
 (https://llvm.org/LICENSE.txt).
+
+## nlohmann/json
+
+https://github.com/nlohmann/json (3.11.3, MIT, copyright Niels Lohmann).
+The automatic Windows VR routers use its JSON parser. Its notice is retained in
+`windows-openxr/router/LICENSE-nlohmann-json` and the Preview bundle's Licenses.

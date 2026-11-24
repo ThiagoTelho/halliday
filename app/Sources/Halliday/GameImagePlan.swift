@@ -1,7 +1,8 @@
 import Foundation
 
-/// Full image budget for shared game projection. The panel is 2000×2040;
-/// 32-pixel-aligned dimensions fit the bridge's 4096-pixel stereo limit.
+/// One common image budget for the current OpenVR and OpenXR transports.
+/// The panel is 2000×2040; both dimensions also satisfy the native runtime's
+/// 32-pixel alignment and the independent bridge's 4096-pixel stereo limit.
 enum GameImagePlan {
     static let targetWidth = 2016
     static let targetHeight = 2048

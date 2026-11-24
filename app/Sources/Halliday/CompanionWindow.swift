@@ -17,8 +17,6 @@ struct CompanionStatus: Equatable {
     var onHeadset = false
     var headset = "Not connected"
     var displayHz = 0
-    var refreshRates: [Int] = []
-    var refreshSwitching = false
     var framesPerSecond = 0.0
     var controllers: [String] = []
     var playing: String?
@@ -29,15 +27,26 @@ struct CompanionStatus: Equatable {
     /// is a headset to switch to at all.
     var desktopMode = false
     var canSwitchOutput = false
+    var refreshRates: [Int] = []
+    var refreshSwitching = false
 }
 
-/// A Windows VR game of GameHub's, as the companion lists it.
+/// A Windows VR game from any supported Wine application.
 struct CompanionGame: Equatable, Identifiable {
     let id: String
     let name: String
     let status: String
+    let source: String
+    var canPlay = false
     /// Set up for Halliday (Undo is offered), or still to set up; nil: nothing to do yet.
     let setUp: Bool?
+}
+
+struct CompanionGameLibrary {
+    var games: [CompanionGame]
+    var hasGameHub: Bool
+    var crossOverInstallations: [CrossOverInstallation]
+    var selectedCrossOverPath: String
 }
 
 /// A window of the Mac, as the companion lists it.
@@ -63,14 +72,25 @@ struct CompanionFrame: Equatable {
 final class CompanionModel: ObservableObject {
     @Published var games: [CompanionGame] = []
     @Published var hasGameHub = false
+    @Published var crossOverInstallations: [CrossOverInstallation] = []
+    @Published var selectedCrossOverPath = ""
+    @Published var windowsOpenXRPreview = false
+    @Published var windowsOpenXRBackend = WindowsOpenXRSupport.Backend.automatic
     @Published var macWindows: [CompanionMacWindow] = []
     @Published var windowsLoading = false
     @Published var frame = CompanionFrame()
     /// The last minutes' GPU time a frame, oldest first (for the chart).
     @Published var frameHistory: [Double] = []
 
-    var readGames: (() -> (games: [CompanionGame], hasGameHub: Bool))?
+    var readGames: (() -> CompanionGameLibrary)?
     var onGame: ((String, Bool) -> Void)?
+    var onPlayGame: ((String) -> Void)?
+    var onChooseCrossOver: ((String) -> Void)?
+    var onOpenCrossOver: (() -> Void)?
+    var onImportWindowsGame: (() -> Void)?
+    var onRefreshGames: (() -> Void)?
+    var onWindowsOpenXRPreview: ((Bool) -> Void)?
+    var onWindowsOpenXRBackend: ((WindowsOpenXRSupport.Backend) -> Void)?
     var onOpenGameHub: (() -> Void)?
     var readWindows: (() async -> [CompanionMacWindow])?
     var onWindow: ((UInt32, Bool) async -> Void)?
@@ -133,6 +153,8 @@ final class CompanionModel: ObservableObject {
         if let g = readGames?() {
             if g.games != games { games = g.games }
             if g.hasGameHub != hasGameHub { hasGameHub = g.hasGameHub }
+            if g.crossOverInstallations != crossOverInstallations { crossOverInstallations = g.crossOverInstallations }
+            if g.selectedCrossOverPath != selectedCrossOverPath { selectedCrossOverPath = g.selectedCrossOverPath }
         }
         if let f = readFrame?(), f != frame {
             frame = f
@@ -247,7 +269,7 @@ final class CompanionWindow: NSObject, NSWindowDelegate {
 // MARK: - Views
 
 private enum Section: String, CaseIterable, Identifiable {
-    case overview = "Overview", sound = "Sound and display", space = "Space", apps = "Apps", extensions = "Extensions", games = "Windows games",
+    case overview = "Overview", sound = "Sound and display", space = "Space", apps = "Apps", extensions = "Extensions", games = "Games",
          windows = "Mac windows", browser = "Browser", tracking = "Tracking", performance = "Performance", controls = "Controls"
     var id: String { rawValue }
     var symbol: String {
@@ -268,6 +290,11 @@ private enum Section: String, CaseIterable, Identifiable {
 }
 
 let companionAccent = Color(red: 0x8A / 255, green: 0xB4 / 255, blue: 1)
+
+@MainActor
+func nativeOpenXRSnapshotView() -> some View {
+    CompanionView(model: CompanionModel(), initialSection: .games)
+}
 
 private struct CompanionView: View {
     @ObservedObject var model: CompanionModel
@@ -381,9 +408,13 @@ private struct CompanionView: View {
 extension CompanionSnapshot {
     /// Uses the real companion navigation and controls; no visible window or setup changes.
     static func gameImage(to path: String) {
-        render(CompanionView(model: CompanionModel(), initialSection: .sound), to: path,
-               size: CGSize(width: 1060, height: 1060))
+        let model = CompanionModel()
+        model.status.refreshRates = [90, 120]
+        model.status.displayHz = 120
+        render(CompanionView(model: model, initialSection: .sound), to: path,
+               size: CGSize(width: 1060, height: 1200))
     }
+
 }
 
 struct CompanionCard<Content: View>: View {
@@ -542,16 +573,17 @@ private struct SoundPane: View {
                 .font(.callout).foregroundStyle(.secondary).monospacedDigit()
             Text("Lower is faster; higher keeps more detail. Restart the game to apply render scale.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("Half frame rate", isOn: model.setting(\.gameHalfFrameRate)).toggleStyle(.switch)
+            Toggle("Half frame rate", isOn: Binding(get: { s.gameHalfFrameRate },
+                set: { model.setting(\.gameHalfFrameRate).wrappedValue = $0 })).toggleStyle(.switch)
                 .accessibilityIdentifier("game.halfFrameRate")
             Text("60 game FPS at 120 Hz, or 45 at 90 Hz. Applies live with Halliday's runtime; headset tracking and display stay at full rate.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("RCAS sharpening", isOn: model.setting(\.gameSharpeningEnabled)).toggleStyle(.switch)
             LevelRow(title: "Sharpness", value: "\(Int((s.gameSharpness * 100).rounded()))%",
                      level: model.setting(\.gameSharpness), range: Settings.gameSharpnessRange, step: 0.05)
-            Text("Sharpening works with FSR on or off. Both switches and sharpness apply immediately.")
+            Text("Sharpening works with FSR on or off. FSR and sharpening changes apply immediately.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Text("At 100% with both switches off, the game image is shown unchanged.")
+            Text("At 100% with FSR and sharpening off, the game image is shown unchanged.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         CompanionCard(title: "Sound") {
@@ -595,6 +627,8 @@ private struct SpacePane: View {
             LevelRow(title: "Pointer speed", value: String(format: "%.1f×", s.pointerSpeed), level: model.setting(\.pointerSpeed),
                      range: Settings.pointerSpeedRange, step: 0.1)
             Toggle("Reduce motion", isOn: model.setting(\.reduceMotion))
+            Text("Interface animations only; game frame rate is unchanged.")
+                .font(.caption).foregroundStyle(.secondary)
             Toggle("Open the keyboard when a text field is chosen", isOn: model.setting(\.keyboardAuto))
             Toggle("Remember the windows' layout for each set of apps", isOn: model.setting(\.rememberLayouts))
         }
@@ -665,7 +699,7 @@ private struct AppsPane: View {
         } message: {
             Text("The app and what it saved in Halliday are deleted.")
         }
-        Text("Windows VR games come from GameHub: see Windows games.").font(.callout).foregroundStyle(.secondary)
+        Text("Native Alyx and Windows VR games are listed in Games.").font(.callout).foregroundStyle(.secondary)
             .sheet(item: Binding(get: { editing.map(EditedApp.init) }, set: { if $0 == nil { editing = nil } })) { edited in
                 AppSettingsSheet(app: edited.app) { editing = nil }
             }
@@ -707,7 +741,7 @@ private struct TrackingPane: View {
                 .font(.callout).foregroundStyle(.secondary)
         }
         CompanionCard(title: "Controllers") {
-            Text("To set where a controller points: in the headset, look straight ahead, point it at the middle of your view and press Create or Options. Hold PS to recenter everything.")
+            Text("Controller aim uses its default alignment. Hold PS to recenter. In a game, tap PS to open or close Halliday; intentional pointer calibration is available in the game panel.")
                 .font(.callout).foregroundStyle(.secondary)
             Button { model.onRecenter?() } label: { Label("Recenter", systemImage: "scope") }
         }
@@ -776,30 +810,64 @@ private struct AppSettingsSheet: View {
 private struct GamesPane: View {
     @ObservedObject var model: CompanionModel
     var body: some View {
-        CompanionCard(title: "GameHub") {
+        CompanionCard(title: "Windows VR") {
             HStack(spacing: 14) {
                 Image(systemName: "desktopcomputer").font(.system(size: 26)).foregroundStyle(companionAccent)
                 VStack(alignment: .leading, spacing: 3) {
-                    Text(model.hasGameHub ? "Windows VR games run through GameHub" : "GameHub isn't on this Mac").font(.headline)
-                    Text("Halliday becomes a game's VR runtime in place of SteamVR: one small file in the game's own container, put back by Undo.")
+                    Text("GameHub and CrossOver").font(.headline)
+                    Text("Set up once per bottle, then launch games from Steam or CrossOver as usual. Undo restores the bottle's previous VR settings.")
                         .font(.callout).foregroundStyle(.secondary)
                 }
                 Spacer()
                 if model.hasGameHub { Button("Open GameHub") { model.onOpenGameHub?() }.controlSize(.large) }
             }
+            if !model.crossOverInstallations.isEmpty {
+                Picker("CrossOver version", selection: Binding(get: { model.selectedCrossOverPath }, set: { model.onChooseCrossOver?($0) })) {
+                    ForEach(model.crossOverInstallations, id: \.id) { installation in
+                        Text(installation.name).tag(installation.applicationURL.path)
+                    }
+                }
+                HStack {
+                    Button("Open CrossOver") { model.onOpenCrossOver?() }
+                    Button("Add Windows game…") { model.onImportWindowsGame?() }
+                    Spacer()
+                    Text("Use the version that normally opens this bottle.").font(.caption).foregroundStyle(.secondary)
+                }
+                Toggle("Windows OpenXR (experimental)", isOn: Binding(get: { model.windowsOpenXRPreview }, set: { model.onWindowsOpenXRPreview?($0) }))
+                Picker("OpenXR runtime", selection: Binding(get: { model.windowsOpenXRBackend }, set: { model.onWindowsOpenXRBackend?($0) })) {
+                    ForEach(WindowsOpenXRSupport.Backend.allCases) { backend in
+                        Text(backend.title).tag(backend)
+                    }
+                }.disabled(!model.windowsOpenXRPreview)
+                Text("Automatic headset selects Halliday for PS VR2 and preserves the bottle's original runtime as an optional alternative. The choice stays fixed while a game runs.")
+                    .font(.caption).foregroundStyle(.secondary)
+            }
+        }
+        CompanionCard(title: "Native Alyx") {
+            Text(NativeOpenXRSupport.bundledFolder(for: .halliday) == nil
+                ? "The native runtime is not included in this build."
+                : "Native Alyx uses Halliday's OpenXR runtime; its original launcher remains unchanged.")
+                .font(.caption).foregroundStyle(.secondary)
         }
         CompanionCard(title: model.games.isEmpty ? "Games" : "Games · \(model.games.count)") {
+            HStack {
+                Text("Installed games").font(.headline)
+                Spacer()
+                Button("Refresh") { model.onRefreshGames?() }
+            }
             if model.games.isEmpty {
-                Text(model.hasGameHub ? "No SteamVR games in GameHub yet." : "Nothing to show.").foregroundStyle(.secondary)
+                Text("No VR games found. Refresh after installing a game, or add its executable manually.").foregroundStyle(.secondary)
             }
             ForEach(model.games) { game in
                 HStack(spacing: 12) {
                     Image(systemName: "gamecontroller.fill").font(.system(size: 20)).foregroundStyle(companionAccent.opacity(0.8)).frame(width: 28)
                     VStack(alignment: .leading, spacing: 2) {
                         Text(game.name)
+                        Text(game.source).font(.caption).foregroundStyle(.secondary)
                         Text(game.status).font(.callout).foregroundStyle(.secondary)
                     }
                     Spacer()
+                    if game.canPlay { Button("Play") { model.onPlayGame?(game.id) } }
                     if let setUp = game.setUp {
                         Button(setUp ? "Undo set-up" : "Set up for Halliday") { model.onGame?(game.id, !setUp) }
                     }
@@ -912,8 +980,8 @@ private struct ControlsPane: View {
                         SenseSchematic().frame(width: 150, height: 170)
                     }
                     legend([("1", "Trigger", "click; hold to drag"), ("2", "Grip (L1 · R1)", "secondary click"), ("3", "Stick", "scroll"),
-                            ("4", "PS", "hold: recenter · tap: aim, or Halliday over a game"), ("5", "Square · Cross", "a video's bar, hide or show"),
-                            ("6", "Triangle · Circle", "in games: Y / B"), ("7", "Create · Options", "as a tap of PS")])
+                            ("4", "PS", "hold: recenter · in games, tap: Halliday"), ("5", "Square · Cross", "a video's bar, hide or show"),
+                            ("6", "Triangle · Circle", "in games: Y / B"), ("7", "Create · Options", "game menu (in games)")])
                 }
             }
             Text("Drawn for orientation, not to scale.").font(.caption).foregroundStyle(.secondary)

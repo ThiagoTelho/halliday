@@ -80,12 +80,14 @@ $(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licen
 	tools/collect-licenses.sh $(APP)/Contents/Resources/Licenses
 	@# Sparkle, without its XPC services (only sandboxed apps need them), each part signed inside out.
 	rm -rf $(APP)/Contents/Frameworks && mkdir -p $(APP)/Contents/Frameworks
-	ditto $(SPARKLE) $(APP)/Contents/Frameworks/Sparkle.framework
+	ditto --norsrc --noextattr $(SPARKLE) $(APP)/Contents/Frameworks/Sparkle.framework
 	rm -rf $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices $(APP)/Contents/Frameworks/Sparkle.framework/XPCServices
+	xattr -cr $(APP)/Contents/Frameworks/Sparkle.framework
 	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
 	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app
 	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework
 	cp $(BUILD)/halliday $(APP)/Contents/MacOS/halliday
+	xattr -cr $(APP)
 	codesign --force --options runtime --entitlements app/Halliday-dev.entitlements --sign "$(SIGN_ID)" $(APP)
 
 app: $(APP)
@@ -199,6 +201,49 @@ openxr-metal-check: openxr
 test:
 	$(REMAP) cargo test --manifest-path core/Cargo.toml
 
+# CrossOver integration and the separate Windows OpenXR preview. All fixture tests are
+# hardware-independent; Wine smoke tests use disposable bottles and are invoked separately.
+.PHONY: crossover-check windows-openxr windows-openxr-check windows-openxr-router independent-native-openxr native-alyx native-alyx-frame-bridge vr-modules vr-package crossover-preview
+crossover-check:
+	tools/test-crossover-library.sh
+	tools/check-openvr-registration.sh
+	tools/check-windows-openxr-registration.sh
+	tools/test-crossover-launcher.sh
+
+windows-openxr:
+	python3 windows-openxr/build.py windows --jobs $(VR_JOBS)
+	tools/build-windows-openxr-registry.sh
+
+windows-openxr-check:
+	python3 windows-openxr/build.py native --jobs $(VR_JOBS)
+
+windows-openxr-router:
+	python3 windows-openxr/router/build.py
+	python3 windows-openxr/router/build_openvr.py
+
+independent-native-openxr:
+	tools/build-independent-native-openxr.sh
+
+native-alyx:
+	python3 native-alyx/build.py
+
+# The coherent native reader is optional and only needs a public Vulkan SDK/library.
+# Example: make native-alyx-frame-bridge MOLTENVK_LIBRARY=/path/libMoltenVK.dylib VULKAN_INCLUDE=/path/include
+native-alyx-frame-bridge:
+	@test -n "$(MOLTENVK_LIBRARY)" || { echo "Set MOLTENVK_LIBRARY to a public SDK libMoltenVK.dylib"; exit 2; }
+	native-alyx/build-frame-bridge.sh --moltenvk-library "$(MOLTENVK_LIBRARY)" $(if $(VULKAN_INCLUDE),--vulkan-include "$(VULKAN_INCLUDE)")
+
+# Optional source-built desktop game modules. Ordinary make app does not need these
+# Windows/Rust targets or any game, headset, installed runtime or private cache.
+vr-modules: windows-openxr windows-openxr-router independent-native-openxr native-alyx
+
+vr-package: app vr-modules
+	HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh
+
+# Explicit local development identity, isolated from the ordinary app and its updater.
+crossover-preview: app vr-modules
+	HALLIDAY_PACKAGE_DEVELOPMENT=1 HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh
+
 lint:
 	tools/check-privacy.sh
 	cargo fmt --all --manifest-path core/Cargo.toml --check
@@ -216,16 +261,8 @@ clean:
 	cargo clean --manifest-path core/halliday-vrclient/Cargo.toml
 	rm -rf $(BUILD)
 
-# Optional Windows OpenXR foundation. Neither target runs Wine, accesses a
-# headset, changes a bottle, or adds the runtime to the ordinary app bundle.
 VR_JOBS ?= 2
-.PHONY: windows-openxr windows-openxr-check windows-bridge-check windows-haptic-feed-check
-windows-openxr:
-	python3 windows-openxr/build.py windows --jobs $(VR_JOBS)
-
-windows-openxr-check:
-	python3 windows-openxr/build.py native --jobs $(VR_JOBS)
-
+.PHONY: windows-bridge-check windows-haptic-feed-check
 windows-bridge-check:
 	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-bridge
 	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib game_bridge

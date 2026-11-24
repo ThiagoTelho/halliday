@@ -10,6 +10,8 @@ final class GamesPanel: VRPanel {
     var onClose: (() -> Void)?
     /// Asks AppDelegate to open a URL (GameHub's launch link) or GameHub itself.
     var onPlay: ((GameEntry) -> Void)?
+    var onSetUp: ((GameEntry) -> Void)?
+    var onUndo: ((GameEntry) -> Void)?
     var onOpenGameHub: (() -> Void)?
     /// "Install an app": the owner lets the user choose an `.apk` file.
     var onInstall: (() -> Void)?
@@ -57,7 +59,7 @@ final class GamesPanel: VRPanel {
     }
 
     private var current: GameEntry? {
-        library.games.first { $0.appID == selected } ?? library.games.first
+        library.games.first { $0.id == selected } ?? library.games.first
     }
 
     private func activate(_ id: String) {
@@ -85,13 +87,17 @@ final class GamesPanel: VRPanel {
         case "play": onPlay?(game)
         case "gamehub": onOpenGameHub?()
         case "setup", "repair", "update":
+            if let onSetUp { onSetUp(game); break }
             if library.setUp(game) {
                 onNotice?("\(game.name) is ready to play in Halliday", false)
             } else {
                 onNotice?("Couldn't set up \(game.name): the log says why", true)
             }
         case "undo":
-            if library.undo(game) { onNotice?("\(game.name) uses its own settings again", false) }
+            if let onUndo { onUndo(game) }
+            else if library.undo(game) { onNotice?("\(game.name) uses its own settings again", false) }
+        case "forget":
+            _ = library.removeCrossOverExecutable(game)
         case "leave": selected = nil
         case "remove": onRemove?(game)
         default: break
@@ -113,21 +119,21 @@ final class GamesPanel: VRPanel {
                          rowHeight: Self.rowHeight, thumbnail: CGSize(width: 48, height: 48))
             return
         }
-        if !library.hasGameHub, library.games.isEmpty {
+        if !library.hasGameHub, !library.hasCrossOver, library.games.isEmpty {
             message(ctx, in: g, symbol: "gamecontroller", title: "No games yet",
-                    detail: "Install an app made for a standalone headset from its .apk file. Windows VR games show here once GameHub is on this Mac.",
+                    detail: "Install a standalone headset app from its .apk file, or a Windows VR game in GameHub or CrossOver.",
                     action: ("install", "Install an app"))
             return
         }
         if library.games.isEmpty {
             message(ctx, in: g, symbol: "gamecontroller", title: "No games yet",
-                    detail: "Install an app made for a standalone headset from its .apk file, or a SteamVR game in GameHub: both show here.",
+                    detail: "Install a standalone headset app or a Windows VR game. Add other Windows executables in the companion's Windows games page.",
                     action: ("install", "Install an app"))
             return
         }
         // The first-time screen, unless every game is set up already (by `--install-openvr`) or
         // waits for its first launch: then there is nothing to ask.
-        let toSetUp = library.games.contains { $0.container != nil && $0.status != .ready }
+        let toSetUp = library.games.contains { !$0.isCrossOver && $0.container != nil && $0.status != .ready }
         if !library.consented, !choosing, toSetUp {
             drawConsent(ctx, g)
             return
@@ -144,7 +150,7 @@ final class GamesPanel: VRPanel {
         var y = c.minY + 80
         NightGlass.drawText("Play your GameHub VR games here", at: CGPoint(x: c.minX, y: y), style: .display, weight: .semibold, width: c.width)
         y += 44
-        let n = library.games.count
+        let n = library.games.filter { !$0.isCrossOver && $0.quest == nil }.count
         for line in NightGlass.wrap("Halliday found \(n) VR game\(n == 1 ? "" : "s") in GameHub. To play them in Halliday, it becomes their VR runtime instead of SteamVR.",
                                     style: .body, width: c.width) {
             NightGlass.drawText(line, at: CGPoint(x: c.minX, y: y), style: .body, color: NightGlass.secondary)
@@ -173,7 +179,7 @@ final class GamesPanel: VRPanel {
         let x = g.minX + 24
         NightGlass.drawText("Games", at: CGPoint(x: x, y: g.minY + 24), style: .display, weight: .semibold)
         // "GameHub" while every game is one of its; with Quest apps among them, just how many.
-        let count = library.games.contains { $0.quest != nil } ? "\(library.games.count) installed" : "GameHub · \(library.games.count)"
+        let count = "\(library.games.count) installed"
         let cw = NightGlass.textSize(count, style: .caption, weight: .semibold).width + 22
         let chipRect = CGRect(x: g.minX + Self.listWidth - 24 - 52 - 48 - cw, y: g.minY + 30, width: cw, height: 28)
         NightGlass.fill(ctx, chipRect, radius: 14, color: NSColor(white: 1, alpha: 0.10))
@@ -186,11 +192,11 @@ final class GamesPanel: VRPanel {
                         color: NSColor(white: 1, alpha: 0.08))
 
         let top = g.minY + 84
-        let chosen = current?.appID
+        let chosen = current?.id
         for (k, game) in library.games.dropFirst(scroll).prefix(Self.visibleRows).enumerated() {
             let r = CGRect(x: g.minX + 14, y: top + CGFloat(k) * Self.rowHeight, width: Self.listWidth - 30, height: Self.rowHeight - 4)
-            row(ctx, "game:\(game.appID)", r, radius: 16, rest: game.appID == chosen ? 0.10 : 0)
-            Self.drawTile(ctx, CGRect(x: r.minX + 8, y: r.minY + 6, width: 48, height: 48), seed: game.appID, symbolSize: 0)
+            row(ctx, "game:\(game.id)", r, radius: 16, rest: game.id == chosen ? 0.10 : 0)
+            Self.drawTile(ctx, CGRect(x: r.minX + 8, y: r.minY + 6, width: 48, height: 48), seed: game.id, symbolSize: 0)
             let chip = statusChip(game.status)
             let chipW = NightGlass.textSize(chip.text, style: .caption, weight: .semibold).width + (chip.symbol == nil ? 20 : 38)
             let textW = r.width - 48 - 30 - chipW - 12
@@ -213,7 +219,7 @@ final class GamesPanel: VRPanel {
         guard let game = current else { return }
         let x = d.minX + 24, w = d.width - 48
         let art = CGRect(x: x, y: d.minY + 24, width: w - 52, height: 150)
-        Self.drawTile(ctx, art, seed: game.appID, symbolSize: 44, radius: 20)
+        Self.drawTile(ctx, art, seed: game.id, symbolSize: 44, radius: 20)
         var y = art.maxY + 18
         NightGlass.drawText(game.name, at: CGPoint(x: x, y: y), style: .title, weight: .semibold, width: w)
         y += 32
@@ -248,6 +254,9 @@ final class GamesPanel: VRPanel {
     }
 
     private func actions(_ g: GameEntry) -> [Action] {
+        if g.nativeAlyx != nil {
+            return [Action(id: "play", title: "Play", symbol: "play.fill")]
+        }
         // A Quest app is Halliday's own to start and to remove.
         if g.quest != nil {
             let remove = Action(id: "remove", title: "Remove", kind: .quiet)
@@ -255,6 +264,18 @@ final class GamesPanel: VRPanel {
             case .stopped: return [Action(id: "play", title: "Try again", symbol: "play.fill"), remove]
             default: return [Action(id: "play", title: "Play", symbol: "play.fill"), remove]
             }
+        }
+        if g.isCrossOver {
+            var result: [Action] = switch g.status {
+            case .ready, .stopped:
+                [Action(id: "play", title: "Play", symbol: "play.fill"), Action(id: "undo", title: "Undo bottle set-up", kind: .quiet)]
+            case .changed:
+                [Action(id: "undo", title: "Undo Halliday set-up"), Action(id: "leave", title: "Leave current settings", kind: .quiet)]
+            default:
+                [Action(id: "setup", title: "Set up bottle")]
+            }
+            if g.isManualCrossOver { result.append(Action(id: "forget", title: "Remove entry", kind: .quiet)) }
+            return result
         }
         return switch g.status {
         case .ready: [Action(id: "play", title: "Play", symbol: "play.fill"), Action(id: "gamehub", title: "Open GameHub"),
@@ -268,6 +289,16 @@ final class GamesPanel: VRPanel {
     }
 
     private func body(_ g: GameEntry) -> String {
+        if g.nativeAlyx != nil {
+            if case .stopped(let why) = g.status { return why }
+            return "\(g.sourceLabel). Play starts this existing Alyx installation in Halliday."
+        }
+        if let game = g.crossOver {
+            if case .stopped(let why) = g.status { return why }
+            if g.status == .changed { return "Another application changed this bottle's VR settings. Halliday leaves those changes in place." }
+            return "\(g.sourceLabel). Play uses the CrossOver version selected in the companion. Set up and Undo affect every game in this bottle."
+                + (game.executable == nil ? " Steam keeps its existing launch options." : " This executable was added manually.")
+        }
         if g.quest != nil, g.status == .ready {
             if let at = g.lastPlayed, let minutes = g.lastMinutes {
                 return "Last played \(Self.when(at)): it ran in Halliday for \(GameBar.duration(max(1, minutes)))."
@@ -289,6 +320,7 @@ final class GamesPanel: VRPanel {
     }
 
     private func subline(_ g: GameEntry) -> String {
+        if g.isCrossOver || g.nativeAlyx != nil { return g.sourceLabel }
         if g.quest != nil, g.status == .ready { return g.lastPlayed.map { "Played \(Self.when($0))" } ?? "Quest app" }
         return switch g.status {
         case .ready: g.lastPlayed.map { "Played \(Self.when($0))" } ?? "Ready to play"

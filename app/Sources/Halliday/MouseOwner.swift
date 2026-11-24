@@ -69,11 +69,26 @@ final class MouseOwner: @unchecked Sendable {
         return on
     }
 
-    /// Where the real cursor goes when an interaction ends: the middle of the main display.
-    private var parkPoint: CGPoint {
-        let b = CGDisplayBounds(CGMainDisplayID())
+    /// The visible Mac display, even when the physical headset is macOS's main
+    /// display. Safe on the event-tap thread: only CoreGraphics display queries.
+    static var desktopParkingPoint: CGPoint {
+        let main = CGMainDisplayID()
+        var count: UInt32 = 0
+        CGGetActiveDisplayList(0, nil, &count)
+        var displays = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        CGGetActiveDisplayList(count, &displays, &count)
+        func headset(_ id: CGDirectDisplayID) -> Bool {
+            guard CGDisplayVendorNumber(id) == 0x4dd9, let mode = CGDisplayCopyDisplayMode(id) else { return false }
+            return mode.pixelWidth == 4000 && mode.pixelHeight == 2040
+        }
+        let display = !headset(main) ? main
+            : (displays.first { CGDisplayIsBuiltin($0) != 0 }
+                ?? displays.first { !headset($0) } ?? main)
+        let b = CGDisplayBounds(display)
         return CGPoint(x: b.midX, y: b.midY)
     }
+
+    private var parkPoint: CGPoint { Self.desktopParkingPoint }
 
     /// Starts owning the mouse. Needs the Accessibility permission.
     func start() -> Bool {

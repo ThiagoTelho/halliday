@@ -5,12 +5,16 @@
 //   halliday --snapshot FILE.png [--yaw DEG] [--pitch DEG] [--no-lens]
 //                               render one frame offscreen to a PNG (no window, no permissions)
 //   halliday --game-image-ui-snapshot PREFIX
-//                               save image settings offscreen, then exit
+//                               save Mac and headset image settings offscreen, then exit
 //   halliday --game-image-render-snapshot FILE.png
-//                               save a synthetic game frame through the renderer, then exit
+//                               save a synthetic game frame through the real renderer, then exit
 //   halliday --probe [--replay FILE]
 //                               command-line check of the core (displays, USB, poses)
 //   halliday --install-openvr PREFIX|gamehub
+//   halliday --configure-windows-vr PREFIX --backend automatic --crossover APP
+//   halliday --undo-windows-vr PREFIX --crossover APP
+//   halliday --list-crossover    list installed CrossOver versions, bottles and Steam games; read-only
+//   halliday --launch-native-alyx FOLDER   open an existing native Alyx in this runtime
 //   halliday --check-extension FOLDER [--call Plugin.method JSON ...] | --install-extension FOLDER
 //                               for extension authors (ExtensionCheck.swift), then exit
 //   halliday --sense-probe [SECONDS] [--leds PHASE]   what the Sense controllers send (no window); 6 lights their tracking LEDs
@@ -21,12 +25,36 @@ import AppKit
 import CHallidayCore
 
 let arguments = CommandLine.arguments
+if let i = arguments.firstIndex(of: "--openxr-panel-bridge-snapshot"), i + 1 < arguments.count {
+    MainActor.assumeIsolated { runOpenXRBridgeSnapshot(path: arguments[i + 1], arguments: arguments) }
+    exit(0)
+}
+if let i = arguments.firstIndex(of: "--native-openxr-ui-snapshot"), i + 1 < arguments.count {
+    MainActor.assumeIsolated {
+        _ = NSApplication.shared
+        NSApp.setActivationPolicy(.prohibited)
+        CompanionSnapshot.nativeOpenXR(to: arguments[i + 1])
+    }
+    exit(0)
+}
 if let i = arguments.firstIndex(of: "--game-image-ui-snapshot"), i + 1 < arguments.count {
     MainActor.assumeIsolated { runGameImageUISnapshot(prefix: arguments[i + 1]) }
     exit(0)
 }
 if let i = arguments.firstIndex(of: "--game-image-render-snapshot"), i + 1 < arguments.count {
     MainActor.assumeIsolated { runGameImageRenderSnapshot(path: arguments[i + 1], arguments: arguments) }
+    exit(0)
+}
+if arguments.contains("--list-crossover") {
+    let discovery = CrossOverLibrary.discover()
+    let result: [String: Any] = [
+        "applications": discovery.installations.map { ["name": $0.name, "path": $0.applicationURL.path] },
+        "bottles": discovery.bottles.map(\.path),
+        "games": discovery.games.map { ["id": $0.id, "appID": $0.appID, "name": $0.name,
+            "bottle": $0.bottle.path, "folder": $0.folder.path, "steam": $0.steamExecutable.path] }
+    ]
+    if let data = try? JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]),
+       let text = String(data: data, encoding: .utf8) { print(text) }
     exit(0)
 }
 let replayArgument: String? = arguments.firstIndex(of: "--replay").flatMap { i in
@@ -40,6 +68,38 @@ if let i = arguments.firstIndex(of: "--snapshot"), i + 1 < arguments.count {
 
 if let i = arguments.firstIndex(of: "--install-openvr"), i + 1 < arguments.count {
     let ok = MainActor.assumeIsolated { GameBridge.installCommand(arguments[i + 1]) }
+    exit(ok ? 0 : 1)
+}
+
+if let at = arguments.firstIndex(of: "--configure-windows-vr") ?? arguments.firstIndex(of: "--undo-windows-vr"), at + 1 < arguments.count {
+    let ok = MainActor.assumeIsolated { () -> Bool in
+        do {
+            guard let appAt = arguments.firstIndex(of: "--crossover"), appAt + 1 < arguments.count else {
+                throw LaunchFailure("Choose the CrossOver application with --crossover APP.")
+            }
+            let installation = CrossOverInstallation(applicationURL: URL(fileURLWithPath: arguments[appAt + 1]))
+            let prefix = URL(fileURLWithPath: arguments[at + 1], isDirectory: true)
+            let undo = arguments[at] == "--undo-windows-vr"
+            let backendAt = arguments.firstIndex(of: "--backend")
+            let raw = backendAt.flatMap { $0 + 1 < arguments.count ? arguments[$0 + 1] : nil } ?? "automatic"
+            guard let backend = WindowsOpenXRSupport.Backend(rawValue: raw) else { throw LaunchFailure("Unknown Windows VR backend.") }
+            guard GameBridge.installRuntime() else { throw LaunchFailure("The OpenVR runtime is not included in this build.") }
+            try WindowsOpenXRSupport.configure(prefix: prefix, installation: installation, enabled: !undo, backend: backend)
+            if undo {
+                try OpenVRRegistration.uninstall(prefix: prefix, runtime: GameBridge.folder)
+            } else {
+                let runtime = backend == .automatic
+                    ? OpenVRRegistration.automaticRuntimeRoot(prefix: prefix, baseRuntime: GameBridge.folder) : GameBridge.folder
+                _ = try OpenVRRegistration.install(prefix: prefix, runtime: runtime)
+                // Match the explicit successful setup, so a later UI Play cannot silently
+                // undo it using an older selector value. Undo remains per-bottle.
+                WindowsOpenXRSupport.enabled = true
+                WindowsOpenXRSupport.backend = backend
+            }
+            print(undo ? "Restored the bottle's previous OpenXR and OpenVR settings." : "Configured OpenXR and OpenVR for \(backend.title). Launch games normally from Steam or CrossOver.")
+            return true
+        } catch { print(error.localizedDescription); return false }
+    }
     exit(ok ? 0 : 1)
 }
 
@@ -85,10 +145,10 @@ if arguments.contains("--probe") {
 
 // Launched from Finder or `open`: there is no terminal, so log to a file (`make open` tails it).
 if isatty(STDOUT_FILENO) == 0 {
-    let logPath = NSHomeDirectory() + "/Library/Logs/Halliday.log"
+    let logPath = RuntimePaths.log.path
     // The run before is kept beside it: a session worth reading is often followed by a restart
     // (or a test run) before anyone reads it.
-    let previous = NSHomeDirectory() + "/Library/Logs/Halliday.previous.log"
+    let previous = RuntimePaths.log.deletingPathExtension().appendingPathExtension("previous.log").path
     try? FileManager.default.removeItem(atPath: previous)
     try? FileManager.default.moveItem(atPath: logPath, toPath: previous)
     freopen(logPath, "w", stdout)

@@ -25,9 +25,14 @@ enum LinkState: Int32, CustomStringConvertible {
 struct HeadPose {
     var position: SIMD3<Float>
     var orientation: simd_quatf
+    /// Radians/second in the head's own axes; rotate before publishing a game-world velocity.
     var angularVelocity: SIMD3<Float>
     var slamAgeNs: Int64
     var predicted: Bool
+    var linearVelocity: SIMD3<Float> = .zero
+    /// Linear/angular validity. Defaults describe stationary synthetic poses;
+    /// tracked and moving simulator sources explicitly supply their flags.
+    var motionFlags: UInt32 = 3
 }
 
 struct HeadsetStatus {
@@ -71,14 +76,17 @@ final class Headset: @unchecked Sendable {
 
     /// Head pose predicted for a host time in ns (e.g. a display link's target timestamp × 1e9).
     func predict(atHostNs t: Int64) -> HeadPose? {
-        var p = HallidayHeadPose()
-        guard halliday_session_predict(session, t, &p) else { return nil }
+        var motion = HallidayHeadPoseMotion()
+        guard halliday_session_predict_motion(session, t, &motion) else { return nil }
+        let p = motion.pose
         return HeadPose(
             position: SIMD3(p.position.0, p.position.1, p.position.2),
             orientation: simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
             angularVelocity: SIMD3(p.angular_velocity.0, p.angular_velocity.1, p.angular_velocity.2),
             slamAgeNs: p.slam_age_ns,
-            predicted: p.predicted != 0)
+            predicted: p.predicted != 0,
+            linearVelocity: SIMD3(motion.linear_velocity.0,motion.linear_velocity.1,motion.linear_velocity.2),
+            motionFlags: motion.motion_flags)
     }
 
     var status: HeadsetStatus? {
