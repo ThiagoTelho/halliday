@@ -567,11 +567,21 @@ pub unsafe extern "C" fn halliday_sense_led_report(
 /// `out` is null or writable for 78 bytes.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn halliday_sense_vibration_report(
-    sequence:u8,counter:u8,amplitude:f32,frequency_hz:f32,host_us:u32,out:*mut u8,
-){
-    if out.is_null(){return;}
-    let report=crate::sense::vibration_report(sequence,counter,amplitude,frequency_hz,host_us);
-    unsafe{std::ptr::copy_nonoverlapping(report.as_ptr(),out,report.len());}
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+    out: *mut u8,
+) {
+    if out.is_null() {
+        return;
+    }
+    let report =
+        crate::sense::vibration_report(sequence, counter, amplitude, frequency_hz, host_us);
+    unsafe {
+        std::ptr::copy_nonoverlapping(report.as_ptr(), out, report.len());
+    }
 }
 
 /// Vibration output retaining the current connection's LED settings and latch.
@@ -582,17 +592,33 @@ pub unsafe extern "C" fn halliday_sense_vibration_report(
 /// 78 bytes. The input is copied before output is written, so they may alias.
 #[unsafe(no_mangle)]
 pub unsafe extern "C" fn halliday_sense_vibration_report_with_led(
-    sequence: u8, counter: u8, amplitude: f32, frequency_hz: f32,
-    host_us: u32, programmed: *const u8, out: *mut u8,
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+    programmed: *const u8,
+    out: *mut u8,
 ) -> bool {
-    if out.is_null() { return false; }
-    let programmed = if programmed.is_null() { None } else {
+    if out.is_null() {
+        return false;
+    }
+    let programmed = if programmed.is_null() {
+        None
+    } else {
         // SAFETY: the caller provides a complete readable packet; u8 array alignment is 1.
         Some(unsafe { std::ptr::read(programmed.cast::<[u8; crate::sense::OUTPUT_REPORT_LEN]>()) })
     };
     let Some(report) = crate::sense::vibration_report_retaining_led(
-        sequence, counter, amplitude, frequency_hz, host_us, programmed.as_ref(),
-    ) else { return false; };
+        sequence,
+        counter,
+        amplitude,
+        frequency_hz,
+        host_us,
+        programmed.as_ref(),
+    ) else {
+        return false;
+    };
     // SAFETY: output is checked and the complete input was copied above.
     unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), out, report.len()) };
     true
@@ -766,6 +792,49 @@ pub struct HallidayHeadPose {
     pub predicted: u8,
 }
 
+/// Additive motion API; the legacy 56-byte pose and getter remain unchanged.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HallidayHeadPoseMotion {
+    pub pose: HallidayHeadPose,
+    pub linear_velocity: [f32; 3],
+    pub motion_flags: u32,
+}
+
+fn head_pose_for_c(h: crate::tracking::HeadPose) -> HallidayHeadPose {
+    let q = h.pose.orientation;
+    HallidayHeadPose {
+        position: h.pose.position,
+        orientation: [q.x, q.y, q.z, q.w],
+        angular_velocity: h.angular_velocity,
+        slam_age_ns: h.slam_age_ns,
+        predicted: u8::from(h.predicted),
+    }
+}
+
+/// Pose and measured velocity from one tracker lock and requested timestamp.
+/// # Safety
+/// `session` is null/live and `out` is null or a writable complete motion DTO.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_session_predict_motion(
+    session: *const HallidaySession,
+    at_host_ns: i64,
+    out: *mut HallidayHeadPoseMotion,
+) -> bool {
+    let (Some(s), Some(out)) = (unsafe { self::session(session) }, unsafe { out.as_mut() }) else {
+        return false;
+    };
+    let Some(h) = s.predict(at_host_ns) else {
+        return false;
+    };
+    *out = HallidayHeadPoseMotion {
+        pose: head_pose_for_c(h),
+        linear_velocity: h.linear_velocity,
+        motion_flags: h.motion_flags,
+    };
+    true
+}
+
 /// Fills `out` with the head pose predicted for `at_host_ns`. Returns false (and leaves `out`
 /// untouched) when there is no live tracking.
 ///
@@ -784,14 +853,7 @@ pub unsafe extern "C" fn halliday_session_predict(
     let Some(h) = s.predict(at_host_ns) else {
         return false;
     };
-    let q = h.pose.orientation;
-    *out = HallidayHeadPose {
-        position: h.pose.position,
-        orientation: [q.x, q.y, q.z, q.w],
-        angular_velocity: h.angular_velocity,
-        slam_age_ns: h.slam_age_ns,
-        predicted: u8::from(h.predicted),
-    };
+    *out = head_pose_for_c(h);
     true
 }
 
@@ -1070,6 +1132,110 @@ pub struct HallidayBridgeConfig {
     pub tangents: [[f32; 4]; 2],
 }
 
+pub type HallidayBridgeProjectionView = halliday_bridge::projection::View;
+pub type HallidayBridgeProjectionGeometry = halliday_bridge::projection::Snapshot;
+
+// --- Game controller output ---
+
+pub use crate::game_haptics::GameHapticCommand as HallidayGameHapticCommand;
+
+/// Independent from the mutable frame host: a fast haptic poller may run on another thread.
+pub struct HallidayBridgeHaptics(std::sync::Mutex<crate::bridge_haptics::Receiver>);
+
+/// # Safety
+/// `bridge` is live and owned by the host. Notify only a real coordinate change.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_reference_changed(bridge: *const HallidayGameBridge) {
+    if let Some(bridge) = unsafe { bridge.as_ref() } {
+        let ext = unsafe { halliday_bridge::haptics::extension(bridge.0.base().cast()) };
+        if ext.available() {
+            ext.space_epoch
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        }
+    }
+}
+
+/// # Safety
+/// `path` is a readable NUL-terminated bridge path. Mapping is independent of rendering.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_haptics_open(
+    path: *const c_char,
+) -> *mut HallidayBridgeHaptics {
+    if path.is_null() {
+        return std::ptr::null_mut();
+    }
+    let Ok(path) = (unsafe { CStr::from_ptr(path) }).to_str() else {
+        return std::ptr::null_mut();
+    };
+    match crate::bridge_haptics::Receiver::open(std::path::Path::new(path)) {
+        Ok(receiver) => Box::into_raw(Box::new(HallidayBridgeHaptics(std::sync::Mutex::new(
+            receiver,
+        )))),
+        Err(_) => std::ptr::null_mut(),
+    }
+}
+/// # Safety
+/// `handle` is live; `out` holds at least four commands. Close never overlaps a call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_haptics_poll(
+    handle: *const HallidayBridgeHaptics,
+    now: u64,
+    focused: bool,
+    connected: u32,
+    out: *mut HallidayGameHapticCommand,
+    capacity: u32,
+) -> u32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    if out.is_null() || capacity < 4 {
+        return 0;
+    }
+    let Ok(mut receiver) = handle.0.lock() else {
+        return 0;
+    };
+    let now = if now == 0 {
+        crate::time::host_time_ns() as u64
+    } else {
+        now
+    };
+    let commands = receiver.poll(now, focused, connected);
+    unsafe {
+        std::ptr::copy_nonoverlapping(commands.as_ptr(), out, commands.len());
+    }
+    commands.len() as u32
+}
+/// # Safety
+/// Same requirements as poll; capacity is at least two.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_haptics_stop(
+    handle: *const HallidayBridgeHaptics,
+    out: *mut HallidayGameHapticCommand,
+    capacity: u32,
+) -> u32 {
+    let Some(handle) = (unsafe { handle.as_ref() }) else {
+        return 0;
+    };
+    if out.is_null() || capacity < 2 {
+        return 0;
+    }
+    let Ok(mut receiver) = handle.0.lock() else {
+        return 0;
+    };
+    let commands = receiver.stop_all();
+    unsafe {
+        std::ptr::copy_nonoverlapping(commands.as_ptr(), out, commands.len());
+    }
+    commands.len() as u32
+}
+/// # Safety
+/// No poll or remaining handle use is allowed after close.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_haptics_close(handle: *mut HallidayBridgeHaptics) {
+    if !handle.is_null() {
+        drop(unsafe { Box::from_raw(handle) });
+    }
+}
 #[repr(C)]
 pub struct HallidayBridgeFrame {
     pub width: u32,
@@ -1419,7 +1585,19 @@ pub unsafe extern "C" fn halliday_bridge_open(
     }
 }
 
-/// Unmaps and removes the bridge file.
+/// Retires the public bridge immediately without releasing its mapping.
+/// Pending GPU readers may keep the handle alive until their copies complete.
+///
+/// # Safety
+/// `bridge` is a live owned handle or null. It remains valid after this call.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_retire(bridge: *const HallidayGameBridge) {
+    if let Some(bridge) = unsafe { bridge.as_ref() } {
+        bridge.0.retire();
+    }
+}
+
+/// Unmaps the bridge and retires its publication if not already retired.
 ///
 /// # Safety
 /// `bridge` came from `halliday_bridge_open` and isn't used afterwards (null is ignored).
@@ -1460,6 +1638,21 @@ pub unsafe extern "C" fn halliday_bridge_publish_frame(
     // SAFETY: caller guarantees valid or null pointers.
     if let (Some(b), Some(s)) = unsafe { (bridge.as_ref(), state.as_ref()) } {
         b.0.publish_frame(s, notify_game);
+    }
+}
+
+/// Explicit head/left/right linear+angular validity associated with this state.
+/// # Safety
+/// Same pointer requirements as `halliday_bridge_publish_frame`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_publish_frame_with_motion(
+    bridge: *const HallidayGameBridge,
+    state: *const HallidayBridgeState,
+    notify_game: bool,
+    motion_mask: u32,
+) {
+    if let (Some(b), Some(s)) = unsafe { (bridge.as_ref(), state.as_ref()) } {
+        b.0.publish_frame_with_motion(s, notify_game, motion_mask);
     }
 }
 
@@ -1504,6 +1697,48 @@ pub unsafe extern "C" fn halliday_bridge_end_read(bridge: *const HallidayGameBri
     }
 }
 
+/// Transfer tag for one eye in the currently claimed frame. Zero preserves legacy handling.
+/// # Safety
+/// `bridge` is open, and the caller owns the frame until `halliday_bridge_end_read`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_frame_color_space(
+    bridge: *const HallidayGameBridge,
+    slot: u32,
+    eye: u32,
+) -> u32 {
+    // SAFETY: caller guarantees a valid or null handle.
+    unsafe { bridge.as_ref() }.map_or(0, |b| b.0.frame_color_space(slot as usize, eye as usize))
+}
+
+/// 0: legacy frame without required geometry, 1: complete matching geometry,
+/// -1: invalid/unavailable required geometry. On -1 retain the previous frame.
+/// # Safety
+/// `bridge` is live or null, `out` writable or null. The caller owns the frame
+/// lease from begin_read until end_read while reading this associated record.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_projection_geometry(
+    bridge: *const HallidayGameBridge,
+    slot: u32,
+    frame_index: u64,
+    out: *mut HallidayBridgeProjectionGeometry,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else {
+        return -1;
+    };
+    *out = HallidayBridgeProjectionGeometry::default();
+    let Some(bridge) = (unsafe { bridge.as_ref() }) else {
+        return -1;
+    };
+    match bridge.0.projection_geometry(slot as usize, frame_index) {
+        Ok(Some(snapshot)) => {
+            *out = snapshot;
+            1
+        }
+        Ok(None) => 0,
+        Err(()) => -1,
+    }
+}
+
 /// The start of the mapping (page-aligned, `halliday_bridge_file_size()` bytes).
 ///
 /// # Safety
@@ -1541,6 +1776,126 @@ pub unsafe extern "C" fn halliday_bridge_client(
             quit_acknowledged: c.quit_acknowledged,
         };
     }
+}
+
+/// Raw producer lease status (0 unowned, 1 ready, UINT_MAX initializing).
+///
+/// # Safety
+/// `bridge` is open or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_client_status(bridge: *const HallidayGameBridge) -> u32 {
+    unsafe { bridge.as_ref() }.map_or(0, |b| b.0.client_status())
+}
+
+/// The currently ready independent client's session generation, or zero for legacy clients.
+///
+/// # Safety
+/// `bridge` is open or null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_client_epoch(bridge: *const HallidayGameBridge) -> u64 {
+    // SAFETY: caller guarantees a valid or null handle.
+    unsafe { bridge.as_ref() }.map_or(0, |b| b.0.client_epoch())
+}
+
+pub type HallidayBridgePanel = halliday_bridge::panels::Panel;
+#[repr(C)]
+pub struct HallidayBridgePanelBatch {
+    pub epoch: u64,
+    pub frame_index: u64,
+    pub count: u32,
+    pub projection_order: u32,
+    pub projection_flags: u32,
+    pub _reserved: u32,
+}
+
+/// # Safety
+/// Live or null bridge; writable batch and capacity-sized panel output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_panels(
+    bridge: *const HallidayGameBridge,
+    slot: u32,
+    frame_index: u64,
+    batch: *mut HallidayBridgePanelBatch,
+    panels: *mut HallidayBridgePanel,
+    capacity: u32,
+) -> bool {
+    unsafe { halliday_bridge_layer_batch(bridge, slot, frame_index, batch, panels, capacity) == 1 }
+}
+
+/// 1 = complete batch, 0 = optional legacy metadata absent, -1 = required batch
+/// unavailable or invalid call. No partial batch is returned on failure.
+/// # Safety
+/// Live or null bridge; writable batch and capacity-sized panel output.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_layer_batch(
+    bridge: *const HallidayGameBridge,
+    slot: u32,
+    frame_index: u64,
+    batch: *mut HallidayBridgePanelBatch,
+    panels: *mut HallidayBridgePanel,
+    capacity: u32,
+) -> i32 {
+    let Some(batch) = (unsafe { batch.as_mut() }) else {
+        return -1;
+    };
+    *batch = HallidayBridgePanelBatch {
+        epoch: 0,
+        frame_index: 0,
+        count: 0,
+        projection_order: 0,
+        projection_flags: 0,
+        _reserved: 0,
+    };
+    let Some(b) = (unsafe { bridge.as_ref() }) else {
+        return -1;
+    };
+    let snapshot = match b.0.checked_panels(slot as usize, frame_index) {
+        Ok(Some(batch)) => batch,
+        Ok(None) => return 0,
+        Err(()) => return -1,
+    };
+    if capacity < snapshot.count as u32 || (snapshot.count > 0 && panels.is_null()) {
+        return -1;
+    }
+    if snapshot.count > 0 {
+        unsafe {
+            std::ptr::copy_nonoverlapping(snapshot.panels.as_ptr(), panels, snapshot.count);
+        }
+    }
+    *batch = HallidayBridgePanelBatch {
+        epoch: snapshot.epoch,
+        frame_index: snapshot.frame_index,
+        count: snapshot.count as u32,
+        projection_order: snapshot.projection_order,
+        projection_flags: snapshot.projection_flags,
+        _reserved: 0,
+    };
+    1
+}
+
+/// # Safety
+/// Live or null bridge, writable output. Release a successful picture claim after GPU completion.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_claim_panel(
+    bridge: *const HallidayGameBridge,
+    index: u32,
+    sequence: u32,
+    out: *mut HallidayBridgePicture,
+) -> bool {
+    let (Some(b), Some(out)) = (unsafe { bridge.as_ref() }, unsafe { out.as_mut() }) else {
+        return false;
+    };
+    let Some(picture) = b.0.claim_panel(index as usize, sequence) else {
+        return false;
+    };
+    *out = HallidayBridgePicture {
+        seq: picture.seq,
+        width: picture.width,
+        height: picture.height,
+        _pad: 0,
+        offset: picture.offset as u64,
+    };
+    true
 }
 
 // --- Android packages (Quest apps) --------------------------------------------------------------
@@ -1600,7 +1955,11 @@ mod tests {
         let mut bytes = [0xa5; 6];
         // SAFETY: all non-null destinations address the complete buffer above.
         unsafe {
-            assert!(!halliday_session_headset_identity(std::ptr::null(), bytes.as_mut_ptr(), 6));
+            assert!(!halliday_session_headset_identity(
+                std::ptr::null(),
+                bytes.as_mut_ptr(),
+                6
+            ));
             assert!(!copy_headset_identity("PCB12", std::ptr::null_mut(), 6));
             assert!(!copy_headset_identity("PCB12", bytes.as_mut_ptr(), 5));
             assert!(!copy_headset_identity("PCB12", bytes.as_mut_ptr(), 0));
@@ -1617,11 +1976,20 @@ mod tests {
         // SAFETY: each non-null pointer below addresses three readable floats or
         // the exclusively owned live handle, which is released exactly once.
         unsafe {
-            assert!(!halliday_hand_set_fisheye_alignment(std::ptr::null(), rotation.as_ptr()));
+            assert!(!halliday_hand_set_fisheye_alignment(
+                std::ptr::null(),
+                rotation.as_ptr()
+            ));
             assert!(!halliday_hand_set_fisheye_alignment(hand, std::ptr::null()));
             assert!(halliday_hand_set_fisheye_alignment(hand, rotation.as_ptr()));
-            assert!(!halliday_hand_set_fisheye_alignment(hand, [f32::NAN, 0.0, 0.0].as_ptr()));
-            assert!(!halliday_hand_set_fisheye_alignment(hand, [0.0, 0.0, 0.1].as_ptr()));
+            assert!(!halliday_hand_set_fisheye_alignment(
+                hand,
+                [f32::NAN, 0.0, 0.0].as_ptr()
+            ));
+            assert!(!halliday_hand_set_fisheye_alignment(
+                hand,
+                [0.0, 0.0, 0.1].as_ptr()
+            ));
             assert!(halliday_hand_set_fisheye_alignment(hand, [0.0; 3].as_ptr()));
             halliday_hand_close(hand);
         }
@@ -1660,6 +2028,15 @@ mod tests {
         assert_eq!(std::mem::offset_of!(HallidayHeadPose, slam_age_ns), 40);
         assert_eq!(std::mem::offset_of!(HallidayHeadPose, predicted), 48);
         assert_eq!(std::mem::size_of::<HallidayHeadPose>(), 56);
+        assert_eq!(
+            std::mem::offset_of!(HallidayHeadPoseMotion, linear_velocity),
+            56
+        );
+        assert_eq!(
+            std::mem::offset_of!(HallidayHeadPoseMotion, motion_flags),
+            68
+        );
+        assert_eq!(std::mem::size_of::<HallidayHeadPoseMotion>(), 72);
         assert_eq!(std::mem::size_of::<HallidayHeadsetStatus>(), 3);
         // The bridge's types as the header declares them.
         assert_eq!(std::mem::size_of::<HallidayBridgeState>(), 64 + 2 * 128);

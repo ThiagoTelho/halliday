@@ -1,6 +1,7 @@
 # Rust
 /core/target/
 /core/halliday-vrclient/target/
+/windows-openxr/build/
 
 # Swift
 /app/.build/

@@ -26,9 +26,14 @@
 
 #![no_std]
 
+pub mod focus;
 pub mod glsl;
+pub mod haptics;
 pub mod math;
+pub mod motion;
+pub mod panels;
 pub mod picture;
+pub mod projection;
 
 use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 
@@ -36,6 +41,33 @@ use core::sync::atomic::{AtomicU32, AtomicU64, Ordering, fence};
 pub const MAGIC: u32 = u32::from_le_bytes(*b"HLBR");
 /// Bumped on any change to the layout below.
 pub const VERSION: u32 = 6;
+/// `Frame::texture_type` keeps its historical API in the low byte. Optional per-eye
+/// transfer tags use previously unused upper bits, without changing the v6 layout.
+pub const FRAME_TEXTURE_API_MASK: u32 = 0xff;
+/// The exact projection geometry must be read before showing this frame.
+pub const FRAME_PROJECTION_GEOMETRY: u32 = 1 << 16;
+/// Ordered layers, source alpha or an explicit empty frame require their batch.
+pub const FRAME_LAYER_BATCH: u32 = 1 << 17;
+pub const FRAME_COLOR_LEGACY: u32 = 0;
+pub const FRAME_COLOR_LINEAR: u32 = 1;
+pub const FRAME_COLOR_SRGB: u32 = 2;
+
+pub const fn frame_texture_metadata(api: u32, left: u32, right: u32) -> u32 {
+    (api & FRAME_TEXTURE_API_MASK) | ((left & 3) << 8) | ((right & 3) << 10)
+}
+
+/// Unknown tags are treated like old untagged producers, rather than guessing a curve.
+pub const fn frame_color_space(metadata: u32, eye: usize) -> u32 {
+    if eye > 1 {
+        return FRAME_COLOR_LEGACY;
+    }
+    let value = (metadata >> (8 + eye * 2)) & 3;
+    if value <= FRAME_COLOR_SRGB {
+        value
+    } else {
+        FRAME_COLOR_LEGACY
+    }
+}
 /// The shared file's name, in the runtime folder (the parent of the DLL's `bin` folder).
 pub const FILE_NAME: &str = "halliday-bridge.shm";
 
@@ -155,7 +187,9 @@ pub struct Frame {
     /// The head pose the frame was rendered from.
     pub pose: Pose,
     pub frame_index: u64,
-    /// OpenVR texture type the game submitted (0: Direct3D 11, 1: OpenGL).
+    /// Low byte: OpenVR texture type (0: D3D11, 1: OpenGL, 4: D3D12).
+    /// Bits 8..9 / 10..11: left/right transfer tag; 0 legacy, 1 linear, 2 sRGB.
+    /// Untagged OpenVR and native producers retain their historical appearance.
     pub texture_type: u32,
     /// 1: both eyes were submitted from the same texture, copied once into the left eye's area
     /// (the bounds tell the halves apart).
@@ -488,6 +522,18 @@ pub unsafe fn publish(h: *mut Header, state: &State) {
 /// # Safety
 /// `h` points to a mapped bridge file with a single state writer.
 pub unsafe fn publish_with_notification(h: *mut Header, state: &State, notify_game: bool) {
+    unsafe { publish_with_motion(h, state, notify_game, None) };
+}
+
+/// Publishes state and optional per-component velocity validity under one seqlock.
+/// # Safety
+/// Same complete mapping/single-writer requirements as `publish_with_notification`.
+pub unsafe fn publish_with_motion(
+    h: *mut Header,
+    state: &State,
+    notify_game: bool,
+    mask: Option<u32>,
+) {
     // SAFETY: `h` is valid (caller); the atomics may be shared.
     let (seq, vsync) = unsafe { (&(*h).state_seq, &(*h).vsync_count) };
     let s = seq.load(Ordering::Relaxed) | 1;
@@ -495,6 +541,7 @@ pub unsafe fn publish_with_notification(h: *mut Header, state: &State, notify_ga
     fence(Ordering::Release);
     // SAFETY: Halliday is the only writer of `state`; readers retry on a torn read.
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!((*h).state), *state) };
+    unsafe { motion::extension(h) }.publish(s.wrapping_add(1), mask);
     seq.store(s.wrapping_add(1), Ordering::Release);
     if notify_game {
         vsync.fetch_add(1, Ordering::SeqCst);
@@ -506,6 +553,13 @@ pub unsafe fn publish_with_notification(h: *mut Header, state: &State, notify_ga
 /// # Safety
 /// `h` points to a mapped bridge file.
 pub unsafe fn read_state(h: *const Header) -> Option<State> {
+    unsafe { read_state_with_motion(h) }.map(|(state, _)| state)
+}
+
+/// Reads velocity validity and all head/controller state from the exact same publication.
+/// # Safety
+/// The caller maps the complete v6 bridge header, including reserved bytes.
+pub unsafe fn read_state_with_motion(h: *const Header) -> Option<(State, u32)> {
     // SAFETY: `h` is valid (caller).
     let seq = unsafe { &(*h).state_seq };
     for _ in 0..64 {
@@ -516,9 +570,10 @@ pub unsafe fn read_state(h: *const Header) -> Option<State> {
         }
         // SAFETY: a copy, validated by the sequence check below.
         let s = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*h).state)) };
+        let mask = unsafe { motion::extension(h) }.read(a);
         fence(Ordering::Acquire);
         if seq.load(Ordering::Relaxed) == a {
-            return Some(s);
+            return Some((s, mask));
         }
     }
     None
@@ -753,6 +808,22 @@ pub mod button {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn optional_per_eye_colour_keeps_the_v6_layout_and_legacy_api() {
+        assert_eq!(VERSION, 6);
+        assert_eq!(core::mem::size_of::<Frame>(), 136);
+        for api in [0, 1, 4] {
+            assert_eq!(frame_color_space(api, 0), FRAME_COLOR_LEGACY);
+            assert_eq!(frame_color_space(api, 1), FRAME_COLOR_LEGACY);
+            let metadata = frame_texture_metadata(api, FRAME_COLOR_LINEAR, FRAME_COLOR_SRGB);
+            assert_eq!(metadata & FRAME_TEXTURE_API_MASK, api);
+            assert_eq!(frame_color_space(metadata, 0), FRAME_COLOR_LINEAR);
+            assert_eq!(frame_color_space(metadata, 1), FRAME_COLOR_SRGB);
+        }
+        assert_eq!(frame_color_space(frame_texture_metadata(0, 3, 3), 0), 0);
+        assert_eq!(frame_color_space(u32::MAX, 2), 0);
+    }
 
     #[test]
     fn layout_is_fixed() {

@@ -127,6 +127,10 @@ pub struct HeadPose {
     pub pose: Pose,
     /// Latest angular velocity in rad/s, in the head's own frame (for rolling-shutter correction).
     pub angular_velocity: Vec3,
+    /// Eye-centre velocity in the same recentered world axes as `pose.position`.
+    pub linear_velocity: Vec3,
+    /// Bit 0: measured linear motion; bit 1: measured angular motion.
+    pub motion_flags: u32,
     /// Age of the SLAM pose the prediction started from, at the requested time.
     pub slam_age_ns: i64,
     /// False until IMU data has arrived: the pose is then the plain SLAM pose, not predicted.
@@ -168,6 +172,9 @@ pub struct HeadTracker {
     slam: Option<SlamSample>,
     /// Tracker-space velocity in m/s, smoothed over SLAM poses.
     velocity: Vec3,
+    /// The same SLAM-derived estimator, reset for reporting across discontinuities.
+    /// Keeping it separate leaves the existing display prediction trajectory intact.
+    motion_velocity: Option<Vec3>,
     /// What the newest SLAM pose changed, still to be taken (`correction_smoothing_ns`): the
     /// turn (in the pose's own frame) and the pivot's shift that put the view back where it was
     /// when the pose arrived, and the time (headset clock) they were taken at.
@@ -278,8 +285,16 @@ impl HeadTracker {
                 for (smoothed, newest) in self.velocity.iter_mut().zip(v) {
                     *smoothed += (newest - *smoothed) * weight;
                 }
+                let previous = self.motion_velocity.unwrap_or([0.; 3]);
+                self.motion_velocity = v
+                    .iter()
+                    .all(|x| x.is_finite())
+                    .then(|| [0, 1, 2].map(|i| previous[i] + (v[i] - previous[i]) * weight));
             }
-            _ => self.velocity = [0.0; 3],
+            _ => {
+                self.velocity = [0.0; 3];
+                self.motion_velocity = None;
+            }
         }
         self.slam = Some(sample);
         self.held_turn = Quat::IDENTITY;
@@ -294,6 +309,10 @@ impl HeadTracker {
             if Quat::IDENTITY.angle_to(turn) < 0.035 && far < 0.03 {
                 self.held_turn = turn;
                 self.held_shift = shift;
+            } else {
+                // Reuse the tracker's existing relocalization/correction test:
+                // a source-coordinate jump is not physical head velocity.
+                self.motion_velocity = None;
             }
         }
     }
@@ -376,9 +395,43 @@ impl HeadTracker {
             Some(r) => r.compose(head),
             None => head,
         };
+        let gyro_fresh = self.imu.back().is_some_and(|s| {
+            self.clock
+                .host_to_vts(at_host_ns)
+                .is_some_and(|target| (target - s.vts_ns).abs() <= self.config.max_extrapolation_ns)
+        });
+        let angular_known = gyro_fresh && latest_gyro.iter().all(|x| x.is_finite());
+        let linear_known = angular_known
+            && slam_age_ns >= 0
+            && slam_age_ns <= MAX_POSITION_EXTRAPOLATION_NS
+            && self.motion_velocity.is_some();
+        let linear_velocity = if linear_known {
+            let omega = tracker.orientation.rotate(latest_gyro);
+            let lever = tracker
+                .orientation
+                .rotate([0, 1, 2].map(|i| NECK_LEVER[i] + SLAM_TO_HEAD.position[i]));
+            let pivot = self.motion_velocity.unwrap();
+            let spin = [
+                omega[1] * lever[2] - omega[2] * lever[1],
+                omega[2] * lever[0] - omega[0] * lever[2],
+                omega[0] * lever[1] - omega[1] * lever[0],
+            ];
+            let velocity = [0, 1, 2].map(|i| pivot[i] + spin[i]);
+            self.recenter
+                .map_or(velocity, |r| r.orientation.rotate(velocity))
+        } else {
+            [0.; 3]
+        };
+        let linear_known = linear_known && linear_velocity.iter().all(|x| x.is_finite());
         Some(HeadPose {
             pose,
             angular_velocity: latest_gyro,
+            linear_velocity: if linear_known {
+                linear_velocity
+            } else {
+                [0.; 3]
+            },
+            motion_flags: u32::from(linear_known) | (u32::from(angular_known) << 1),
             slam_age_ns,
             predicted,
         })
@@ -661,6 +714,122 @@ mod tests {
         // Held as sent, it is 9 mm behind.
         let behind = held.predict(host).unwrap().pose.position;
         assert!((want[0] - behind[0] - v * 0.03).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reported_eye_velocity_matches_translated_rotating_pose_and_recenter_basis() {
+        // Independently differentiate the existing predicted position, with
+        // smoothing disabled so correction decay cannot masquerade as motion.
+        for seed in 1..=20 {
+            let a = seed as f32 * 0.13;
+            let q = Quat::from_axis_angle([1., 0., 0.], a)
+                * Quat::from_axis_angle([0., 1., 0.], -a * 0.7)
+                * Quat::from_axis_angle([0., 0., 1.], a * 0.3);
+            let gyro = [0.21 + a * 0.02, -0.31, 0.17];
+            let raw = raw_gyro(gyro);
+            let mut t = HeadTracker::new(TrackerConfig {
+                correction_smoothing_ns: 0,
+                still_speed: 0.,
+                still_window_ns: 0,
+                still_turn: 0.,
+                ..Default::default()
+            });
+            feed_imu(&mut t, 0, 700, raw);
+            let velocity = [0.3, -0.13, 0.19];
+            let mut last = 0;
+            for i in 1..=40u32 {
+                last = i * 16_667;
+                let position = [0, 1, 2].map(|axis| {
+                    velocity[axis] * last as f32 * 1e-6 + if axis == 1 { 1.6 } else { 0. }
+                });
+                t.ingest_slam(
+                    &slam_record(last, q, position),
+                    last as i64 * 1000 + OFFSET + 23 * MS,
+                );
+            }
+            let at = last as i64 * 1000 + OFFSET + 20 * MS;
+            let pose = t.predict(at).unwrap();
+            assert_eq!(pose.motion_flags, 3);
+            let delta = 100_000;
+            let before = t.predict(at - delta).unwrap().pose.position;
+            let after = t.predict(at + delta).unwrap().pose.position;
+            let measured = [0, 1, 2].map(|i| (after[i] - before[i]) / (2 * delta) as f32 * 1e9);
+            assert_vec(pose.linear_velocity, measured, 0.002);
+            let r = Pose {
+                position: [100., -13., 87.],
+                orientation: Quat::from_axis_angle([0., 1., 0.], a)
+                    * Quat::from_axis_angle([0., 0., 1.], -0.4),
+            };
+            t.recenter = Some(r);
+            let transformed = t.predict(at).unwrap();
+            assert_eq!(transformed.motion_flags, 3);
+            assert_vec(
+                transformed.linear_velocity,
+                r.orientation.rotate(pose.linear_velocity),
+                1e-5,
+            );
+            // No velocity from recenter translation, and gyro remains body-local.
+            assert_vec(transformed.angular_velocity, pose.angular_velocity, 1e-6);
+        }
+    }
+
+    #[test]
+    fn motion_unknown_on_first_sample_gaps_and_relocalization_then_recovers() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        feed_imu(&mut t, 0, 200, [0; 3]);
+        t.ingest_slam(
+            &slam_record(180_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            188 * MS,
+        );
+        assert_eq!(
+            t.predict(198 * MS).unwrap().motion_flags,
+            2,
+            "one SLAM sample cannot measure translation"
+        );
+        t.ingest_slam(
+            &slam_record(196_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            204 * MS,
+        );
+        let still = t.predict(208 * MS).unwrap();
+        assert_eq!(still.motion_flags, 3);
+        assert_vec(still.linear_velocity, [0.; 3], 1e-6);
+        assert_eq!(
+            t.predict(310 * MS).unwrap().motion_flags,
+            0,
+            "stale gyro and capped translation are unknown"
+        );
+        feed_imu(&mut t, 200_000, 160, [0; 3]);
+        t.ingest_slam(
+            &slam_record(330_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            338 * MS,
+        );
+        assert_eq!(
+            t.predict(348 * MS).unwrap().motion_flags,
+            2,
+            "gap resets translation history"
+        );
+        t.ingest_slam(
+            &slam_record(346_000, Quat::IDENTITY, [1., 1.6, 0.]),
+            354 * MS,
+        );
+        assert_eq!(
+            t.predict(360 * MS).unwrap().motion_flags,
+            2,
+            "relocalization is not physical velocity"
+        );
+        feed_imu(&mut t, 360_000, 970, [0; 3]);
+        // The existing display correction may still be unwinding the jump;
+        // report no translation until the tracker's continuity test settles.
+        for i in 1..=60 {
+            let us = 346_000 + i * 16_000;
+            t.ingest_slam(
+                &slam_record(us, Quat::IDENTITY, [1., 1.6, 0.]),
+                us as i64 * 1000 + 8 * MS,
+            );
+        }
+        let recovered = t.predict(1320 * MS).unwrap();
+        assert_eq!(recovered.motion_flags, 3);
+        assert_vec(recovered.linear_velocity, [0.; 3], 1e-6);
     }
 
     #[test]

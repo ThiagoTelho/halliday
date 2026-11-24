@@ -219,6 +219,21 @@ The updater behind Halliday's opt-in update checks. Not part of Halliday's sourc
 the XPC services only sandboxed apps need. MIT licensed (Copyright (c) 2006-2013 Andy Matuschak and
 others; its own notices are in its `LICENSE`, also in the bundle's `Licenses/`).
 
+## Windows OpenXR runtime
+
+The Windows ABI, lifecycle, action-space and initial D3D11 frontend derive from
+[BasaltVR](https://github.com/frenchbaguetteman/BasaltVR), revision
+`c104bc0b489384745157bc42e357f08d17e41638` (MIT). Its copyright notice is retained
+in `windows-openxr/LICENSE-BasaltVR`. The original network/video transport and
+graphics-provider patches are not included.
+
+Checked-in OpenXR headers retain the Khronos MIT notice in
+`windows-openxr/LICENSE-Khronos-MIT`; they came from Monado revision
+`ae43b1893e4544189bb6333c79e19dc3ecfee673`. No Monado runtime source is included.
+Public Vulkan SDK headers retain `windows-openxr/LICENSE-Khronos-Vulkan-MIT`.
+Windows builds use an independently installed LLVM-MinGW toolchain; its runtime
+notice is recorded in `windows-openxr/LICENSE-LLVM-MinGW`.
+
 ## LLVM compiler-rt
 
 https://github.com/llvm/llvm-project/tree/main/compiler-rt

@@ -1,0 +1,4 @@
+LIBRARY halliday_openxr
+EXPORTS
+    xrNegotiateLoaderRuntimeInterface
+    hallidayGetTransferStats

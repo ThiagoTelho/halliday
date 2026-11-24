@@ -56,6 +56,16 @@ typedef struct {
 /* Head pose predicted for host time at_host_ns. False when there is no live tracking. */
 bool halliday_session_predict(const HallidaySession *session, int64_t at_host_ns, HallidayHeadPose *out);
 
+/* Additive API: same pose plus eye-centre linear velocity in its recentered world axes.
+   motion_flags bit0=linear valid, bit1=angular valid; unknown linear motion is zero.
+   The nested legacy pose (including its latest body-local gyro) is unchanged. */
+typedef struct {
+    HallidayHeadPose pose;
+    float linear_velocity[3];
+    uint32_t motion_flags;
+} HallidayHeadPoseMotion;
+bool halliday_session_predict_motion(const HallidaySession *session, int64_t at_host_ns, HallidayHeadPoseMotion *out);
+
 typedef struct {
     uint8_t worn;            /* proximity sensor */
     uint8_t function_button; /* Fn button under the visor */
@@ -299,6 +309,30 @@ typedef struct {
 } HallidayBridgeConfig;
 
 typedef struct {
+    float position[3];
+    float orientation[4]; // quaternion x,y,z,w, host floor coordinates
+    float tangents[4]; // canonical left,right,up,down after producer mirroring
+} HallidayBridgeProjectionView;
+typedef struct {
+    uint64_t epoch, frame_index;
+    HallidayBridgeProjectionView views[2];
+} HallidayBridgeProjectionGeometry;
+
+// Game controller output. The poller has an independent lifetime from the frame host.
+typedef struct {
+    uint32_t hand, sequence, stop, _pad;
+    float amplitude, frequency_hz;
+    uint64_t duration_ns; // remaining duration; polling never extends a pulse
+} HallidayGameHapticCommand;
+typedef struct HallidayBridgeHaptics HallidayBridgeHaptics;
+void halliday_bridge_reference_changed(const HallidayGameBridge *bridge);
+HallidayBridgeHaptics *halliday_bridge_haptics_open(const char *bridge_path);
+uint32_t halliday_bridge_haptics_poll(const HallidayBridgeHaptics *handle, uint64_t now_ns, bool focused,
+                                    uint32_t connected_mask, HallidayGameHapticCommand *out, uint32_t capacity);
+uint32_t halliday_bridge_haptics_stop(const HallidayBridgeHaptics *handle, HallidayGameHapticCommand *out, uint32_t capacity);
+void halliday_bridge_haptics_close(HallidayBridgeHaptics *handle);
+
+typedef struct {
     uint32_t width;
     uint32_t height;
     uint32_t bottom_up;
@@ -310,6 +344,16 @@ typedef struct {
     uint64_t frame_index;
     uint64_t offsets[2]; // each eye's image, from the start of the mapping
 } HallidayBridgeFrame;
+
+// Optional per-eye transfer tags; the existing frame/shared-file layout is unchanged.
+#define HALLIDAY_FRAME_COLOR_LEGACY 0
+#define HALLIDAY_FRAME_COLOR_LINEAR 1
+#define HALLIDAY_FRAME_COLOR_SRGB 2
+uint32_t halliday_bridge_frame_color_space(const HallidayGameBridge *bridge, uint32_t slot, uint32_t eye);
+/* Caller owns the claimed frame. 0: legacy/no required record, 1: exact valid record,
+   -1: required geometry invalid or unavailable: keep the previous complete frame. */
+int32_t halliday_bridge_projection_geometry(const HallidayGameBridge *bridge, uint32_t slot,
+                                           uint64_t frame_index, HallidayBridgeProjectionGeometry *out);
 
 typedef struct {
     uint64_t frames;
@@ -387,16 +431,44 @@ typedef struct {
 
 HallidayGameBridge *halliday_bridge_open(const char *path, const HallidayBridgeConfig *config);
 void halliday_bridge_close(HallidayGameBridge *bridge);
+/* Mark dead and unlink only this generation; retain mapping for pending GPU readers. */
+void halliday_bridge_retire(const HallidayGameBridge *bridge);
 void halliday_bridge_publish(const HallidayGameBridge *bridge, const HallidayBridgeState *state);
 /* Updates pose/input on every display tick; notify_game alone wakes the game's next frame.
    The shared-memory Header remains v6; legacy publish still always notifies. */
 void halliday_bridge_publish_frame(const HallidayGameBridge *bridge, const HallidayBridgeState *state,
                                    bool notify_game);
+/* Bits0/1=head linear/angular,2/3=left,4/5=right. Legacy publish APIs remain unchanged. */
+void halliday_bridge_publish_frame_with_motion(const HallidayGameBridge *bridge, const HallidayBridgeState *state,
+                                             bool notify_game, uint32_t motion_mask);
 bool halliday_bridge_begin_read(const HallidayGameBridge *bridge, HallidayBridgeFrame *out);
 void halliday_bridge_end_read(const HallidayGameBridge *bridge);
 uint8_t *halliday_bridge_base(const HallidayGameBridge *bridge);
 uint64_t halliday_bridge_file_size(void);
 void halliday_bridge_client(const HallidayGameBridge *bridge, HallidayBridgeClient *out);
+/* Raw producer lease: 0 unowned, 1 ready, UINT32_MAX initializing. */
+uint32_t halliday_bridge_client_status(const HallidayGameBridge *bridge);
+/* Independent-client session generation; zero for a legacy or unready client.
+   Added separately so HallidayBridgeClient and the shared v6 layout stay unchanged. */
+uint64_t halliday_bridge_client_epoch(const HallidayGameBridge *bridge);
+/* Optional producer-owned OpenXR panels, tied to the claimed frame and session. */
+typedef struct {
+    HallidayBridgePose pose;
+    float width_m, height_m;
+    uint32_t eye_visibility, flags, order, picture_index, picture_seq;
+    uint32_t color_space, bgra, anchor;
+} HallidayBridgePanel;
+typedef struct {
+    uint64_t epoch, frame_index;
+    uint32_t count, projection_order, projection_flags, _reserved;
+} HallidayBridgePanelBatch;
+bool halliday_bridge_panels(const HallidayGameBridge *bridge, uint32_t slot, uint64_t frame_index,
+                           HallidayBridgePanelBatch *batch, HallidayBridgePanel *panels, uint32_t capacity);
+/* 1 complete, 0 legacy absent, -1 required metadata invalid/unavailable. */
+int32_t halliday_bridge_layer_batch(const HallidayGameBridge *bridge, uint32_t slot, uint64_t frame_index,
+                                  HallidayBridgePanelBatch *batch, HallidayBridgePanel *panels, uint32_t capacity);
+bool halliday_bridge_claim_panel(const HallidayGameBridge *bridge, uint32_t index, uint32_t sequence,
+                                HallidayBridgePicture *out);
 bool halliday_bridge_scene(const HallidayGameBridge *bridge, HallidayBridgeScene *scene, HallidayBridgeOverlay *overlays);
 bool halliday_bridge_claim_picture(const HallidayGameBridge *bridge, int32_t index, uint32_t seen, HallidayBridgePicture *out);
 void halliday_bridge_release_picture(const HallidayGameBridge *bridge, int32_t index);

@@ -5,8 +5,10 @@
 //! `include/halliday_core.h`.
 
 pub mod apk;
+pub mod bridge_haptics;
 pub mod ffi;
 pub mod game_bridge;
+pub mod game_haptics;
 pub mod math;
 pub mod psvr2;
 pub mod recording;

@@ -215,3 +215,29 @@ clean:
 	cargo clean --manifest-path core/Cargo.toml
 	cargo clean --manifest-path core/halliday-vrclient/Cargo.toml
 	rm -rf $(BUILD)
+
+# Optional Windows OpenXR foundation. Neither target runs Wine, accesses a
+# headset, changes a bottle, or adds the runtime to the ordinary app bundle.
+VR_JOBS ?= 2
+.PHONY: windows-openxr windows-openxr-check windows-bridge-check windows-haptic-feed-check
+windows-openxr:
+	python3 windows-openxr/build.py windows --jobs $(VR_JOBS)
+
+windows-openxr-check:
+	python3 windows-openxr/build.py native --jobs $(VR_JOBS)
+
+windows-bridge-check:
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-bridge
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib game_bridge
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib bridge_haptics
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib game_haptics
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib tracking::head
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib ffi::tests
+	bash tools/test-game-bridge-lease.sh
+	bash tools/test-game-producer-state.sh
+	bash tools/test-game-producer-watchdog.sh
+
+# CPU-only end-to-end fixture: C++ producer -> Rust bridge -> Swift callbacks.
+windows-haptic-feed-check:
+	cargo build --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --release
+	bash tools/test-independent-haptic-feed.sh
