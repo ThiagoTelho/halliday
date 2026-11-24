@@ -1,0 +1,64 @@
+{
+  "schema": 1,
+  "upstream": {
+    "repository": "https://github.com/armax9/VeRantyx",
+    "release_tag": "v0.3.2-native-moltenvr",
+    "release_url": "https://github.com/armax9/VeRantyx/releases/tag/v0.3.2-native-moltenvr",
+    "release_published_at": "2026-11-06T17:24:20Z",
+    "source_commit": "df680b6a8bedf8284d9a2c637274d67aeb658fe0",
+    "bridge_source_url": "https://github.com/armax9/VeRantyx/tree/df680b6a8bedf8284d9a2c637274d67aeb658fe0/MoltenVRBridge",
+    "wire_source_url": "https://github.com/armax9/VeRantyx/blob/df680b6a8bedf8284d9a2c637274d67aeb658fe0/NativeARM/vrruntime/vr_runtime.h",
+    "original_project": "https://github.com/Ag3497120/VeRantyx",
+    "copyright": "Copyright (c) 2026 Ag3497120",
+    "license": "MIT",
+    "license_source_url": "https://github.com/armax9/VeRantyx/blob/df680b6a8bedf8284d9a2c637274d67aeb658fe0/LICENSE",
+    "verification": "GitHub primary releases API confirms the exact release target; all copied original bridge/header and wire/license bytes match the cached Git commit.",
+    "verified_original_files": {
+      "MoltenVRBridge/bridge.cpp": true,
+      "MoltenVRBridge/controllers.h": true,
+      "MoltenVRBridge/loading_bridge.h": true,
+      "MoltenVRBridge/rotation_warp.h": true,
+      "MoltenVRBridge/shared_bridge.h": true,
+      "MoltenVRBridge/upload.h": true,
+      "MoltenVRBridge/openxr_loader_negotiation.h": true,
+      "NativeARM/vrruntime/vr_runtime.h": true,
+      "LICENSE": true
+    }
+  },
+  "source_files": {
+    "bridge.cpp": "f004505c49c6213a024773e2cba43de40224e0d756cb828ff019814fbe17ae32",
+    "controllers.h": "7a603dcc267ee538ba5d3b27ed689e1133e3718025c6e32961847ac526f2a221",
+    "loading_bridge.h": "bdc2a1cd3df80e96a2aa791259a05b964d575c109e13164f9c4de46d82d71e63",
+    "rotation_warp.h": "2648a86419eae78d70590313078138a43177f988a7cee665f6a48877a3cbe180",
+    "shared_bridge.h": "7a5ea3f60e3e7160020453d426869f26a4d018516fe78e8052b3b33355ec0427",
+    "upload.h": "2cc8fc05f960bb6982db1f547ff9d194bef50a55bf8a24179565143d2c7788e9",
+    "openxr_loader_negotiation.h": "454e87fea1e749ca6da7a5e8a362de153216f245219267a24ce9d7fb5b5e6560"
+  },
+  "wire_original_sha256": "b11eafc3bc97e1c59047525769fd11e057a227f7b960e15a10937e0b6a65f201",
+  "license": "Native-Alyx-Bridge-MIT.txt",
+  "OpenVR_notice": "OpenVR-BSD.txt",
+  "modifications": [
+    "Isolate the unchanged shared ABI in wire_layout.hpp instead of including the guest OpenVR runtime header.",
+    "Use wire namespace for copied wire types/constants.",
+    "Call Halliday coherent_frame_reader.hpp through a stateless local Access adapter; retain original SharedBridge object members/layout.",
+    "No benchmark instrumentation or trace code is included.",
+    "Require an explicitly selected native runtime instead of an installed-provider fallback; use a neutral source-built application identity while retaining the historical public guest compatibility boundary."
+  ],
+  "source_frozen": true,
+  "vendored_files": {
+    "rotation_warp.h": "2648a86419eae78d70590313078138a43177f988a7cee665f6a48877a3cbe180",
+    "loading_bridge.h": "3b0086438f939ee5c75eca5523e4bfdae21296162d1443f8693de5b9e135eedb",
+    "wire_layout.hpp": "0d8d594b1fc694371ca96dd90bbda3aa002828ff01fb8b7704e9ac5da27a31c7",
+    "OpenVR-BSD.txt": "f56ff606104d4ef18e617921a75c73ad73b5a1a1d70c69590c29de16919e04ad",
+    "controllers.h": "cb786427427b7b8ca72290631c0aa92cb6e18d8da2d0500e2067addfbda7d516",
+    "shared_bridge.h": "9c6cd0440231728d606f660589b73d953d49cdae60626ced4fa86fbb2d4001f0",
+    "README.md": "4fe738c60fb456f9075d3904b94a72c9dec4fcf308b3cc267fe89189f20cf8a7",
+    "openxr_loader_negotiation.h": "454e87fea1e749ca6da7a5e8a362de153216f245219267a24ce9d7fb5b5e6560",
+    "bridge.cpp": "238c36fb2d51d9bdebbdbc43f3699041b209d0608c783ad6c9f3177a40e8e481",
+    "Native-Alyx-Bridge-MIT.txt": "b2982281b11b00cff6e423515c8eab3c1afb675be925c9b4b0f95b51f4c52af9",
+    "upload.h": "2cc8fc05f960bb6982db1f547ff9d194bef50a55bf8a24179565143d2c7788e9",
+    "runtime_selection.hpp": "785220dc4ec81a11248468639610c53ee05b63be346fbdb43a324cb1b849b0d3"
+  },
+  "coherent_reader_sha256": "bd86d55de0dcb6c4c1d8abc85afa5a1b63bed668655b011b9cd668562d6c2387",
+  "build_script_sha256": "f60177b1e666884808a6a3e95ff3b6126ab890f79b86e6e419695c3edb657614"
+}

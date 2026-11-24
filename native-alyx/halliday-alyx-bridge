@@ -1,0 +1,37 @@
+#!/bin/bash
+set -euo pipefail
+bridge_dir="$(cd "$(dirname "$0")" && pwd)"
+original_bridge="${HALLIDAY_ALYX_ORIGINAL_BRIDGE:?Native Alyx bridge was not selected}"
+selected_runtime="${HALLIDAY_NATIVE_OPENXR_RUNTIME:?Halliday native runtime was not selected}"
+[[ -x "$original_bridge" && -f "$selected_runtime" ]] || { echo 'Native Alyx or its Halliday runtime is unavailable.' >&2; exit 1; }
+redirect_library="$bridge_dir/libhalliday_alyx_redirect.dylib"
+[[ -f "$redirect_library" ]] || { echo 'Halliday native Alyx support is incomplete.' >&2; exit 1; }
+# The ordinary reader is optional for compatibility with older resource bundles.
+# Keep the original installation untouched and resolve its existing Vulkan loader.
+selected_bridge="$original_bridge"
+frame_bridge="$bridge_dir/halliday-native-frame-bridge"
+# This ordinary reader matches only the verified VeRantyx 0.3.2 shared ABI.
+# An unknown/future port keeps its own bridge, even when the optional file exists.
+compatible_original_sha256="54724892ee8000399257c1a6e12679885a01f87f41c6f7b5ca7a8766f0fb9aab"
+original_sha256=""
+if [[ -f "$original_bridge" && ! -L "$original_bridge" ]]; then
+    original_identity_before="$(/usr/bin/stat -f '%d:%i:%z:%m:%c' "$original_bridge" 2>/dev/null || true)"
+    original_size="$(/usr/bin/stat -f '%z' "$original_bridge" 2>/dev/null || true)"
+    if [[ "$original_size" =~ ^[0-9]+$ ]] && (( original_size > 0 && original_size <= 16777216 )); then
+        if original_digest_line="$(/usr/bin/shasum -a 256 -- "$original_bridge" 2>/dev/null)"; then
+            original_identity_after="$(/usr/bin/stat -f '%d:%i:%z:%m:%c' "$original_bridge" 2>/dev/null || true)"
+            if [[ -n "$original_identity_before" && "$original_identity_before" = "$original_identity_after" ]]; then
+                original_sha256="${original_digest_line%% *}"
+            fi
+        fi
+    fi
+fi
+if [[ "$original_sha256" = "$compatible_original_sha256" && ( -e "$frame_bridge" || -L "$frame_bridge" ) ]]; then
+    [[ -f "$frame_bridge" && -x "$frame_bridge" && ! -L "$frame_bridge" ]] || { echo 'Halliday native frame bridge is invalid.' >&2; exit 1; }
+    original_directory="$(cd "$(dirname "$original_bridge")" && pwd)"
+    [[ -f "$original_directory/libMoltenVK.dylib" ]] || { echo 'The selected Alyx installation has no Vulkan loader.' >&2; exit 1; }
+    export DYLD_LIBRARY_PATH="$original_directory${DYLD_LIBRARY_PATH:+:$DYLD_LIBRARY_PATH}"
+    selected_bridge="$frame_bridge"
+fi
+export DYLD_INSERT_LIBRARIES="$redirect_library${DYLD_INSERT_LIBRARIES:+:$DYLD_INSERT_LIBRARIES}"
+exec "$selected_bridge" "$@"
