@@ -369,6 +369,10 @@ final class FrameStats: @unchecked Sendable {
         gpuTotal += seconds; gpuMax = max(gpuMax, seconds)
     }
 
+    func cpuWork(_ seconds: Double) {
+        lock.lock(); defer { lock.unlock() }; cpuTotal += seconds; cpuMax = max(cpuMax, seconds)
+    }
+
     func cpu(_ seconds: Double) {
         lock.lock(); defer { lock.unlock() }
         frames += 1; cpuTotal += seconds; cpuMax = max(cpuMax, seconds)
@@ -818,7 +822,8 @@ final class Renderer {
     func setEyeSize(_ eyeSize: Int) {
         guard eyeTexture.height != eyeSize, let t = try? Renderer.makeEyeTexture(device: device, eyeSize: eyeSize) else { return }
         eyeTexture = t
-        spareEyeTexture = nil
+        completedSceneTextures = [nil, nil, nil]
+        retirePresentation()
     }
 
     private static func makeEyeTexture(device: MTLDevice, eyeSize: Int) throws -> MTLTexture {
@@ -965,7 +970,7 @@ final class Renderer {
     func render(head: HeadPose, calibration: [Float], into target: MTLTexture, present drawable: CAMetalDrawable?) {
         let cpuStart = CACurrentMediaTime()
         guard let cb = queue.makeCommandBuffer() else { return }
-        let (sceneTexture, desktop) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
+        let (sceneTexture, desktop, _) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
 
         // 2. Distortion into the output.
         let lens = Lens(queue: queue, pipeline: distortPipeline, passthrough: passthroughPipeline, sampler: sampler,
@@ -986,7 +991,7 @@ final class Renderer {
 
     /// The scene (both eyes, or the desktop view) into its texture, encoded into `cb`.
     private func drawScene(head: HeadPose, calibration: [Float], cb: MTLCommandBuffer, output target: (width: Int, height: Int))
-        -> (MTLTexture, (width: Int, height: Int)?) {
+        -> (MTLTexture, (width: Int, height: Int)?, Bool) {
         updateMeshes(calibration: calibration)
         for hook in beforeFrame { hook(cb) }
         // Runs on the same GPU queue before reprojection and lens correction;
@@ -1066,6 +1071,7 @@ final class Renderer {
         sp.colorAttachments[0].texture = sceneTexture
         sp.colorAttachments[0].loadAction = .dontCare
         sp.colorAttachments[0].storeAction = .store
+        var sceneEncoded = false
         if let enc = cb.makeRenderCommandEncoder(descriptor: sp) {
             enc.setRenderPipelineState(scenePipeline)
             enc.setFragmentSamplerState(sampler, index: 0)
@@ -1104,29 +1110,76 @@ final class Renderer {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
             enc.endEncoding()
+            sceneEncoded = true
         }
 
-        return (sceneTexture, desktop)
+        return (sceneTexture, desktop, sceneEncoded)
     }
 
     // --- Late latching (LateLatch.swift) ---
 
     /// Set by the headset's view while the head comes from the headset: the tracker's orientation
     /// for a host time in ns, callable from any thread.
-    var latePose: (@Sendable (Int64) -> (orientation: simd_quatf, turning: SIMD3<Float>)?)?
+    var latePose: (@Sendable (Int64) -> LateHeadPose?)?
     /// The host time (ns) the frame being drawn is seen at: what the late pose is asked for.
     var lateTargetNs: Int64 = 0
     private lazy var lateLatch = LateLatch()
-    /// The other eye texture: a latched frame's scene is drawn into one while the lens thread may
-    /// still have the frame before in the other.
-    private var spareEyeTexture: MTLTexture?
-    /// Frames whose scene was committed and whose lens pass has not finished yet.
-    private let lensPending = LensPending()
     private let lensQueue = DispatchQueue(label: "halliday.lens", qos: .userInteractive)
+    private let presentationClock = LateDisplayClock()
+    let displayPulseDriver = CompositorRefreshDriver()
+    var displayPulseOffsetNs: Int64 = 0
+    var displayPulseFeedback = CompositorPulseFeedback()
+    private lazy var independentPresenter = IndependentLensPresenter(clock: presentationClock, queue: lensQueue)
+    private var completedSceneTextures: [MTLTexture?] = [nil, nil, nil]
+    private var sceneWrite: CompositorScenePolicy.Write?
+    private var admissionPrepared = false
+    private var independentPresentationActive = false
+    private var presentationGame = false
+    private var presentationProducer: String?
+    private(set) var sceneImageAcquisitionAllowed = true
+
+    /// Reserve GPU scene work before AppDelegate publishes input. Only image
+    /// ingestion is gated; head/input/haptics/heartbeats continue every refresh.
+    func preparePresentation(latched: Bool) {
+        if !latched {
+            if independentPresentationActive { retirePresentation() }
+            independentPresentationActive = false
+            sceneImageAcquisitionAllowed = true; admissionPrepared = false
+            return
+        }
+        independentPresentationActive = true
+        if let old = sceneWrite { independentPresenter.completed(old, scene: nil) }
+        sceneWrite = independentPresenter.mailbox.reserveWrite()
+        sceneImageAcquisitionAllowed = sceneWrite != nil
+        admissionPrepared = true
+    }
+
+    /// Retire unsubmitted output on display/space/content changes. A command
+    /// already on the GPU keeps its lease and completes normally.
+    func retirePresentation() {
+        displayPulseDriver.clearConfiguration()
+        presentationClock.reset(); independentPresenter.retire()
+        if let old = sceneWrite { independentPresenter.completed(old, scene: nil) }
+        sceneWrite = nil; sceneImageAcquisitionAllowed = false
+    }
+
+    func presentationContent(game: Bool, producer: String?) {
+        let changed = game != presentationGame || (game && producer != nil &&
+            presentationProducer != nil && producer != presentationProducer)
+        if changed { retirePresentation() }
+        presentationGame = game
+        if !game { presentationProducer = nil }
+        else if let producer { presentationProducer = producer }
+    }
     /// The display's refresh period, seconds (the headset's view sets it).
     var refreshPeriod: Double {
         get { displayPhase.period }
-        set { displayPhase.period = newValue }
+        set {
+            displayPhase.period = newValue
+            let epoch = presentationClock.epoch
+            presentationClock.configure(period: newValue)
+            if presentationClock.epoch != epoch { independentPresenter.retire() }
+        }
     }
     private let displayPhase = DisplayPhase()
 
@@ -1138,14 +1191,18 @@ final class Renderer {
     /// most 2 ms and lost frames now and then. That is the floor of this display path.
     private final class DisplayPhase: @unchecked Sendable {
         private let lock = NSLock()
-        var period = 1.0 / 120
+        private var storedPeriod = 1.0 / 120
+        var period: Double {
+            get { lock.lock(); defer { lock.unlock() }; return storedPeriod }
+            set { lock.lock(); storedPeriod = newValue; lock.unlock() }
+        }
         private var frames = 0, waited = 0.0, phase = 0.0
         func shown(at time: Double, committed: Double) {
             lock.lock(); defer { lock.unlock() }
             frames += 1
             waited += time - committed
-            var p = (committed - time).truncatingRemainder(dividingBy: period)
-            if p < 0 { p += period }
+            var p = (committed - time).truncatingRemainder(dividingBy: storedPeriod)
+            if p < 0 { p += storedPeriod }
             phase += p
             if frames == 600 {
                 log(String(format: "[display] 600 frames shown %.2f ms after their lens pass, committed %.2f ms after a refresh",
@@ -1163,80 +1220,78 @@ final class Renderer {
     /// pose to be had.
     var canLatch: Bool { LateLatch.enabled && latePose != nil && !desktopView && distortionEnabled && meshes.count == 2 }
 
-    /// One frame for the headset in two parts (LateLatch.swift): the scene now, with `head`; then,
-    /// on the lens queue once the GPU has drawn it, a drawable from `layer`, the orientation for
-    /// the same moment asked for again, and the lens pass turned by the difference. The main
-    /// thread never waits for a drawable (it waited up to 9 ms a frame, and frames were lost).
-    /// `presenting` is handed the drawable before it is presented. False when the frame is left
-    /// out: the lens pass of the frame before last hasn't finished yet (the display is behind;
-    /// leaving one out lets its queue drain).
+    /// Offer a physical-refresh output independently of scene GPU completion.
+    /// The presenter consumes the newest successful completed scene and queries
+    /// a fresh head pose after drawable acquisition, with one lens job in flight.
     @discardableResult
     func renderLatched(head: HeadPose, calibration: [Float], layer: CAMetalLayer,
-                       presenting: (@Sendable (CAMetalDrawable) -> Void)? = nil) -> Bool {
-        guard let pose = latePose, lensPending.begin() else { return false }
-        let cpuStart = CACurrentMediaTime()
-        guard let cb = queue.makeCommandBuffer() else { lensPending.end(); return false }
-        if spareEyeTexture == nil { spareEyeTexture = try? Renderer.makeEyeTexture(device: device, eyeSize: eyeTexture.height) }
-        if let spare = spareEyeTexture { spareEyeTexture = eyeTexture; eyeTexture = spare }
-        let size = CGSize(width: layer.drawableSize.width, height: layer.drawableSize.height)
-        let (sceneTexture, _) = drawScene(head: head, calibration: calibration, cb: cb, output: (Int(size.width), Int(size.height)))
-        let lens = Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline, passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
-        // Used on the lens queue: a layer's nextDrawable may be called from any thread, and the
-        // scene texture is only read there.
-        let shared = LensFrame(layer: layer, scene: sceneTexture)
-        let latch = lateLatch, pending = lensPending, stats = self.stats, lensQueue = self.lensQueue, phase = displayPhase
-        let rendered = head.orientation, target = lateTargetNs, started = Int64(cpuStart * 1e9)
-        let done = gpuDone
-        gpuDone = nil
-        cb.addCompletedHandler { cb in
-            let sceneEnd = cb.gpuEndTime, sceneTime = cb.gpuEndTime > cb.gpuStartTime ? cb.gpuEndTime - cb.gpuStartTime : 0
-            lensQueue.async {
-                let asked = CACurrentMediaTime()
-                guard let drawable = shared.layer.nextDrawable(), let lensCB = lens.queue.makeCommandBuffer() else {
-                    pending.end()
-                    return
-                }
-                let warp = latch.latch(rendered: rendered, startedNs: started, targetNs: target, sceneEnd: sceneEnd,
-                                       drawableWait: CACurrentMediaTime() - asked, pose: pose)
-                lens.encode(into: lensCB, target: drawable.texture, scene: shared.scene, warp: warp)
-                lensCB.addCompletedHandler { cb in
-                    // Its eye texture may be drawn into again (two queues: nothing else orders them).
-                    pending.end()
-                    if cb.gpuEndTime > cb.gpuStartTime { stats.gpu(cb.gpuEndTime - cb.gpuStartTime + sceneTime) }
-                    done?(cb.gpuEndTime)
-                }
-                presenting?(drawable)
-                let committed = CACurrentMediaTime()
-                drawable.addPresentedHandler { d in
-                    if d.presentedTime > 0 { phase.shown(at: d.presentedTime, committed: committed) }
-                }
-                lensCB.present(drawable)
-                lensCB.commit()
-            }
+                       presenting: (@Sendable (CAMetalDrawable) -> Void)? = nil,
+                       output: IndependentLensPresenter.Output? = nil,
+                       sceneCompleted: (@Sendable (Bool, Double) -> Void)? = nil) -> Bool {
+        if calibration != meshCalibration {
+            retirePresentation(); admissionPrepared = false
         }
+        updateMeshes(calibration: calibration)
+        if !admissionPrepared { preparePresentation(latched: true) }
+        admissionPrepared = false
+        let ticket = sceneWrite
+        sceneWrite = nil
+        defer { sceneImageAcquisitionAllowed = true }
+        guard let pose = latePose else {
+            if let ticket { independentPresenter.completed(ticket, scene: nil) }
+            return false
+        }
+        let begin = CACurrentMediaTime()
+        let presenter = independentPresenter, stats = self.stats
+        gpuDone = nil // physical pulses own their fresh completion identity
+        let lens = Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
+                        passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
+        let epoch = presentationClock.epoch, latch = lateLatch, feedback = displayPulseFeedback
+        presenter.configureRefresh(displayPulseDriver, offsetNs: displayPulseOffsetNs, epoch: epoch,
+            output: output ?? .init(layer: layer, presenting: nil), lens: lens, latch: latch, pose: pose,
+            feedback: feedback, submitted: { stats.cpu($0) }, completed: { _, duration in stats.gpu(duration) })
+        displayPulseDriver.pulseIfUnclocked(startedNs: Int64(begin * 1e9), targetNs: lateTargetNs)
+        guard let ticket else { return true } // lens repeat requires no new scene
+        guard let cb = queue.makeCommandBuffer() else {
+            presenter.completed(ticket, scene: nil); return true
+        }
+        let side = eyeTexture.height
+        if completedSceneTextures[ticket.slot]?.height != side {
+            completedSceneTextures[ticket.slot] = try? Renderer.makeEyeTexture(device: device, eyeSize: side)
+        }
+        guard let target = completedSceneTextures[ticket.slot] else {
+            presenter.completed(ticket, scene: nil); return true
+        }
+        let normal = eyeTexture
+        eyeTexture = target
+        let rendered = head.orientation
+        let size = layer.drawableSize
+        let generatedBefore = spacewarpGeneratedFrames
+        let (scene, _, encoded) = drawScene(head: head, calibration: calibration, cb: cb,
+            output: (Int(size.width), Int(size.height)))
+        eyeTexture = normal
+        let started = Int64(begin * 1e9)
+        let completedScene = IndependentLensPresenter.Scene(texture: scene, rendered: rendered,
+            startedNs: started, ended: 0, nativeSequence: projection?.imageSequence ?? 0,
+            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration)
+        cb.label = "Admitted compositor scene"
+        cb.addCompletedHandler { cb in
+            let successful = encoded && cb.status == .completed && cb.gpuEndTime > 0
+            if successful && cb.gpuEndTime > cb.gpuStartTime { stats.gpu(cb.gpuEndTime - cb.gpuStartTime) }
+            presenter.completed(ticket, scene: successful ? completedScene.ending(at: cb.gpuEndTime) : nil)
+            sceneCompleted?(successful, cb.gpuEndTime)
+        }
+        // Publish the admitted scene only after its GPU commands complete.
         cb.commit()
-        stats.cpu(CACurrentMediaTime() - cpuStart)
+        stats.cpuWork(CACurrentMediaTime() - begin)
         return true
     }
 
-    private struct LensFrame: @unchecked Sendable {
-        let layer: CAMetalLayer
-        let scene: MTLTexture
-    }
-
-    /// At most two frames between their scene's commit and their lens pass's end: the two eye
-    /// textures.
-    private final class LensPending: @unchecked Sendable {
-        private let lock = NSLock()
-        private var count = 0
-        func begin() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            guard count < 2 else { return false }
-            count += 1
-            return true
-        }
-        func end() { lock.lock(); count -= 1; lock.unlock() }
-        func snapshotCount() -> Int { lock.lock(); defer { lock.unlock() }; return count }
+    /// A value snapshot of the actual production lens state. Its retained
+    /// resources can be used on the presentation queue or an offscreen oracle.
+    func makePresentationLens() -> Lens {
+        Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
+             passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
     }
 
     /// The lens pass: what it needs, so it can be encoded on any thread.
@@ -1248,13 +1303,14 @@ final class Renderer {
         /// Each eye's distortion mesh; nil: the scene texture stretched over the output.
         let meshes: [(vertices: MTLBuffer, indices: MTLBuffer, count: Int)]?
 
-        func encode(into cb: MTLCommandBuffer, target: MTLTexture, scene: MTLTexture, warp: LensWarp) {
+        @discardableResult
+        func encode(into cb: MTLCommandBuffer, target: MTLTexture, scene: MTLTexture, warp: LensWarp) -> Bool {
             let dp = MTLRenderPassDescriptor()
             dp.colorAttachments[0].texture = target
             dp.colorAttachments[0].loadAction = .clear
             dp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
             dp.colorAttachments[0].storeAction = .store
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: dp) else { return }
+            guard let enc = cb.makeRenderCommandEncoder(descriptor: dp) else { return false }
             enc.setFragmentTexture(scene, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
             if let meshes {
@@ -1272,6 +1328,7 @@ final class Renderer {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
             enc.endEncoding()
+            return true
         }
     }
 

@@ -490,7 +490,7 @@ final class GameBridge {
     /// `ahead`: the head as it is expected `lead` after this frame is seen, when the frame the
     /// game draws with it will be: published instead of `head` (a game that predicts nothing
     /// itself drew for a head 20 to 40 ms old, and its picture had to be moved that far).
-    func tick(head: HeadPose, ahead: HeadPose? = nil) -> View? {
+    func tick(head: HeadPose, ahead: HeadPose? = nil, allowImageAcquisition: Bool = true) -> View? {
         guard let b = bridge else { return nil }
         let now = CACurrentMediaTime()
         let displayTarget = HeadsetView.frameTarget
@@ -684,14 +684,14 @@ final class GameBridge {
         if publicEpoch != 0 && !observedOpenVRSubmitTiming {
             // Independent OpenXR publishes projection frames only. A previous
             // OpenVR client may have left a window, grid, fade or overlays here.
-            if !reading { takeFrame(b) }
+            if allowImageAcquisition, !reading { takeFrame(b) }
             if !observedOpenVRSubmitTiming {
                 return View(projection: framesArriving ? layer : nil, layers: [], skybox: nil,
                             fade: .zero, backgroundFade: .zero)
             }
         }
-        takeWindowFrame(b, now: now, pid: client.pid)
-        if !reading { takeFrame(b) }
+        takeWindowFrame(b, now: now, pid: client.pid, allowImageAcquisition: allowImageAcquisition)
+        if allowImageAcquisition, !reading { takeFrame(b) }
 
         var scene = HallidayBridgeScene()
         var overlays = [HallidayBridgeOverlay](repeating: HallidayBridgeOverlay(), count: Int(HALLIDAY_BRIDGE_OVERLAYS))
@@ -699,9 +699,9 @@ final class GameBridge {
         if fresh { lastScene = (scene, overlays) }
         let (sc, ov) = lastScene ?? (scene, [])
         updateFade(sc, now: now)
-        let layers = overlayLayersFor(ov, b: b, head: (head.position, head.orientation), hands: hands)
+        let layers = overlayLayersFor(ov, b: b, head: (head.position, head.orientation), hands: hands, allowImageAcquisition: allowImageAcquisition)
         point(at: ov, b: b, hands: hands)
-        let sky = skybox(sc, b: b)
+        let sky = skybox(sc, b: b, allowImageAcquisition: allowImageAcquisition)
         // The compositor's own place instead of the game's frames: asked for (FadeGrid), the game
         // suspended its rendering, or no frame is coming.
         let showFrames = framesArriving && sc.grid == 0 && sc.suspended == 0
@@ -844,7 +844,7 @@ final class GameBridge {
     /// The overlays as layers: their pictures copied on the GPU when they change.
     private func overlayLayersFor(_ overlays: [HallidayBridgeOverlay], b: OpaquePointer,
                                   head: (SIMD3<Float>, simd_quatf),
-                                  hands: [(position: SIMD3<Float>, orientation: simd_quatf)]) -> [QuadLayer] {
+                                  hands: [(position: SIMD3<Float>, orientation: simd_quatf)], allowImageAcquisition: Bool = true) -> [QuadLayer] {
         var out: [QuadLayer] = []
         for (i, o) in overlays.enumerated() {
             guard o.used != 0 else {
@@ -853,7 +853,7 @@ final class GameBridge {
                 overlayFiles[i] = nil
                 continue
             }
-            updatePicture(i, o, b: b)
+            if allowImageAcquisition { updatePicture(i, o, b: b) }
             guard o.visible != 0, let layer = overlayLayers[i] else { continue }
             // Pose: the overlay's matrix, in the room or after its device's pose.
             let m = o.transform
@@ -940,9 +940,9 @@ final class GameBridge {
     }
 
     /// The skybox, as a picture around the viewer (equirectangular; a stereo pair top/bottom).
-    private func skybox(_ scene: HallidayBridgeScene, b: OpaquePointer) -> VideoSphere? {
+    private func skybox(_ scene: HallidayBridgeScene, b: OpaquePointer, allowImageAcquisition: Bool = true) -> VideoSphere? {
         guard scene.skybox != 0 else { return nil }
-        if !skyboxReading, let buffer, let lease = bridgeLease, lease.pointer == b {
+        if allowImageAcquisition, !skyboxReading, let buffer, let lease = bridgeLease, lease.pointer == b {
             var pic = HallidayBridgePicture()
             if halliday_bridge_claim_picture(b, -1, skyboxSeen, &pic) {
                 skyboxSeen = pic.seq
@@ -1216,7 +1216,7 @@ final class GameBridge {
     /// Follows the runtime's window (capture it while it presents, again when the stream stops,
     /// at its new size when it changes) and shows its newest frame when it is newer than the one
     /// shown.
-    private func takeWindowFrame(_ b: OpaquePointer, now: Double, pid: UInt32) {
+    private func takeWindowFrame(_ b: OpaquePointer, now: Double, pid: UInt32, allowImageAcquisition: Bool = true) {
         var status = HallidayBridgePresent()
         halliday_bridge_present_status(b, &status)
         if status.state != presentState {
@@ -1266,6 +1266,9 @@ final class GameBridge {
         capture.resize(width: Int(status.width), height: Int(status.height))
         guard let f = capture.take() else { return }
         halliday_bridge_present_seen(b, f.number)
+        // Drain the captured presentation acknowledgement even without GPU
+        // scene credit. The capture itself already retains only its newest image.
+        guard allowImageAcquisition else { return }
         if lastNumber != 0, f.number &- lastNumber > 1, f.number &- lastNumber < 1000 { windowGaps += Int(f.number &- lastNumber) - 1 }
         lastNumber = f.number
         windowFrames += 1

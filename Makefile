@@ -293,3 +293,8 @@ spacewarp-check:
 	bash tools/test-game-spacewarp-cadence.sh
 	bash tools/test-game-spacewarp-settings.sh
 	python3 tools/test-amd-optical-flow-provenance.py
+
+# Pure ownership/clock-policy checks; no app, GPU, display or headset is started.
+.PHONY: compositor-check
+compositor-check:
+	bash tools/test-independent-compositor.sh

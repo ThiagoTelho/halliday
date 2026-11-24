@@ -1469,12 +1469,22 @@ vertex DistortOut distort_vs(uint vid [[vertex_id]],
 }
 
 static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, float eye, int c) {
-    if (any(lens < 0.0) || any(lens > 1.0)) return 0.0;
-    // A turned point just past the eye texture's edge takes the edge (a late turn is a fraction
-    // of a degree); the lens's own edge stays where it was.
-    uv = clamp(uv, 0.0, 1.0);
+    // Keep the sample centre inside this eye's texel centres. Gradient sampling
+    // is evaluated before the lens mask; implicit derivatives after a divergent
+    // early return are undefined for partially covered fragment quads.
+    float2 halfTexel = float2(1.0 / float(tex.get_width()), 0.5 / float(tex.get_height()));
+    uv = clamp(uv, halfTexel, 1.0 - halfTexel);
     float2 sbs = float2((eye + uv.x) * 0.5, uv.y);
-    return tex.sample(s, sbs)[c];
+    float2 dx = dfdx(sbs), dy = dfdy(sbs);
+    // A valid centre alone does not bound an anisotropic footprint at the SBS
+    // seam. Keep anisotropy in the interior; the seam's footprint falls back to
+    // a single bilinear sample without borrowing the other eye's texels.
+    float radius = 0.5 * (abs(dx.x) + abs(dy.x)) + 0.5 / float(tex.get_width());
+    float distance = eye < 0.5 ? 0.5 - sbs.x : sbs.x - 0.5;
+    bool atSeam = distance <= radius;
+    float2 gx = atSeam ? float2(0.0) : dx, gy = atSeam ? float2(0.0) : dy;
+    float value = tex.sample(s, sbs, gradient2d(gx, gy))[c];
+    return (any(lens < 0.0) || any(lens > 1.0)) ? 0.0 : value;
 }
 
 fragment float4 distort_fs(DistortOut in [[stage_in]],

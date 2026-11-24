@@ -2330,6 +2330,7 @@ if !open, passthroughForVideo {
     /// Brings the whole interface to where the user is looking: the arc of panels, the ones placed
     /// by hand, the dock, video and any open overlay. It moves the interface, not the user.
     func recenterUI() {
+        renderer?.retirePresentation()
         // A running game's world comes back in front of the user too.
         game?.recenter(head: currentHead)
         // The controllers too: each points straight ahead now, as far as Halliday knows.
@@ -4500,7 +4501,7 @@ if !open, passthroughForVideo {
         // A Quest app (an OpenXR application) draws with the pose as given: it gets the head as
         // predicted for when its frame is seen. (Windows games' runtime predicts by itself.)
         let gameLead = QuestApps.shared.runningPackage != nil && Self.predictsForApps ? min(game?.lead ?? 0, 0.08) : 0
-        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead)) {
+        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead), allowImageAcquisition: renderer.sceneImageAcquisitionAllowed) {
             renderer.projection = shown.projection
             // Its overlays, and Halliday's notices (the hint at its start, "set up" messages).
             renderer.gameLayers = shown.layers + (notice.map { $0.isVisible ? [$0.layer] : [] } ?? [])
@@ -4514,6 +4515,7 @@ if !open, passthroughForVideo {
             renderer.gameBackgroundFade = .zero
         }
         if browser?.xrActive != true, game?.isPresenting != true, renderer.projection != nil { renderer.projection = nil }
+        renderer.presentationContent(game: game?.isPresenting == true, producer: game?.focusProducer?.lease)
         // Halliday over the game: its world dims and blurs in (420 ms) and out.
         let awayTarget: Float = gameAway && game?.isPresenting == true ? 1 : 0
         let awayNow = CACurrentMediaTime()

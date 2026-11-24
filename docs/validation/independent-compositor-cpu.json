@@ -1,0 +1,34 @@
+{
+  "passed": true,
+  "scope": "CPU ownership/clock/telemetry fixtures and complete Swift6 host typecheck; no app, GPU, game or headset execution.",
+  "dependency": "Coherent exposure-time tracking generation (preceding controllertracking contribution).",
+  "sources": {
+    "app/Sources/Halliday/AppDelegate.swift": "f02ca9afc1baa7b1c611d5b7fe924b5dc1b3a71c9401065d7d4ac08f4d7721c4",
+    "app/Sources/Halliday/GameBridge.swift": "846e038cacd8a1f1841b6b810fad532dbd055e6cc3db34a8cdb7bbc11979f7c9",
+    "app/Sources/Halliday/HeadsetView.swift": "c4bf9b8ed3fd651dae2c2402265adc454d8b3c511cb24af318cd610a1439cb4c",
+    "app/Sources/Halliday/LateLatch.swift": "c90c3bb914374df182cb57bdc76dfeeadc7521e2aa9a1c7dfe09109299ccc459",
+    "app/Sources/Halliday/Renderer.swift": "5ee0b1404f8eb9dce8222569fc1dab500c7f0cf714ce3cf2440ec1616690e853",
+    "app/Sources/Halliday/Shaders.swift": "496342db82d11bf94d92c8fcaed4c6a000d8f249827bc22fe57a80f84de2190c",
+    "app/Sources/Halliday/CompositorPresentationTelemetry.swift": "b26fe3601cf6403e90bc7177409550b5b92dc5a896f48fc10fc01b47ccb2ca53",
+    "app/Sources/Halliday/CompositorRefreshDriver.swift": "779da36ad31249c3b4a0498166d4c5ce55dfed32d92ce94ca8ccc0b45929d711",
+    "app/Sources/Halliday/CompositorSceneMailbox.swift": "5d0d33e7e43d0e3969686b26a275e4b81b3796f78c740707c5ab1357713d4153",
+    "app/Sources/Halliday/IndependentLensPresenter.swift": "3eae0d0e6af8d68c61075dcf54ec7e2a469f5bc4a2b2b315f7f685d72a9608c4",
+    "app/Sources/Halliday/LateDisplayTimeline.swift": "83135599ca0124bbf8a752241981b7f81abccec120d17d73d8dcd56214098af1",
+    "app/Sources/Halliday/LateHeadPose.swift": "065bb81553de41146323c2d0fe172a4fad1d32cdf0ad795f32a4488f1815934a"
+  },
+  "checks": {
+    "mailbox_assertions": 18668,
+    "physical_driver_mainactor_stall": true,
+    "presentation_telemetry_semantics": true,
+    "late_target_model_assertions": 29,
+    "concurrent_retirements": 1000,
+    "full_swift6_typecheck": true
+  },
+  "deployment_target": "macOS14.0",
+  "test_command": "make compositor-check",
+  "limits": [
+    "No photon-latency, physicalcomfort or gameFPS claim.",
+    "GPU/panel acceptance not rerun for this publication extraction.",
+    "Earlier and later frame-generation contributions keep their own synthesis and classification validation."
+  ]
+}
