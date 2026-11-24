@@ -7,6 +7,16 @@ Nothing from Sony is included or distributed: no driver binaries, firmware or SD
 
 The app carries the licence of everything it includes in `Halliday.app/Contents/Resources/Licenses/`.
 
+## AMD FidelityFX Super Resolution 1
+
+https://github.com/GPUOpen-Effects/FidelityFX-FSR
+
+Optional game-image processing uses AMD's MIT-licensed FSR 1 EASU upscaler and
+RCAS sharpener (v1.20210629), translated to Metal with separate bounds for each
+eye. The source and full AMD notice ship in `Contents/Resources/fsr1/`.
+The additional colour-preparation pass is local Halliday integration code.
+
+
 ## Monado
 
 https://gitlab.freedesktop.org/monado/monado

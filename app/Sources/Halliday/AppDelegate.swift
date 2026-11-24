@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var renderer: Renderer?
     /// A VR game under Wine, through Halliday's OpenVR runtime (nil if the runtime isn't in the app).
     private var game: GameBridge?
+    private var gameImageReconfiguration: DispatchWorkItem?
     /// A game is showing its frames (the mouse turns the head, clicks are its controller's).
     /// A game under Wine is presenting (its frames fill the view; W/A/S/D walk whatever the mode).
     /// A game presents and has the input (Halliday isn't up over it).
@@ -956,6 +957,8 @@ if !open, passthroughForVideo {
     func applicationWillTerminate(_ notification: Notification) {
         log("[app] quitting: releasing the mouse and putting windows back")
         discardHandTrackingWork()
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
         // A game in Halliday is asked to quit too (as SteamVR's do): it reads the request from the
         // bridge it still maps after Halliday closes it.
         game?.requestQuit()
@@ -2679,6 +2682,34 @@ if !open, passthroughForVideo {
             lastMode = s.mode
             recenterUI()
         }
+        scheduleGameImageReconfiguration()
+    }
+
+    /// Image dimensions are negotiated at connection. Defer edits during a live game.
+    private func scheduleGameImageReconfiguration() {
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
+        guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if !self.applyGameImageReconfiguration() { self.scheduleGameImageReconfiguration() }
+        }
+        gameImageReconfiguration = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    @discardableResult
+    private func applyGameImageReconfiguration() -> Bool {
+        guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent else { return true }
+        guard game.canReconfigureImage, let renderer else { return false }
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
+        game.onChange = nil
+        game.close()
+        self.game = nil
+        renderer.projection = nil
+        startGameBridge(renderer)
+        return true
     }
 
     /// Seated mode: the arc is centered on the user and faces where they face (at launch and on
@@ -3194,6 +3225,7 @@ if !open, passthroughForVideo {
             if !presenting { self.renderer?.projection = nil }
             // Seated: the walk the game needed ends with it (room-scale keeps where the user went).
             if !presenting, Settings.shared.mode == .seated { self.mouse.position = MouseLook().position }
+            if !presenting { self.scheduleGameImageReconfiguration() }
             if presenting { self.scheduleGameKeys() }
         }
     }
@@ -3660,6 +3692,7 @@ if !open, passthroughForVideo {
             playQuestApp(package)
             return
         }
+        applyGameImageReconfiguration()
         guard let url = GameLibrary.playURL(g) else { return }
         log("[games] starting \(g.name) through GameHub")
         notify("Starting \(g.name)", symbol: "gamecontroller", kind: .progress, seconds: 20)

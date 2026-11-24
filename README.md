@@ -363,6 +363,9 @@ Sense tracking uses a bounded optical worker, optional per-headset camera alignm
 a separate game-hand mounting frame. See [tracking and validation](docs/sense-tracking.md)
 for the controls, source references and remaining physical acceptance.
 
+Optional [game-image controls](docs/game-image.md) offer render scale, FSR 1 and
+independent RCAS sharpening before headset reprojection.
+
 ## Repository layout
 
 | Path | What |

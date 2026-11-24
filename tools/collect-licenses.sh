@@ -14,6 +14,7 @@ mkdir -p "$OUT"
 
 cp LICENSE "$OUT/Halliday.txt"
 cp THIRD-PARTY.md "$OUT/THIRD-PARTY.md"
+cp app/Resources/fsr1/LICENSE-AMD-FSR1.txt "$OUT/AMD-FidelityFX-FSR1-MIT.txt"
 
 # Rust crates compiled in: found through cargo, which knows where each one's source is.
 crate_dir() {

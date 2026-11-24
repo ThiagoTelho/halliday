@@ -4,8 +4,8 @@ import Foundation
 
 @MainActor
 final class Settings {
-    static let shared = Settings()
-    private let defaults = UserDefaults.standard
+    static let shared = Settings(defaults: .standard)
+    private let defaults: UserDefaults
     /// Called after any setting changes.
     var onChange: (() -> Void)?
 
@@ -94,12 +94,57 @@ final class Settings {
         didSet { defaults.set(vrPageEye, forKey: "vrPageEye"); onChange?() }
     }
 
+    /// FSR 1 processes game frames before the headset's lens correction.
+    var gameFSREnabled: Bool {
+        didSet { defaults.set(gameFSREnabled, forKey: "gameFSREnabled"); onChange?() }
+    }
+
+    /// RCAS sharpening is independent of FSR upscaling and is off by default.
+    var gameSharpeningEnabled: Bool {
+        didSet { defaults.set(gameSharpeningEnabled, forKey: "gameSharpeningEnabled"); onChange?() }
+    }
+
+    /// Percentage of the full game image rendered by the game, in five-percent steps.
+    static let gameRenderPercentRange = 50...100
+    var gameRenderPercent: Int {
+        didSet {
+            gameRenderPercent = Self.validGameRenderPercent(gameRenderPercent)
+            defaults.set(gameRenderPercent, forKey: "gameRenderPercent")
+            onChange?()
+        }
+    }
+
+    static let gameSharpnessRange: ClosedRange<Float> = 0...1
+    var gameSharpness: Float {
+        didSet {
+            gameSharpness = Self.validGameSharpness(gameSharpness)
+            defaults.set(gameSharpness, forKey: "gameSharpness")
+            onChange?()
+        }
+    }
+
+    static func validGameRenderPercent(_ percent: Int) -> Int {
+        let bounded = min(max(percent, gameRenderPercentRange.lowerBound), gameRenderPercentRange.upperBound)
+        return Int((Double(bounded) / 5).rounded()) * 5
+    }
+
+    static func validGameSharpness(_ sharpness: Float) -> Float {
+        sharpness.isFinite ? min(max(sharpness, 0), 1) : 0.3
+    }
+
     /// The Windows panel's layout is remembered for each set of apps open together.
     var rememberLayouts: Bool {
         didSet { defaults.set(rememberLayouts, forKey: "rememberLayouts"); onChange?() }
     }
 
-    private init() {
+    init(defaults: UserDefaults) {
+        self.defaults = defaults
+        gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
+        gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
+        let renderPercent = defaults.object(forKey: "gameRenderPercent")
+        gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)
+        let sharpness = defaults.object(forKey: "gameSharpness")
+        gameSharpness = Self.validGameSharpness((sharpness as? Float) ?? (sharpness as? String).flatMap(Float.init) ?? 0.3)
         rememberLayouts = defaults.object(forKey: "rememberLayouts") as? Bool ?? true
         vrPageEye = Self.vrPageSizes.contains(defaults.integer(forKey: "vrPageEye")) ? defaults.integer(forKey: "vrPageEye") : 1440
         reduceMotion = defaults.bool(forKey: "reduceMotion")
