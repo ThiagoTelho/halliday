@@ -137,6 +137,30 @@ pub struct HeadPose {
     pub predicted: bool,
 }
 
+/// One coherent prediction plus the tracker's discontinuity token.
+/// A changed token conservatively retires images rendered before a reset/correction;
+/// it does not claim that every large SLAM correction changes the world's basis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackedHeadPose {
+    pub motion: HeadPose,
+    pub tracking_generation: u64,
+}
+
+#[derive(Debug)]
+struct TrackingGeneration(u64);
+
+impl Default for TrackingGeneration {
+    fn default() -> Self {
+        // Process-wide allocation also distinguishes replacement trackers/sessions. Zero
+        // remains the legacy/unknown value. Exhaustion requires 2^64 discontinuities.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        )
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct ImuSample {
     vts_ns: i64,
@@ -164,6 +188,7 @@ pub struct HeadsetStatus {
 
 #[derive(Debug, Default)]
 pub struct HeadTracker {
+    tracking_generation: TrackingGeneration,
     config: TrackerConfig,
     vts: VtsUnwrapper,
     clock: ClockOffset,
@@ -203,6 +228,18 @@ impl HeadTracker {
     /// Estimated `host_ns - vts_ns`, once IMU data has arrived.
     pub fn clock_offset_ns(&self) -> Option<i64> {
         self.clock.offset_ns()
+    }
+
+    /// Must be read with the exact pose under the same Session tracker lock.
+    pub fn predict_tracked(&self, at_host_ns: i64) -> Option<TrackedHeadPose> {
+        self.predict(at_host_ns).map(|motion| TrackedHeadPose {
+            motion,
+            tracking_generation: self.tracking_generation.0,
+        })
+    }
+
+    fn discontinuity(&mut self) {
+        self.tracking_generation = TrackingGeneration::default();
     }
 
     /// Feeds a status packet received at `host_ns` (host monotonic clock).
@@ -261,15 +298,18 @@ impl HeadTracker {
             .last_target_vts
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(sample.vts_ns);
-        let before = match self.slam {
-            Some(prev)
-                if self.config.correction_smoothing_ns > 0
-                    && (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)) =>
-            {
-                Some(self.carried(&prev, anchor))
-            }
-            _ => None,
-        };
+        let continuous = self
+            .slam
+            .is_some_and(|prev| (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)));
+        // The residual is measured against gyro-carried prior motion, not the raw
+        // difference of two orientations: an ordinary fast turn is not a reset.
+        let continuity_before = self
+            .slam
+            .filter(|_| continuous)
+            .map(|prev| self.carried(&prev, anchor));
+        if self.slam.is_some() && !continuous {
+            self.discontinuity();
+        }
         match self.slam {
             Some(prev) if (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)) => {
                 let dt = (sample.vts_ns - prev.vts_ns) as f32 * 1e-9;
@@ -300,19 +340,27 @@ impl HeadTracker {
         self.held_turn = Quat::IDENTITY;
         self.held_shift = [0.0; 3];
         self.held_at_vts = anchor;
-        if let Some((orientation, pivot)) = before {
+        if let Some((orientation, pivot)) = continuity_before {
             let (now, now_pivot) = self.carried(&sample, anchor);
             let turn = (now.conjugate() * orientation).normalized();
-            let shift = [0, 1, 2].map(|i| pivot[i] - now_pivot[i]);
-            let far = shift[0].abs().max(shift[1].abs()).max(shift[2].abs());
-            // A real jump (tracking found again, a relocalization) is taken at once.
-            if Quat::IDENTITY.angle_to(turn) < 0.035 && far < 0.03 {
-                self.held_turn = turn;
-                self.held_shift = shift;
-            } else {
-                // Reuse the tracker's existing relocalization/correction test:
-                // a source-coordinate jump is not physical head velocity.
-                self.motion_velocity = None;
+            let far = (0..3)
+                .map(|i| (pivot[i] - now_pivot[i]).abs())
+                .fold(0.0, f32::max);
+            let small = Quat::IDENTITY.angle_to(turn) < 0.035 && far < 0.03;
+            if !small {
+                // Existing smoothing takes this correction at once. Retire old scene
+                // images even when correction smoothing has explicitly been disabled.
+                self.discontinuity();
+            }
+            if self.config.correction_smoothing_ns > 0 {
+                // Keep the existing prediction/smoothing trajectory exactly. Only the
+                // additive discontinuity token above is new.
+                if small {
+                    self.held_turn = turn;
+                    self.held_shift = [0, 1, 2].map(|i| pivot[i] - now_pivot[i]);
+                } else {
+                    self.motion_velocity = None;
+                }
             }
         }
     }
@@ -541,6 +589,7 @@ impl HeadTracker {
     /// Recenters so that the current heading becomes forward (−z) and the current position the
     /// origin, keeping the horizon level and the height.
     pub fn recenter_yaw(&mut self, at_host_ns: i64) {
+        self.discontinuity();
         self.recenter = None;
         let Some(h) = self.predict(at_host_ns) else {
             return;
@@ -556,6 +605,7 @@ impl HeadTracker {
 
     /// Recenters fully: the current orientation becomes identity (useful lying down).
     pub fn recenter_full(&mut self, at_host_ns: i64) {
+        self.discontinuity();
         self.recenter = None;
         let Some(h) = self.predict(at_host_ns) else {
             return;
@@ -569,6 +619,7 @@ impl HeadTracker {
     }
 
     pub fn clear_recenter(&mut self) {
+        self.discontinuity();
         self.recenter = None;
     }
 }
@@ -656,6 +707,96 @@ mod tests {
     fn nothing_without_slam() {
         let t = HeadTracker::new(TrackerConfig::default());
         assert!(t.predict(0).is_none());
+    }
+
+    #[test]
+    fn tracked_prediction_keeps_legacy_motion_and_unique_replacement_generation() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        assert!(t.predict_tracked(0).is_none());
+        t.ingest_slam(
+            &slam_record(10_000, Quat::IDENTITY, [0.1, 1.6, -0.2]),
+            50 * MS,
+        );
+        let h = t.predict_tracked(60 * MS).unwrap();
+        assert_ne!(h.tracking_generation, 0);
+        assert_eq!(h.motion, t.predict(60 * MS).unwrap());
+        assert_eq!(h, t.predict_tracked(60 * MS).unwrap());
+        let mut replacement = HeadTracker::new(TrackerConfig::default());
+        replacement.ingest_slam(
+            &slam_record(10_000, Quat::IDENTITY, [0.1, 1.6, -0.2]),
+            50 * MS,
+        );
+        let new = replacement.predict_tracked(60 * MS).unwrap();
+        assert!(new.tracking_generation > h.tracking_generation);
+        assert_eq!(new.motion, h.motion);
+    }
+
+    #[test]
+    fn tracked_generation_preserves_a_normal_gyro_carried_fifteen_degree_turn() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        // Approximately 15 degrees of normal integrated motion, not a SLAM residual.
+        let gyro = raw_gyro([0., 5., 0.]);
+        let rate = status_pair(0, gyro).imu[0].gyro_rad_s()[1];
+        feed_imu(&mut t, 0, 100, gyro);
+        let q0 = Quat::IDENTITY;
+        let pivot = [0., 1.6, 0.];
+        let position = |q: Quat| {
+            let lever = (SLAM_CORRECTION * q).rotate(NECK_LEVER);
+            [0, 1, 2].map(|i| pivot[i] + lever[i])
+        };
+        t.ingest_slam(&slam_record(20_000, q0, position(q0)), 43 * MS + OFFSET);
+        let first = t.predict_tracked(43 * MS + OFFSET).unwrap();
+        let duration_s = 0.052;
+        let q1 = Quat::from_axis_angle([0., 1., 0.], rate * duration_s);
+        t.ingest_slam(&slam_record(72_000, q1, position(q1)), 95 * MS + OFFSET);
+        let turned = t.predict_tracked(95 * MS + OFFSET).unwrap();
+        assert!(q0.angle_to(q1) > 0.25);
+        assert_eq!(turned.tracking_generation, first.tracking_generation);
+        assert_eq!(turned.motion, t.predict(95 * MS + OFFSET).unwrap());
+    }
+
+    #[test]
+    fn tracked_generation_retires_large_corrections_gaps_and_explicit_recenters() {
+        for smoothing in [0, 60 * MS] {
+            for (angle, shift, changes) in
+                [(0.01, 0.001, false), (0.05, 0., true), (0., 0.05, true)]
+            {
+                let mut t = HeadTracker::new(TrackerConfig {
+                    correction_smoothing_ns: smoothing,
+                    ..TrackerConfig::default()
+                });
+                t.ingest_slam(&slam_record(0, Quat::IDENTITY, [0., 1.6, 0.]), 0);
+                let initial = t.predict_tracked(0).unwrap().tracking_generation;
+                t.ingest_slam(
+                    &slam_record(
+                        16_000,
+                        Quat::from_axis_angle([0., 1., 0.], angle),
+                        [shift, 1.6, 0.],
+                    ),
+                    16 * MS,
+                );
+                let after = t.predict_tracked(16 * MS).unwrap().tracking_generation;
+                assert_eq!(
+                    initial != after,
+                    changes,
+                    "smoothing={smoothing}, angle={angle}, shift={shift}"
+                );
+                t.ingest_slam(
+                    &slam_record(250_000, Quat::IDENTITY, [0., 1.6, 0.]),
+                    250 * MS,
+                );
+                let gap = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(gap > after);
+                t.recenter_yaw(250 * MS);
+                let yaw = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(yaw > gap);
+                t.recenter_full(250 * MS);
+                let full = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(full > yaw);
+                t.clear_recenter();
+                assert!(t.predict_tracked(250 * MS).unwrap().tracking_generation > full);
+            }
+        }
     }
 
     #[test]

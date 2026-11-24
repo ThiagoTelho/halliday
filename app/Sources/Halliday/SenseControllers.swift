@@ -243,6 +243,16 @@ final class SenseControllers: @unchecked Sendable {
 
     var connected: [Hand] { lock.lock(); defer { lock.unlock() }; return Hand.allCases.filter { devices[$0] != nil } }
 
+    /// A cached, bracketed sensor orientation for this exact camera exposure.
+    /// No HID request, forward prediction or stale latest-state fallback.
+    func orientation(_ hand: Hand, atHostNs exposure: Int64) -> simd_quatf? {
+        lock.lock(); defer { lock.unlock() }
+        guard let core = devices[hand]?.core else { return nil }
+        var q = [Float](repeating: 0, count: 4)
+        guard halliday_sense_orientation_at(core, exposure, &q) else { return nil }
+        return simd_quatf(ix: q[0], iy: q[1], iz: q[2], r: q[3])
+    }
+
     /// Says a hand's controller points along `yaw` now (radians about y; 0 is straight ahead).
     func recenter(_ hand: Hand, yaw: Float) {
         lock.lock()

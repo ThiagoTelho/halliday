@@ -17,7 +17,7 @@ use crate::psvr2::protocol::{DistortionCalibration, FirmwareInfo, SlamRecord, St
 use crate::recording::{Reader, RecordingError, Stream};
 use crate::time::host_time_ns;
 use crate::tracking::blobs::Blob;
-use crate::tracking::{HeadPose, HeadTracker, HeadsetStatus, TrackerConfig};
+use crate::tracking::{HeadPose, HeadTracker, HeadsetStatus, TrackedHeadPose, TrackerConfig};
 
 /// The bright spots one tracking camera saw at its newest exposure (the controllers' LEDs, and
 /// whatever else is bright). Views: a frame holds two cameras' pictures, left then right or top
@@ -143,6 +143,13 @@ impl Shared {
         self.tracker.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn reset_tracker(&self) {
+        // Allocate replacement state while holding the same lock as prediction. The
+        // replacement's token cannot be observed with the previous tracker's pose.
+        let mut tracker = self.tracker();
+        *tracker = HeadTracker::new(TrackerConfig::default());
+    }
+
     fn ingest(&self, stream: Stream, data: &[u8], host_ns: i64) {
         match stream {
             Stream::Status => {
@@ -216,6 +223,12 @@ impl Session {
     /// Head pose predicted for host time `at_host_ns` (see [`crate::time::host_time_ns`]).
     pub fn predict(&self, at_host_ns: i64) -> Option<HeadPose> {
         self.shared.tracker().predict(at_host_ns)
+    }
+
+    /// Pose, motion validity and discontinuity generation from ONE tracker lock.
+    /// A replacement tracker (USB reconnect/replay loop) receives a new token.
+    pub fn predict_tracked(&self, at_host_ns: i64) -> Option<TrackedHeadPose> {
+        self.shared.tracker().predict_tracked(at_host_ns)
     }
 
     pub fn status(&self) -> HeadsetStatus {
@@ -362,7 +375,7 @@ fn replay(shared: &Shared, path: &PathBuf, looping: bool) {
                 return;
             }
         };
-        *shared.tracker() = HeadTracker::new(TrackerConfig::default());
+        shared.reset_tracker();
         let start = host_time_ns();
         let mut first_t: Option<u64> = None;
         for record in reader {
@@ -602,7 +615,7 @@ mod usb {
     }
 
     fn run_connected(shared: &Shared, headset: Arc<Headset>) {
-        *shared.tracker() = HeadTracker::new(TrackerConfig::default());
+        shared.reset_tracker();
         // A failed read must not attach the previous headset's camera profile to a new device.
         *shared.firmware.lock().unwrap() = headset.firmware_info().ok();
         match headset.distortion_calibration() {
@@ -648,6 +661,69 @@ mod tests {
     use super::*;
     use crate::psvr2::protocol::{IMU_RECORD_SIZE, SLAM_RECORD_SIZE, STATUS_HEADER_SIZE};
     use crate::recording::Writer;
+
+    fn generation_record(x: f32) -> SlamRecord {
+        SlamRecord {
+            vts_us: 0,
+            unknown1: 3,
+            position: [0., 1.6, x],
+            orientation: crate::math::Quat::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn tracked_generation_is_atomic_with_pose_across_session_replacements() {
+        let shared = Arc::new(Shared::new(LinkState::Connected));
+        let expected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let first_generation = {
+            let mut t = shared.tracker();
+            t.ingest_slam(&generation_record(0.), 0);
+            let sample = t.predict_tracked(0).unwrap();
+            expected
+                .lock()
+                .unwrap()
+                .insert(sample.tracking_generation, sample.motion);
+            sample.tracking_generation
+        };
+        let session = Session {
+            shared: shared.clone(),
+            thread: None,
+        };
+        thread::scope(|scope| {
+            let writer_shared = shared.clone();
+            let writer_expected = expected.clone();
+            scope.spawn(move || {
+                for i in 1..=1000 {
+                    let mut t = writer_shared.tracker();
+                    *t = HeadTracker::new(TrackerConfig::default());
+                    t.ingest_slam(&generation_record(i as f32 * 0.001), 0);
+                    let sample = t.predict_tracked(0).unwrap();
+                    writer_expected
+                        .lock()
+                        .unwrap()
+                        .insert(sample.tracking_generation, sample.motion);
+                    thread::yield_now();
+                }
+            });
+            for _ in 0..5000 {
+                let sample = session.predict_tracked(0).unwrap();
+                assert_eq!(
+                    expected.lock().unwrap().get(&sample.tracking_generation),
+                    Some(&sample.motion)
+                );
+                thread::yield_now();
+            }
+        });
+        let final_sample = session.predict_tracked(0).unwrap();
+        assert!(final_sample.tracking_generation > first_generation);
+        shared.reset_tracker();
+        assert!(session.predict_tracked(0).is_none());
+        shared.tracker().ingest_slam(&generation_record(3.), 0);
+        assert!(
+            session.predict_tracked(0).unwrap().tracking_generation
+                > final_sample.tracking_generation
+        );
+    }
 
     #[test]
     fn camera_profile_identity_is_cached_and_connected_only() {

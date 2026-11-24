@@ -1574,8 +1574,8 @@ if !open, passthroughForVideo {
         // The top cameras' pictures of the same exposure, when they have arrived.
         let top = [2, 3].map { view in headset.cameraView(view).flatMap { $0.counter == l.counter ? spots($0) : nil } ?? [] }
         let orientations = SenseControllers.Hand.allCases.compactMap { hand -> HandTrackingWorker.HandOrientation? in
-            guard let state = sense.state(hand), state.settled else { return nil }
-            let q = state.orientation
+            guard let state = sense.state(hand), state.settled,
+                  let q = sense.orientation(hand, atHostNs: l.exposureHostNs) else { return nil }
             return HandTrackingWorker.HandOrientation(index: hand.rawValue, orientation: q.vector)
         }
         guard !orientations.isEmpty else { return }
@@ -1593,7 +1593,7 @@ if !open, passthroughForVideo {
         handTrackingWorker?.submit(HandTrackingWorker.Frame(counter: l.counter, exposureHostNs: l.exposureHostNs,
             headOrientation: head.orientation.vector, headPosition: head.position, heightLift: usb?.heightLift ?? 0,
             handOrientations: orientations, views: [left, right, top[0], top[1]], fisheyes: Self.bottomFisheyes,
-            fisheyeAlignment: handFisheyeAlignment))
+            fisheyeAlignment: handFisheyeAlignment, trackingGeneration: head.trackingGeneration))
     }
 
     private func discardHandTrackingWork() {
@@ -1608,6 +1608,8 @@ if !open, passthroughForVideo {
         guard let headset = usb?.headset, headset.linkState == .connected,
               handTrackingSource == ObjectIdentifier(headset) else { return }
         let frame = output.frame
+        if frame.trackingGeneration != 0, let current = lastHead?.trackingGeneration,
+           current != 0, current != frame.trackingGeneration { return }
         guard frame.fisheyes == Self.bottomFisheyes, frame.fisheyeAlignment == handFisheyeAlignment else { return }
         let age = hostTimeNs() - frame.exposureHostNs
         guard frame.exposureHostNs > lastHandResultExposure, age >= -20_000_000, age <= 250_000_000 else { return }

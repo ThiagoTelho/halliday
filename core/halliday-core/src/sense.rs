@@ -13,6 +13,7 @@
 //! to its fusion unchanged); the orientation turns that frame into the tracking space's.
 
 use crate::math::{Quat, Vec3};
+pub use crate::sense_orientation_history::OrientationHistory;
 
 pub const VENDOR_ID: u16 = 0x054C;
 pub const PRODUCT_ID_LEFT: u16 = 0x0E45;
@@ -449,6 +450,7 @@ pub struct Controller {
     /// doesn't count as taken late.
     device_s: f64,
     clock_offset: Option<f64>,
+    orientation_history: OrientationHistory,
 }
 
 impl Controller {
@@ -470,11 +472,13 @@ impl Controller {
             room_yaw: None,
             device_s: 0.0,
             clock_offset: None,
+            orientation_history: OrientationHistory::new(),
         }
     }
 
     pub fn set_calibration(&mut self, calibration: Calibration) {
         self.calibration = calibration;
+        self.orientation_history.reset();
     }
 
     /// Takes one input report (report id first). Returns the parsed report.
@@ -513,13 +517,15 @@ impl Controller {
     /// The accelerometer's sample to the place filter: in the room's frame, gravity taken off,
     /// at the host's time for the moment it was taken.
     fn feed_place(&mut self, accel: Vec3, dt: f32) {
-        if dt <= 0.0 || dt > 0.25 {
+        if dt > 0.25 {
             // A gap: the clocks are matched again, and nothing is carried across it.
             self.clock_offset = None;
-            if dt > 0.25 {
-                self.place.reset();
-            }
+            self.orientation_history.reset();
+            self.place.reset();
         }
+        // A duplicate timestamp is not a new clock epoch. Keeping the existing
+        // minimum offset also makes the position filter ignore that repeated
+        // sample, rather than moving its clock forward by transport delay.
         self.device_s += f64::from(dt.max(0.0));
         let arrived = crate::time::host_time_ns() as f64 * 1e-9;
         let offset = arrived - self.device_s;
@@ -529,6 +535,9 @@ impl Controller {
             .clock_offset
             .map_or(offset, |o| (o + 0.0002 * f64::from(dt)).min(offset));
         self.clock_offset = Some(kept);
+        if self.settled {
+            self.orientation_history.push_device_time((self.device_s*1e9).round() as i64,self.orientation);
+        }
         let (Some(yaw), true) = (self.room_yaw, self.settled) else {
             return;
         };
@@ -594,9 +603,18 @@ impl Controller {
         Quat::from_axis_angle([0.0, 1.0, 0.0], self.heading) * self.orientation
     }
 
+    /// A bracketed sensor orientation at a camera exposure in the existing
+    /// common host clock. No latest-pose fallback and no extra prediction/wait.
+    pub fn orientation_at_host_ns(&self, exposure_ns: i64) -> Option<Quat> {
+        let offset=(self.clock_offset?*1e9).round() as i64;
+        let q=self.orientation_history.sample_host_time(exposure_ns,offset)?;
+        Some(Quat::from_axis_angle([0.,1.,0.],self.heading)*q)
+    }
+
     /// Makes the direction the controller points now (its −z, flattened) the heading `yaw`
     /// (radians about y; 0 is the tracking space's forward).
     pub fn recenter(&mut self, yaw: f32) {
+        self.orientation_history.reset();
         self.heading = yaw - self.orientation.yaw();
     }
 
@@ -882,6 +900,76 @@ mod tests {
         (rate / Calibration::default().gyro_scale[0]).round() as i16
     }
     const ONE_G: i16 = 4080;
+
+    #[test]
+    fn exposure_orientation_history_uses_current_clock_offset_without_changing_live_pose() {
+        for hand in [Hand::Left,Hand::Right] {
+            let mut c=Controller::new(hand);
+            c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],0,0)).unwrap();
+            let first=c.orientation;
+            c.ingest(&report([0;3],0,[0,counts(1.),0],[0,ONE_G,0],50_000,1)).unwrap();
+            let current=c.orientation();
+            let device=(c.device_s*1e9).round() as i64/2;
+            let offset=(c.clock_offset.unwrap()*1e9).round() as i64;
+            let expected=crate::sense_orientation_history::between((0,first),
+                ((c.device_s*1e9).round() as i64,c.orientation),device).unwrap();
+            let sampled=c.orientation_at_host_ns(device+offset).unwrap();
+            assert!(sampled.angle_to(expected)<1e-5);
+            assert_eq!(c.orientation(),current,"Historical lookup cannot change the current game pose");
+            // A lower transport estimate must rebase every sample consistently.
+            c.clock_offset=Some(c.clock_offset.unwrap()-0.01);
+            let shifted=(c.clock_offset.unwrap()*1e9).round() as i64;
+            assert!(c.orientation_at_host_ns(device+shifted).unwrap().angle_to(expected)<1e-5);
+            c.recenter(0.4);
+            assert!(c.orientation_at_host_ns(device+shifted).is_none());
+            c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],100_000,2)).unwrap();
+            let now=(c.device_s*1e9).round() as i64+(c.clock_offset.unwrap()*1e9).round() as i64;
+            assert_eq!(c.orientation_at_host_ns(now),Some(c.orientation()));
+            let unchanged=c.orientation();c.set_calibration(Calibration::default());
+            assert!(c.orientation_at_host_ns(now).is_none());assert_eq!(c.orientation(),unchanged);
+        }
+    }
+
+    #[test]
+    fn exposure_orientation_history_retires_device_clock_gaps_and_resets() {
+        let mut c=Controller::new(Hand::Left);
+        for i in 0..4 {c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],i*50_000,i)).unwrap();}
+        let old_device=(c.device_s*1e9).round() as i64;
+        c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],1,5)).unwrap(); // device clock reset
+        let offset=(c.clock_offset.unwrap()*1e9).round() as i64;
+        assert!(c.orientation_history.sample_host_time(old_device+offset,offset).is_none());
+        let current=(c.device_s*1e9).round() as i64;
+        assert!(c.orientation_history.sample_host_time(current+offset,offset).is_some());
+        c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],3_000_001,6)).unwrap(); // >250ms gap
+        let offset=(c.clock_offset.unwrap()*1e9).round() as i64;
+        assert!(c.orientation_history.sample_host_time(current+offset,offset).is_none());
+    }
+
+    #[test]
+    fn exposure_orientation_duplicate_report_keeps_the_clock_and_existing_bracket() {
+        let mut c=Controller::new(Hand::Right);
+        c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],0,0)).unwrap();
+        c.ingest(&report([0;3],0,[0,counts(1.),0],[0,ONE_G,0],50_000,1)).unwrap();
+        let offset=c.clock_offset;
+        let offset_ns=(offset.unwrap()*1e9).round() as i64;
+        let device=(c.device_s*1e9).round() as i64/2;
+        let expected=c.orientation_at_host_ns(device+offset_ns).unwrap();
+        c.ingest(&report([0;3],0,[0,counts(1.),0],[0,ONE_G,0],50_000,1)).unwrap();
+        assert_eq!(c.clock_offset,offset,"Duplicate device time cannot become a transport-offset reset");
+        assert_eq!(c.orientation_at_host_ns(device+offset_ns),Some(expected));
+    }
+
+    #[test]
+    fn exposure_orientation_device_tick_wrap_keeps_one_unwrapped_history() {
+        let mut c=Controller::new(Hand::Left);
+        c.ingest(&report([0;3],0,[0;3],[0,ONE_G,0],u32::MAX-50_000,0)).unwrap();
+        c.ingest(&report([0;3],0,[0,counts(1.),0],[0,ONE_G,0],1,1)).unwrap();
+        assert!(c.device_s>0. && c.device_s<0.02);
+        let device=(c.device_s*1e9).round() as i64/2;
+        let offset=(c.clock_offset.unwrap()*1e9).round() as i64;
+        assert!(c.orientation_history.sample_host_time(device+offset,offset).is_some(),
+            "A normal wrapping hardware counter is not a reconnect/reset epoch");
+    }
 
     #[test]
     fn at_rest_up_is_found_and_kept() {

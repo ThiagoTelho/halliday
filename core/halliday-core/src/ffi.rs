@@ -469,6 +469,21 @@ pub unsafe extern "C" fn halliday_sense_report(
     }
 }
 
+/// Cached orientation bracketed at a camera exposure on the common host clock.
+/// Does not wait, predict forward, read HID or fall back to a stale latest pose.
+/// # Safety
+/// Null or live sense handle; out is null or4 writable floats. Unchanged on failure.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_sense_orientation_at(
+    sense: *const HallidaySense, exposure_host_ns: i64, out: *mut f32,
+) -> bool {
+    if sense.is_null() || out.is_null() {return false;}
+    let Ok(c)=(unsafe{&*sense}).0.lock() else{return false};
+    let Some(q)=c.orientation_at_host_ns(exposure_host_ns) else{return false};
+    unsafe{std::ptr::copy_nonoverlapping([q.x,q.y,q.z,q.w].as_ptr(),out,4);}
+    true
+}
+
 /// The newest state. False until a report has been taken.
 ///
 /// # Safety
@@ -801,6 +816,22 @@ pub struct HallidayHeadPoseMotion {
     pub motion_flags: u32,
 }
 
+/// Additive coherent discontinuity API; legacy 56/72-byte DTOs are unchanged.
+#[repr(C)]
+#[derive(Debug, Default, Clone, Copy)]
+pub struct HallidayTrackedHeadPose {
+    pub motion: HallidayHeadPoseMotion,
+    pub tracking_generation: u64,
+}
+
+fn head_motion_for_c(h: crate::tracking::HeadPose) -> HallidayHeadPoseMotion {
+    HallidayHeadPoseMotion {
+        pose: head_pose_for_c(h),
+        linear_velocity: h.linear_velocity,
+        motion_flags: h.motion_flags,
+    }
+}
+
 fn head_pose_for_c(h: crate::tracking::HeadPose) -> HallidayHeadPose {
     let q = h.pose.orientation;
     HallidayHeadPose {
@@ -827,10 +858,27 @@ pub unsafe extern "C" fn halliday_session_predict_motion(
     let Some(h) = s.predict(at_host_ns) else {
         return false;
     };
-    *out = HallidayHeadPoseMotion {
-        pose: head_pose_for_c(h),
-        linear_velocity: h.linear_velocity,
-        motion_flags: h.motion_flags,
+    *out = head_motion_for_c(h);
+    true
+}
+
+/// Exact prediction and discontinuity generation sampled under one tracker lock.
+/// Zero is reserved for legacy/unknown sources. False leaves `out` untouched.
+/// # Safety
+/// `session` is null/live and `out` is null or a writable complete tracked DTO.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_session_predict_tracked(
+    session: *const HallidaySession,
+    at_host_ns: i64,
+    out: *mut HallidayTrackedHeadPose,
+) -> bool {
+    let (Some(s), Some(out)) = (unsafe { self::session(session) }, unsafe { out.as_mut() }) else {
+        return false;
+    };
+    let Some(h) = s.predict_tracked(at_host_ns) else { return false; };
+    *out = HallidayTrackedHeadPose {
+        motion: head_motion_for_c(h.motion),
+        tracking_generation: h.tracking_generation,
     };
     true
 }
@@ -2003,6 +2051,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn exposure_orientation_c_api_rejects_missing_history_without_touching_output() {
+        let sense=halliday_sense_open(0x0e46);
+        let mut q=[0.25;4];
+        unsafe {
+            assert!(!halliday_sense_orientation_at(std::ptr::null(),0,q.as_mut_ptr()));
+            assert!(!halliday_sense_orientation_at(sense,0,std::ptr::null_mut()));
+            assert!(!halliday_sense_orientation_at(sense,0,q.as_mut_ptr()));
+            assert_eq!(q,[0.25;4]);
+            halliday_sense_close(sense);
+        }
+    }
+
+    #[test]
     fn controller_frames_c_api_pairs_both_hands_and_legacy_publish_clears_tags() {
         use halliday_bridge::controller_frames::{FrameKind, LEGACY};
         let folder = std::env::temp_dir().join(format!("halliday-controller-frames-{}-{}",
@@ -2056,6 +2117,22 @@ mod tests {
             assert!(copy_headset_identity("PCB12", bytes.as_mut_ptr(), 6));
             assert_eq!(&bytes, b"PCB12\0");
         }
+    }
+
+    #[test]
+    fn tracked_head_c_api_keeps_output_unchanged_on_missing_session() {
+        let mut out = HallidayTrackedHeadPose::default();
+        out.tracking_generation = 0x123456789;
+        out.motion.motion_flags = 0xa5;
+        out.motion.pose.orientation = [1., 2., 3., 4.];
+        // SAFETY: output is a complete writable DTO and null session is supported.
+        unsafe {
+            assert!(!halliday_session_predict_tracked(std::ptr::null(), 17, &mut out));
+            assert!(!halliday_session_predict_tracked(std::ptr::null(), 17, std::ptr::null_mut()));
+        }
+        assert_eq!(out.tracking_generation, 0x123456789);
+        assert_eq!(out.motion.motion_flags, 0xa5);
+        assert_eq!(out.motion.pose.orientation, [1., 2., 3., 4.]);
     }
 
     #[test]
@@ -2126,6 +2203,9 @@ mod tests {
             68
         );
         assert_eq!(std::mem::size_of::<HallidayHeadPoseMotion>(), 72);
+        assert_eq!(std::mem::offset_of!(HallidayTrackedHeadPose, motion), 0);
+        assert_eq!(std::mem::offset_of!(HallidayTrackedHeadPose, tracking_generation), 72);
+        assert_eq!(std::mem::size_of::<HallidayTrackedHeadPose>(), 80);
         assert_eq!(std::mem::size_of::<HallidayHeadsetStatus>(), 3);
         // The bridge's types as the header declares them.
         assert_eq!(std::mem::size_of::<HallidayBridgeState>(), 64 + 2 * 128);

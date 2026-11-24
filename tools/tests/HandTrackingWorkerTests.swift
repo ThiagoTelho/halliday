@@ -33,6 +33,7 @@ private final class Recorder: @unchecked Sendable {
             try coalesces()
             try resets()
             try geometryGenerations()
+            try trackingGenerations()
             try closesAndDrops()
             try nativeEquivalence(path: CommandLine.arguments[1])
             if CommandLine.arguments.count > 2 {
@@ -137,6 +138,45 @@ private final class Recorder: @unchecked Sendable {
         worker.close(); try wait(closed, "Geometry fixture did not close")
     }
 
+    static func trackingGenerations() throws {
+        let recorder=Recorder(), entered=DispatchSemaphore(value:0), release=DispatchSemaphore(value:0)
+        let output=DispatchSemaphore(value:0), closed=DispatchSemaphore(value:0)
+        let worker=HandTrackingWorker(solver:.init(solve:{ f in
+            recorder.record{recorder.calls.append(f.counter)}
+            if f.counter==1{entered.signal();release.wait()}
+            return fixes()
+        },reset:{recorder.record{recorder.resets+=1}},close:{closed.signal()})){ value in
+            recorder.record{recorder.outputs.append(value)};output.signal()
+        }
+        var first=frame(1);first.trackingGeneration=10
+        worker.submit(first);try wait(entered,"Tracked fixture did not begin")
+        var next=frame(2);next.trackingGeneration=11;worker.submit(next)
+        var newest=frame(3);newest.trackingGeneration=11;worker.submit(newest)
+        release.signal();try wait(output,"Replacement tracking generation did not solve")
+        let value=recorder.lock.withLock{recorder.outputs.last!}
+        try require(recorder.lock.withLock{recorder.calls==[1,3]&&recorder.outputs.count==1&&recorder.resets==1},
+                    "Tracking discontinuity leaked a completed old-world result or missed reset")
+        var same=frame(4);same.trackingGeneration=11;worker.submit(same);try wait(output,"Same generation did not solve")
+        worker.submit(frame(5));try wait(output,"Legacy untagged fallback did not solve")
+        try require(recorder.lock.withLock{recorder.resets==1}&&worker.isCurrent(value),
+                    "Equal/zero generations must not clear hypotheses every frame")
+        var changed=frame(6);changed.trackingGeneration=12;worker.submit(changed)
+        try require(!worker.isCurrent(value),"Queued old-world callback survived a known nonzero change")
+        try wait(output,"Known generation after unknown fallback did not solve")
+        try require(recorder.lock.withLock{recorder.resets==2&&recorder.outputs.last?.frame.trackingGeneration==12},
+                    "Unknown fallback erased the previous known generation or lost source metadata")
+        worker.close();try wait(closed,"Tracked fixture did not close")
+
+        let initial=Recorder(), ready=DispatchSemaphore(value:0), finished=DispatchSemaphore(value:0)
+        let legacy=HandTrackingWorker(solver:.init(solve:{_ in fixes()},reset:{initial.record{initial.resets+=1}},close:{finished.signal()})){ value in
+            initial.record{initial.outputs.append(value)};ready.signal()
+        }
+        legacy.submit(frame(1));try wait(ready,"Initial legacy frame missing")
+        var known=frame(2);known.trackingGeneration=20;legacy.submit(known);try wait(ready,"Initial known generation missing")
+        try require(initial.lock.withLock{initial.resets==0},"Binding a first known token must preserve legacy fixtures")
+        legacy.close();try wait(finished,"Legacy fixture did not close")
+    }
+
     struct SavedFrame: Decodable {
         let counter: Int, exposureHostNs: Int64
         let head: [Float], left: [Float], right: [Float]
@@ -164,12 +204,10 @@ private final class Recorder: @unchecked Sendable {
         let frames = try JSONDecoder().decode([SavedFrame].self, from: Data(contentsOf: URL(fileURLWithPath: path))).map {
             var frame = $0.snapshot; frame.fisheyeAlignment = alignment; return frame
         }
-        let handles = [halliday_hand_open(true)!, halliday_hand_open(false)!]
-        defer { for handle in handles { halliday_hand_close(handle) } }
-        for handle in handles {
-            halliday_hand_set_fisheyes(handle, true)
-            try require(halliday_hand_set_fisheye_alignment(handle, [alignment.x, alignment.y, alignment.z]), "Valid profile rejected by real Core")
-        }
+        let handle = halliday_hand_pair_open()!
+        defer { halliday_hand_pair_close(handle) }
+        halliday_hand_pair_set_fisheyes(handle, true)
+        try require(halliday_hand_pair_set_fisheye_alignment(handle, [alignment.x, alignment.y, alignment.z]), "Valid profile rejected by real Core")
         let recorder = Recorder(), output = DispatchSemaphore(value: 0)
         let worker = HandTrackingWorker { value in recorder.record { recorder.outputs.append(value) }; output.signal() }
         defer { worker.close() }
@@ -181,13 +219,21 @@ private final class Recorder: @unchecked Sendable {
             if let phase { phaseExposures[phase] += 1 }
             let views = frame.views.map { $0.map { HallidayCameraSpot(x: $0.x, y: $0.y, area: $0.area, peak: $0.peak) } }
             let h = frame.headOrientation
-            var expected: [HallidayHandFix?] = []
+            var controllers = [Float](repeating: 0, count: 8)
+            var controllerMask: UInt32 = 0
             for hand in frame.handOrientations {
                 let q = hand.orientation
-                var fix = HallidayHandFix()
-                let valid = halliday_hand_update(handles[hand.index], [h.x, h.y, h.z, h.w], [q.x, q.y, q.z, q.w],
-                    views[0], UInt32(views[0].count), views[1], UInt32(views[1].count), views[2], UInt32(views[2].count), views[3], UInt32(views[3].count), &fix)
-                expected.append(valid ? fix : nil)
+                for (axis, value) in [q.x, q.y, q.z, q.w].enumerated() { controllers[hand.index * 4 + axis] = value }
+                controllerMask |= UInt32(1) << UInt32(hand.index)
+            }
+            let p = frame.headPosition
+            var native = [HallidayHandFix(), HallidayHandFix()]
+            let accepted = halliday_hand_pair_update(handle, UInt64(frame.exposureHostNs), [h.x, h.y, h.z, h.w],
+                [p.x, p.y, p.z], controllers, controllerMask,
+                views[0], UInt32(views[0].count), views[1], UInt32(views[1].count),
+                views[2], UInt32(views[2].count), views[3], UInt32(views[3].count), &native)
+            let expected: [HallidayHandFix?] = (0..<2).map { hand in
+                accepted & (UInt32(1) << UInt32(hand)) != 0 ? native[hand] : nil
             }
             worker.submit(frame); try wait(output, "Real worker replay timed out")
             let actual = recorder.lock.withLock { recorder.outputs.last! }

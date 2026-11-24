@@ -32,6 +32,10 @@ use super::stereo::{
 use crate::math::Quat;
 use crate::sense::Hand;
 
+#[path = "hand_pair.rs"]
+mod pair;
+pub use pair::{PairDiagnostics, PairedHandTracker};
+
 /// A bright spot of one picture: its middle in pixels and its size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spot {
@@ -135,6 +139,9 @@ const NEAR_LAST_FRAMES: u32 = 60;
 #[derive(Debug, Clone, Copy)]
 struct Sighting {
     view: usize,
+    /// Identity of the actual source blob within this view/exposure, retained
+    /// even when another controller's observations are masked before refitting.
+    spot: usize,
     led: usize,
     at: [f64; 2],
 }
@@ -160,6 +167,31 @@ impl Solution {
     fn is_good(&self) -> bool {
         self.sightings.len() >= MIN_SIGHTINGS && self.rms < MAX_RMS
     }
+
+    /// High-observability stereo support, using the existing large-heading
+    /// support count and cold-acquisition unique-LED count. Only the paired
+    /// tracker may use this branch: it also corroborates independent exposures.
+    fn strong_stereo(&self) -> bool {
+        self.rms < MAX_RMS
+            && self.sightings.len() >= JUMP_SIGHTINGS
+            && self
+                .sightings
+                .iter()
+                .map(|s| (s.view, s.spot))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.sightings.len()
+            && [0, 1].iter().all(|view| {
+                self.sightings.iter().filter(|s| s.view == *view).count() >= JUMP_SIGHTINGS / 2
+            })
+            && self
+                .sightings
+                .iter()
+                .map(|s| s.led)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= SCAN_SIGHTINGS
+    }
 }
 
 /// One exposure's spots: the bottom pair's two pictures (views 0 and 1) with the points they
@@ -167,6 +199,7 @@ impl Solution {
 struct Seen<'a> {
     cameras: Vec<Camera>,
     spots: Vec<&'a [Spot]>,
+    spot_ids: Vec<Vec<usize>>,
     points: Vec<V3>,
 }
 
@@ -230,6 +263,7 @@ impl<'a> Seen<'a> {
         }
         Seen {
             cameras,
+            spot_ids: spots.iter().map(|view| (0..view.len()).collect()).collect(),
             spots,
             points,
         }
@@ -412,6 +446,7 @@ fn assign(seen: &Seen, shape: &Shape, p: V3, radius: f64) -> Vec<Sighting> {
             if d < radius * radius && !nearer {
                 out.push(Sighting {
                     view,
+                    spot: seen.spot_ids[view][j],
                     led: *led,
                     at: [f64::from(spots[j].x), f64::from(spots[j].y)],
                 });
@@ -564,6 +599,10 @@ pub struct HandTracker {
     /// on few LEDs is not taken: with the heading unknown, five sightings fitted a controller
     /// 36° off its real heading.
     settled: bool,
+    /// Enables the expanded stereo gate only for the paired temporal owner.
+    paired_confirmation: bool,
+    /// Per-exposure paired identity support; legacy callers keep MIN_SIGHTINGS.
+    required_sightings: usize,
     /// A cold monocular hypothesis must fit a later exposure before it establishes yaw.
     monocular_trial: Option<MonocularTrial>,
 }
@@ -582,6 +621,8 @@ impl HandTracker {
             bottom: None,
             bottom_alignment: [0.0; 3],
             settled: false,
+            paired_confirmation: false,
+            required_sightings: MIN_SIGHTINGS,
             monocular_trial: None,
         }
     }
@@ -619,7 +660,9 @@ impl HandTracker {
             return true;
         }
         let raw = self.bottom.is_some();
+        let paired = self.paired_confirmation;
         *self = Self::new(self.hand);
+        self.paired_confirmation = paired;
         self.bottom_alignment = rotation;
         self.set_bottom_fisheyes(raw);
         true
@@ -769,7 +812,8 @@ impl HandTracker {
         if !found.as_ref().is_some_and(|s| self.usable(s))
             && self.lost >= SCAN_AFTER
             && (self.lost - SCAN_AFTER) % SCAN_EVERY == 0
-            && seen.points.len() >= 5
+            && (seen.points.len() >= 5
+                || self.paired_confirmation && self.last.is_some() && self.lost <= NEAR_LAST_FRAMES)
         {
             let steps = if self.settled && self.lost < RESCAN_AFTER {
                 -SCAN_NEAR_STEPS..=SCAN_NEAR_STEPS
@@ -779,7 +823,7 @@ impl HandTracker {
             found = steps
                 .filter_map(|step| {
                     let heading = self.heading + f64::from(step) * 6f64.to_radians();
-                    self.fit(
+                    let voted = self.fit(
                         seen,
                         camera_from_world,
                         imu,
@@ -789,9 +833,37 @@ impl HandTracker {
                             radii: &RADII_SEARCH,
                             hold: 0.0,
                         },
-                    )
+                    );
+                    let prior = if self.paired_confirmation && self.lost <= NEAR_LAST_FRAMES {
+                        self.last
+                            .and_then(|last| {
+                                self.fit(
+                                    seen,
+                                    camera_from_world,
+                                    imu,
+                                    heading,
+                                    Search {
+                                        start: Some(last),
+                                        radii: &RADII_SEARCH,
+                                        hold: 0.0,
+                                    },
+                                )
+                            })
+                            .filter(Solution::strong_stereo)
+                    } else {
+                        None
+                    };
+                    [voted, prior]
+                        .into_iter()
+                        .flatten()
+                        .filter(|s| self.scan_usable(s))
+                        .max_by(|a, b| {
+                            (a.sightings.len(), -a.rms)
+                                .partial_cmp(&(b.sightings.len(), -b.rms))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                 })
-                .filter(|s| s.sightings.len() >= SCAN_SIGHTINGS && s.rms < SCAN_RMS)
+                .filter(|s| self.scan_usable(s))
                 .max_by(|a, b| {
                     (a.sightings.len(), -a.rms)
                         .partial_cmp(&(b.sightings.len(), -b.rms))
@@ -802,7 +874,9 @@ impl HandTracker {
         // Its initial yaw is arbitrary: retrying only yaw zero can never acquire it. Keep
         // the IMU's tilt/roll, scan a bounded number of yaws, and require eight unique LEDs
         // in one picture, the normal scan's tight RMS, and a confirming later exposure.
-        if !self.settled && !found.as_ref().is_some_and(|s| self.usable(s)) {
+        if (!self.settled || self.paired_confirmation && self.lost >= SCAN_AFTER)
+            && !found.as_ref().is_some_and(|s| self.usable(s))
+        {
             if let Some(trial) = self.monocular_trial
                 && self.lost > trial.exposure
                 && self.lost - trial.exposure <= MONOCULAR_CONFIRM_FRAMES
@@ -838,6 +912,7 @@ impl HandTracker {
             {
                 let step = (self.lost - SCAN_AFTER) / SCAN_EVERY * MONOCULAR_HEADINGS_PER_SCAN;
                 let mut best: Option<(usize, usize, Solution)> = None;
+                let mut strong_best: Option<Solution> = None;
                 for offset in 0..MONOCULAR_HEADINGS_PER_SCAN {
                     let heading = f64::from((step + offset) % 60) * 6f64.to_radians();
                     let rotation = mul(
@@ -875,6 +950,19 @@ impl HandTracker {
                             continue;
                         };
                         let count = tried.sightings.iter().filter(|v| v.view == view).count();
+                        if self.paired_confirmation && tried.strong_stereo() && self.usable(&tried)
+                        {
+                            // A single-camera seed is only a proposal. Both raw
+                            // cameras validate it, and the paired owner requires
+                            // an independent exposure before publishing this pose.
+                            if strong_best.as_ref().is_none_or(|old| {
+                                (tried.sightings.len(), -tried.rms)
+                                    > (old.sightings.len(), -old.rms)
+                            }) {
+                                strong_best = Some(tried);
+                            }
+                            continue;
+                        }
                         if count < SCAN_SIGHTINGS || tried.rms >= SCAN_RMS || !self.usable(&tried) {
                             continue;
                         }
@@ -885,6 +973,9 @@ impl HandTracker {
                             best = Some((view, count, tried));
                         }
                     }
+                }
+                if let Some(strong) = strong_best {
+                    found = Some(strong);
                 }
                 if let Some((view, _, tried)) = best {
                     self.monocular_trial = Some(MonocularTrial {
@@ -932,11 +1023,18 @@ impl HandTracker {
             .rem_euclid(std::f64::consts::TAU)
             - std::f64::consts::PI;
         s.is_good()
+            && s.sightings.len() >= self.required_sightings
             && dot(s.position, s.position).sqrt() < MAX_REACH
             && (self.settled || s.sightings.len() >= SCAN_SIGHTINGS)
             && !(self.settled
                 && jump.abs() > HEADING_JUMP
-                && !(s.sightings.len() >= JUMP_SIGHTINGS && s.rms < SCAN_RMS))
+                && !(s.sightings.len() >= JUMP_SIGHTINGS && s.rms < SCAN_RMS
+                    || self.paired_confirmation && s.strong_stereo()))
+    }
+
+    fn scan_usable(&self, s: &Solution) -> bool {
+        s.sightings.len() >= SCAN_SIGHTINGS && s.rms < SCAN_RMS
+            || self.paired_confirmation && s.strong_stereo()
     }
 
     /// The place, heading and lean that fit the spots, starting from `start` or, without one, from
@@ -1077,20 +1175,17 @@ pub fn at_exposure(frames: &mut [Frame], lag_ns: i64) {
                 continue;
             }
             let ((t0, q0), (t1, q1)) = (reports[after - 1], reports[after]);
-            if wanted - t0 > 50_000_000 || t1 - wanted > 50_000_000 {
+            let (Ok(t0), Ok(t1), Ok(wanted_time)) =
+                (i64::try_from(t0), i64::try_from(t1), i64::try_from(wanted))
+            else {
                 continue;
-            }
-            let k = (wanted - t0) as f32 / (t1 - t0).max(1) as f32;
-            let q1 = if q0.dot(q1) < 0.0 { -q1 } else { q1 };
-            frame.hands[hand] = Some(
-                Quat {
-                    w: q0.w + (q1.w - q0.w) * k,
-                    x: q0.x + (q1.x - q0.x) * k,
-                    y: q0.y + (q1.y - q0.y) * k,
-                    z: q0.z + (q1.z - q0.z) * k,
-                }
-                .normalized(),
-            );
+            };
+            let Some(q) =
+                crate::sense_orientation_history::between((t0, q0), (t1, q1), wanted_time)
+            else {
+                continue;
+            };
+            frame.hands[hand] = Some(q);
             frame.hands_at[hand] = Some(wanted);
         }
     }
@@ -2275,5 +2370,60 @@ mod tests {
                 "{tilt:?}"
             );
         }
+    }
+}
+
+#[cfg(test)]
+mod strong_stereo_contract_tests {
+    use super::*;
+    fn strong() -> Solution {
+        Solution {
+            position: [0., 0., 0.5],
+            heading: 0.,
+            tilt: [0.; 2],
+            rms: 1.7,
+            sightings: (0..16)
+                .map(|i| Sighting {
+                    view: i / 8,
+                    spot: i % 8,
+                    led: i % 8,
+                    at: [0.; 2],
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn strong_stereo_requires_unique_leds_unique_blobs_both_views_and_existing_rms_bound() {
+        let good = strong();
+        assert!(good.strong_stereo());
+        let mut weak = good.clone();
+        weak.sightings.truncate(8);
+        assert!(!weak.strong_stereo());
+        let mut one = good.clone();
+        for s in &mut one.sightings {
+            s.view = 0;
+        }
+        assert!(!one.strong_stereo());
+        let mut repeat = good.clone();
+        for s in &mut repeat.sightings {
+            s.led %= 4;
+        }
+        assert!(!repeat.strong_stereo());
+        let mut duplicate = good.clone();
+        duplicate.sightings[1].spot = duplicate.sightings[0].spot;
+        assert!(!duplicate.strong_stereo());
+        let mut loose = good.clone();
+        loose.rms = MAX_RMS;
+        assert!(!loose.strong_stereo());
+        let legacy = HandTracker::new(Hand::Left);
+        assert!(!legacy.scan_usable(&good));
+        let mut paired = legacy;
+        paired.paired_confirmation = true;
+        assert!(paired.scan_usable(&good));
+        let mut weak_tight = good.clone();
+        weak_tight.sightings.truncate(8);
+        weak_tight.rms = 1.1;
+        assert!(paired.scan_usable(&weak_tight));
+        assert!(HandTracker::new(Hand::Left).scan_usable(&weak_tight));
     }
 }

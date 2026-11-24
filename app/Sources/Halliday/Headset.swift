@@ -33,6 +33,8 @@ struct HeadPose {
     /// Linear/angular validity. Defaults describe stationary synthetic poses;
     /// tracked and moving simulator sources explicitly supply their flags.
     var motionFlags: UInt32 = 3
+    /// Coherent tracker-discontinuity token; zero for legacy/synthetic sources.
+    var trackingGeneration: UInt64 = 0
 }
 
 struct HeadsetStatus {
@@ -76,8 +78,9 @@ final class Headset: @unchecked Sendable {
 
     /// Head pose predicted for a host time in ns (e.g. a display link's target timestamp × 1e9).
     func predict(atHostNs t: Int64) -> HeadPose? {
-        var motion = HallidayHeadPoseMotion()
-        guard halliday_session_predict_motion(session, t, &motion) else { return nil }
+        var tracked = HallidayTrackedHeadPose()
+        guard halliday_session_predict_tracked(session, t, &tracked) else { return nil }
+        let motion = tracked.motion
         let p = motion.pose
         return HeadPose(
             position: SIMD3(p.position.0, p.position.1, p.position.2),
@@ -86,7 +89,8 @@ final class Headset: @unchecked Sendable {
             slamAgeNs: p.slam_age_ns,
             predicted: p.predicted != 0,
             linearVelocity: SIMD3(motion.linear_velocity.0,motion.linear_velocity.1,motion.linear_velocity.2),
-            motionFlags: motion.motion_flags)
+            motionFlags: motion.motion_flags,
+            trackingGeneration: tracked.tracking_generation)
     }
 
     var status: HeadsetStatus? {

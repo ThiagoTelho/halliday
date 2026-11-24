@@ -9,4 +9,4 @@ pub mod place;
 pub mod replay;
 pub mod stereo;
 
-pub use head::{HeadPose, HeadTracker, HeadsetStatus, TrackerConfig};
+pub use head::{HeadPose, HeadTracker, HeadsetStatus, TrackedHeadPose, TrackerConfig};

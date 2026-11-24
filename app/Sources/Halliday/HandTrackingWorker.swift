@@ -25,6 +25,8 @@ final class HandTrackingWorker: @unchecked Sendable {
         let fisheyes: Bool
         /// Right tracking-camera-local rotation vector, radians; identity without a profile.
         var fisheyeAlignment: SIMD3<Float> = .zero
+        /// Coherent head-tracker discontinuity token; zero is legacy/unknown.
+        var trackingGeneration: UInt64 = 0
     }
     struct Fix: Sendable {
         let index: Int
@@ -50,6 +52,7 @@ final class HandTrackingWorker: @unchecked Sendable {
     private struct Geometry: Equatable {
         let fisheyes: Bool
         let alignment: SIMD3<Float>
+        var trackingGeneration: UInt64
         init?(_ frame: Frame) {
             let a = frame.fisheyes ? frame.fisheyeAlignment : .zero
             let limit = Float.pi / 36 // Same five-degree safety domain as the Core setter.
@@ -57,6 +60,15 @@ final class HandTrackingWorker: @unchecked Sendable {
                   a.x * a.x + a.y * a.y + a.z * a.z <= limit * limit else { return nil }
             fisheyes = frame.fisheyes
             alignment = a
+            trackingGeneration = frame.trackingGeneration
+        }
+        mutating func retainKnownGeneration(from old: Geometry?) {
+            if trackingGeneration == 0 { trackingGeneration = old?.trackingGeneration ?? 0 }
+        }
+        func changes(from old: Geometry) -> Bool {
+            fisheyes != old.fisheyes || alignment != old.alignment ||
+                (trackingGeneration != 0 && old.trackingGeneration != 0 &&
+                 trackingGeneration != old.trackingGeneration)
         }
     }
 
@@ -102,12 +114,13 @@ final class HandTrackingWorker: @unchecked Sendable {
         }
 
         func submit(_ frame: Frame) {
-            guard let nextGeometry = Geometry(frame) else { reset(); return }
+            guard var nextGeometry = Geometry(frame) else { reset(); return }
             lock.lock()
             guard !closed else { lock.unlock(); return }
             // Geometry belongs to a result's generation, even before solving.
             // A completed old result queued on another actor must also expire.
-            if let geometry, geometry != nextGeometry { generation &+= 1 }
+            nextGeometry.retainKnownGeneration(from: geometry)
+            if let geometry, nextGeometry.changes(from: geometry) { generation &+= 1 }
             geometry = nextGeometry
             pending = Request(frame: frame, generation: generation)
             let start = !scheduled
@@ -168,31 +181,31 @@ final class HandTrackingWorker: @unchecked Sendable {
     /// Handles and their temporal state never leave the worker queue.
     private final class NativeSolver: @unchecked Sendable {
         private let queue: DispatchQueue
-        private var handles: [OpaquePointer?] = [nil, nil]
+        private var handle: OpaquePointer?
         private var geometry: Geometry?
         init(queue: DispatchQueue) { self.queue = queue }
         func reset() {
             dispatchPrecondition(condition: .onQueue(queue))
-            for i in handles.indices {
-                if let handle = handles[i] { halliday_hand_close(handle) }
-                handles[i] = nil
-            }
+            if let handle { halliday_hand_pair_close(handle) }
+            handle = nil
             geometry = nil
         }
         func solve(_ frame: Frame) -> [Fix] {
             dispatchPrecondition(condition: .onQueue(queue))
-            guard frame.views.count >= 2 else { return [] }
-            guard let nextGeometry = Geometry(frame) else { reset(); return [] }
-            if let geometry, geometry != nextGeometry { reset() }
-            // Configure both handles together before either receives an exposure.
-            // A bad profile/failed setter must not leave one hand on old geometry.
-            for hand in handles.indices where handles[hand] == nil {
-                guard let handle = halliday_hand_open(hand == 0) else { reset(); return [] }
-                handles[hand] = handle
-                halliday_hand_set_fisheyes(handle, nextGeometry.fisheyes)
+            guard frame.views.count >= 2, frame.exposureHostNs > 0 else { return [] }
+            guard var nextGeometry = Geometry(frame) else { reset(); return [] }
+            nextGeometry.retainKnownGeneration(from: geometry)
+            if let geometry, nextGeometry.changes(from: geometry) { reset() }
+            // One paired solve owns both temporal tracks and blob assignments.
+            // A bad profile cannot leave one hand on a different geometry.
+            if handle == nil {
+                guard let opened = halliday_hand_pair_open() else { reset(); return [] }
+                handle = opened
+                halliday_hand_pair_set_fisheyes(opened, nextGeometry.fisheyes)
                 let a = nextGeometry.alignment
-                guard halliday_hand_set_fisheye_alignment(handle, [a.x, a.y, a.z]) else { reset(); return [] }
+                guard halliday_hand_pair_set_fisheye_alignment(opened, [a.x, a.y, a.z]) else { reset(); return [] }
             }
+            guard let handle else { return [] }
             geometry = nextGeometry
             let views = (0..<4).map { i in
                 (frame.views.indices.contains(i) ? frame.views[i] : []).map {
@@ -201,20 +214,26 @@ final class HandTrackingWorker: @unchecked Sendable {
             }
             let h = frame.headOrientation
             let head = [h.x, h.y, h.z, h.w]
-            var fixes: [Fix] = []
+            var controllers = [Float](repeating: 0, count: 8)
+            var controllerMask: UInt32 = 0
             var visited: Set<Int> = []
             for hand in frame.handOrientations where (0...1).contains(hand.index) && visited.insert(hand.index).inserted {
-                guard let handle = handles[hand.index] else { continue }
                 let q = hand.orientation
-                var fix = HallidayHandFix()
-                if halliday_hand_update(handle, head, [q.x, q.y, q.z, q.w],
-                    views[0], UInt32(views[0].count), views[1], UInt32(views[1].count),
-                    views[2], UInt32(views[2].count), views[3], UInt32(views[3].count), &fix) {
-                    fixes.append(Fix(index: hand.index, position: SIMD3(fix.position.0, fix.position.1, fix.position.2),
-                        heading: fix.heading, tilt: SIMD2(fix.tilt.0, fix.tilt.1), sightings: fix.sightings, rms: fix.rms))
-                }
+                for (axis, value) in [q.x, q.y, q.z, q.w].enumerated() { controllers[hand.index * 4 + axis] = value }
+                controllerMask |= UInt32(1) << UInt32(hand.index)
             }
-            return fixes
+            let p = frame.headPosition
+            var nativeFixes = [HallidayHandFix(), HallidayHandFix()]
+            let accepted = halliday_hand_pair_update(handle, UInt64(frame.exposureHostNs), head,
+                [p.x, p.y, p.z], controllers, controllerMask,
+                views[0], UInt32(views[0].count), views[1], UInt32(views[1].count),
+                views[2], UInt32(views[2].count), views[3], UInt32(views[3].count), &nativeFixes)
+            return (0..<2).compactMap { hand in
+                guard accepted & (UInt32(1) << UInt32(hand)) != 0 else { return nil }
+                let fix = nativeFixes[hand]
+                return Fix(index: hand, position: SIMD3(fix.position.0, fix.position.1, fix.position.2),
+                    heading: fix.heading, tilt: SIMD2(fix.tilt.0, fix.tilt.1), sightings: fix.sightings, rms: fix.rms)
+            }
         }
     }
 }

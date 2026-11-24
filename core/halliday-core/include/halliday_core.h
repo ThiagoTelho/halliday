@@ -66,6 +66,18 @@ typedef struct {
 } HallidayHeadPoseMotion;
 bool halliday_session_predict_motion(const HallidaySession *session, int64_t at_host_ns, HallidayHeadPoseMotion *out);
 
+/* Additive coherent prediction: pose/motion and discontinuity generation are read under
+   the SAME tracker lock. Nonzero generation changes on tracker/session replacement,
+   recenter, discontinuous SLAM gaps and large unsmoothed correction; ordinary integrated
+   head motion does not change it. It conservatively invalidates earlier scene images,
+   not a claim that every correction changes world coordinates. Zero=legacy/unknown.
+   False leaves out unchanged. Existing pose structs/getters retain their exact ABI. */
+typedef struct {
+    HallidayHeadPoseMotion motion;
+    uint64_t tracking_generation;
+} HallidayTrackedHeadPose;
+bool halliday_session_predict_tracked(const HallidaySession *session, int64_t at_host_ns, HallidayTrackedHeadPose *out);
+
 typedef struct {
     uint8_t worn;            /* proximity sensor */
     uint8_t function_button; /* Fn button under the visor */
@@ -158,6 +170,21 @@ bool halliday_hand_update(const HallidayHand *hand, const float *head, const flo
                           const HallidayCameraSpot *top_left, uint32_t top_left_count,
                           const HallidayCameraSpot *top_right, uint32_t top_right_count, HallidayHandFix *out);
 
+/* Transactional paired optical association. Existing single-hand API remains valid.
+ * Input positions are used only for world-space temporal consistency, never as a hand offset.
+ * head=XYZW, head_position=XYZ, controllers=leftXYZW/rightXYZW; controller_mask bits0/1.
+ * out holds two fixes (left/right); return bits0/1 identify accepted fixes. */
+typedef struct HallidayHandPair HallidayHandPair;
+HallidayHandPair *halliday_hand_pair_open(void);
+void halliday_hand_pair_close(HallidayHandPair *pair);
+void halliday_hand_pair_set_fisheyes(const HallidayHandPair *pair, bool on);
+bool halliday_hand_pair_set_fisheye_alignment(const HallidayHandPair *pair, const float *rotation);
+uint32_t halliday_hand_pair_update(const HallidayHandPair *pair, uint64_t exposure_ns,
+    const float *head, const float *head_position, const float *controllers, uint32_t controller_mask,
+    const HallidayCameraSpot *left, uint32_t left_count, const HallidayCameraSpot *right, uint32_t right_count,
+    const HallidayCameraSpot *top_left, uint32_t top_left_count,
+    const HallidayCameraSpot *top_right, uint32_t top_right_count, HallidayHandFix *out);
+
 /* --- Sense controllers --------------------------------------------------------------------- */
 
 /* One PS VR2 Sense controller: the app reads its HID reports (Bluetooth or USB) and feeds them
@@ -208,6 +235,10 @@ bool halliday_sense_calibrate(const HallidaySense *sense, const uint8_t *first, 
 bool halliday_sense_report(const HallidaySense *sense, const uint8_t *bytes, size_t len);
 /* The newest state. False until a report has been taken. */
 bool halliday_sense_state(const HallidaySense *sense, HallidaySenseState *out);
+/* Cached raw sensor orientation at camera exposure host ns; no wait/HID/prediction.
+ * False for unbracketed/stale history; out4 XYZW floats unchanged on failure.
+ * Existing current-state/game-controller APIs are unaffected. */
+bool halliday_sense_orientation_at(const HallidaySense *sense, int64_t exposure_host_ns, float *out);
 /* Writes the 48-byte feature report (id 0x08) that asks for about 133 reports a second, not 60. */
 void halliday_sense_polling_report(uint8_t *out);
 /* Writes the 78-byte Bluetooth output report (id 0x31) that sets the tracking LEDs: phase 1
