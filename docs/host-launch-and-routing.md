@@ -29,10 +29,11 @@ No graphics-provider DLL is replaced.
 
 OpenVR and Windows OpenXR registrations keep reversible original receipts.
 Automatic routing selects a validated provider once per process. The app's
-500 ms policy publication favors a worn, ready Halliday headset; an optional
-external provider needs fresh `connected:true` telemetry. Installed manifests or
-DLL presence alone do not establish a connection. A user may restore the original
-runtime explicitly. Existing processes keep their chosen runtime.
+500 ms policy publication favors a worn, ready Halliday headset. Fresh
+`connected:true` telemetry marks an optional provider active and affects its
+priority; installed-file presence alone does not establish a connection. The
+saved original remains a fallback when Halliday or its policy is unavailable,
+even without telemetry. A user may restore that original runtime explicitly. Existing processes keep their chosen runtime.
 
 Native VeRantyx uses the source-built native runtime and helpers from
 [PR05](native-runtime.md), with bounded Steam readiness, executable/start-time

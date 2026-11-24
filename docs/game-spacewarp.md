@@ -1,8 +1,9 @@
 # Experimental colour-only Spacewarp
 
 **Game image → Spacewarp 2×** is a live switch on the Mac and in the headset.
-It is off by default. Enabling it selects Half frame rate: 60 real game frames
-at 120 Hz, or 45 at 90 Hz, with a bounded forecast on the intervening refresh.
+It is off by default. Enabling it selects Half frame rate, targeting a 60 game-frame/s budget
+at 120 Hz or 45 at 90 Hz, with a bounded forecast on intervening refreshes.
+Actual game FPS can be lower.
 Disabling Spacewarp retains the chosen half-rate cadence; that switch can then
 be disabled separately. FSR 1 and RCAS remain independent live controls.
 
