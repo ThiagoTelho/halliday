@@ -60,6 +60,11 @@ To remove everything Halliday has kept, quit it and delete those files.
   its runtime shows the game's frames in, on a second hidden display of Halliday's. The pictures stay in the graphics
   memory and never leave the Mac. They are written to disk only if you ask for a snapshot with
   one of the developer flags (`--keys-snapshot` and the like), to the file you name.
+- **System audio recording**: when **Game audio in PS VR2** is enabled and a VR
+  game is presenting, Halliday relays the Mac system mix to the headset. Other
+  apps playing at that time are included; Halliday's own audio and the microphone
+  are excluded. Samples stay in a small memory buffer and are never saved or
+  sent over the network. Capture stops with the game/headset or when disabled.
 - **Accessibility**: to move those windows onto that display, resize them, and pass your clicks
   and typing to them.
 - **Automation** (asked once per app): only if you open Music in Halliday, to show and control

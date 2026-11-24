@@ -278,3 +278,9 @@ windows-bridge-check:
 windows-haptic-feed-check:
 	cargo build --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --release
 	bash tools/test-independent-haptic-feed.sh
+
+# Synthetic PCM and settings only: no capture, output device, TCC, or app launch.
+.PHONY: system-game-audio-check
+system-game-audio-check:
+	bash tools/test-system-game-audio.sh
+	bash tools/test-system-game-audio-settings.sh

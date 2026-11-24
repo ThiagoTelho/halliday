@@ -54,6 +54,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// pointer, its trigger clicks, its grip right-clicks and its stick scrolls.
     /// Hold PS to recenter; a tap in a game opens or closes Halliday's dashboard.
     private let sense = SenseControllers()
+    private let systemGameAudio = SystemGameAudio()
     private var senseHand = SenseControllers.Hand.right
     private var senseButtons: [SenseControllers.Hand: SenseControllers.Buttons] = [:]
     private var senseSeeded: Set<SenseControllers.Hand> = []
@@ -436,6 +437,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
             environments?.apply(CommandLine.arguments[i + 1])
         }
         Settings.shared.onChange = { [weak self] in self?.applySettings() }
+        systemGameAudio.onStatus = { status in log("[game audio] \(status.displayText)") }
         applySettings()
         video = try? VideoPlayer(renderer: renderer)
         applyVolume()
@@ -1008,6 +1010,7 @@ if !open, passthroughForVideo {
     func applicationWillTerminate(_ notification: Notification) {
         log("[app] quitting: releasing the mouse and putting windows back")
         automaticVRPolicy.shutdown(now: Date())
+        systemGameAudio.stop()
         refreshSwitchTask?.cancel()
         discardHandTrackingWork()
         gameImageReconfiguration?.cancel()
@@ -2679,6 +2682,7 @@ if !open, passthroughForVideo {
         video?.volume = level
         QuestApps.setVolume(level)
         Sounds.volume = Settings.shared.soundVolume * level
+        updateGameAudio()
         quickSettings?.setNeedsDisplay()
     }
 
@@ -3360,6 +3364,7 @@ if !open, passthroughForVideo {
                 // Retire the old inode now; submitted GPU work retains its
                 // original GameBridgeLease until completion. New games open a
                 // fresh, unowned mapping through the normal creation path.
+                self.systemGameAudio.stop()
                 expired.onChange = nil
                 expired.close()
                 self.game = nil
@@ -3386,6 +3391,7 @@ if !open, passthroughForVideo {
         GameLibrary.shared.refresh()
         game?.onChange = { [weak self] presenting in
             guard let self, let game = self.game else { return }
+            self.updateGameAudio()
             let name = GameLibrary.shared.displayName(forExecutable: game.appName)
             if presenting {
                 // How to get out, the first three times a game starts (design board 14, moment 1).
@@ -3699,6 +3705,9 @@ if !open, passthroughForVideo {
         if let game, !game.setPhysicalDisplayHz(hz) { scheduleGameImageReconfiguration() }
         if let id = Self.displayID(screen) { view?.refreshHeadsetTiming(display: id, hz: Double(hz)) }
         if changed {
+            // A display-backed SCK stream can retire during a physical mode switch.
+            systemGameAudio.stop()
+            updateGameAudio()
             log("[display] live headset refresh \(Int(hz.rounded())) Hz")
             settingsPanel?.setNeedsDisplay()
             companion?.model.refresh()
@@ -3950,6 +3959,8 @@ if !open, passthroughForVideo {
         s.onHeadset = onHeadset
         s.desktopMode = desktopMode
         s.canSwitchOutput = headsetWindow != nil
+        s.gameAudio = !Settings.shared.gameSystemAudio ? "Game audio is off"
+            : game?.isPresenting != true ? "Ready for a VR game" : systemGameAudio.status.displayText
         s.refreshRates = availableHeadsetRefreshRates
         s.refreshSwitching = refreshSwitchTask != nil
         s.framesPerSecond = shownFramesPerSecond
@@ -4321,12 +4332,22 @@ if !open, passthroughForVideo {
         let tick = CACurrentMediaTime()
         guard tick < lastAutomaticVRPoll || tick - lastAutomaticVRPoll >= 0.5 else { return }
         lastAutomaticVRPoll = tick
+        updateGameAudio()
         applyPreferredHeadsetRefresh()
         let now = Date()
         let ready = onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected && game != nil
         automaticVRPolicy.update(hallidayReady: ready, worn: ready && usb?.headset.status?.worn == true,
                                  externalActive: WindowsOpenXRSupport.externalIsActive(now: now), now: now)
         if let error = automaticVRPolicy.takeError() { log("[games] \(error)") }
+    }
+
+    /// Renderer-independent system mix; output is pinned to the headset.
+    /// Polling notices unplug/reconnect and a manually changed Mac output.
+    private func updateGameAudio() {
+        systemGameAudio.setState(enabled: Settings.shared.gameSystemAudio,
+            gameActive: game?.isPresenting == true,
+            psvrConnected: onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected,
+            volume: playerMuted ? 0 : Settings.shared.volume)
     }
 
     private func frameTick(head: HeadPose) {

@@ -27,6 +27,7 @@ struct CompanionStatus: Equatable {
     /// is a headset to switch to at all.
     var desktopMode = false
     var canSwitchOutput = false
+    var gameAudio = "Ready for a VR game"
     var refreshRates: [Int] = []
     var refreshSwitching = false
 }
@@ -588,9 +589,14 @@ private struct SoundPane: View {
         }
         CompanionCard(title: "Sound") {
             LevelRow(title: "Volume", value: s.volume < 0.01 ? "Off" : "\(Int((s.volume * 100).rounded()))%", level: model.setting(\.volume), range: 0...1)
-            Text("Videos, apps and Halliday's own sounds all play at this level.").font(.callout).foregroundStyle(.secondary)
+            Text("Videos, apps, relayed game audio and Halliday's own sounds play at this level.").font(.callout).foregroundStyle(.secondary)
             LevelRow(title: "Interface sounds", value: s.soundVolume < 0.01 ? "Off" : "\(Int((s.soundVolume * 100).rounded()))%",
                      level: model.setting(\.soundVolume), range: 0...1, step: 0.1)
+            Toggle("Game audio in PS VR2", isOn: model.setting(\.gameSystemAudio)).toggleStyle(.switch)
+                .accessibilityIdentifier("game.systemAudio")
+            Text(model.status.gameAudio).font(.callout).foregroundStyle(.secondary)
+            Text("Sends Mac audio to the headset while a VR game is running. Uses Screen & System Audio Recording permission.")
+                .font(.caption).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         CompanionCard(title: "Display") {
             HStack {
