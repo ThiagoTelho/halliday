@@ -44,7 +44,9 @@ final class SettingsPanel: VRPanel {
         case "page:gameImage": showingGameImage = true
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
-        case "game:halfFrameRate": if !settings.gameSpacewarpEnabled { settings.gameHalfFrameRate.toggle() }
+        case "game:half:off": settings.gameHalfFrameRateMode = .off
+        case "game:half:on": settings.gameHalfFrameRateMode = .on
+        case "game:half:auto": settings.gameHalfFrameRateMode = .auto
         case "game:spacewarp": settings.setGameSpacewarp(!settings.gameSpacewarpEnabled)
         case "game:systemAudio": settings.gameSystemAudio.toggle()
         case "display:90": onRefreshRate?(90)
@@ -228,20 +230,16 @@ final class SettingsPanel: VRPanel {
         NightGlass.drawText("Lower is faster; higher keeps more detail.", at: CGPoint(x: x, y: y + 30), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 60
-        y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:halfFrameRate"], x: rx, y: y, width: rw) { r in
-            let rect = CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34)
-            if self.settings.gameSpacewarpEnabled {
-                self.control("game:halfFrameRate", rect.insetBy(dx: -6, dy: -4), enabled: false)
-                NightGlass.fill(ctx, rect, radius: 17, color: NightGlass.accent.withAlphaComponent(0.35))
-                NightGlass.fill(ctx, CGRect(x: rect.maxX - 31, y: rect.minY + 3, width: 28, height: 28), radius: 14,
-                                color: NSColor(white: 1, alpha: 0.45))
-            } else { self.toggle(ctx, "game:halfFrameRate", self.settings.effectiveGameHalfFrameRate, rect) }
+        y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:half:off", "game:half:on", "game:half:auto"], x: rx, y: y, width: rw) { r in
+            _ = self.segmented(ctx, GameHalfFrameRateMode.allCases.map {
+                ("game:half:" + $0.rawValue, $0.title, self.settings.gameHalfFrameRateMode == $0)
+            }, x: r.maxX - 14 - 234, y: r.midY - 22, width: 234)
         }
         NightGlass.drawText("Every other refresh: 60 game FPS at 120 Hz; 45 at 90 Hz.", at: CGPoint(x: x, y: y + 4), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Headset tracking and display stay at full rate.", at: CGPoint(x: x, y: y + 26), style: .caption,
+        NightGlass.drawText("Auto follows game performance and checks for recovery.", at: CGPoint(x: x, y: y + 26), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Half rate is live with Halliday; restart for render scale.", at: CGPoint(x: x, y: y + 48), style: .caption,
+        NightGlass.drawText("Applies live; headset tracking and display stay at full rate.", at: CGPoint(x: x, y: y + 48), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 76
         y = row(ctx, "Spacewarp 2×", "square.stack.3d.up", (0x7FD3FF, 0x2A7FBF), ids: ["game:spacewarp"], x: rx, y: y, width: rw) { r in
@@ -249,9 +247,9 @@ final class SettingsPanel: VRPanel {
         }
         NightGlass.drawText("At 120 Hz: 60 game frames + 60 generated frames per second.", at: CGPoint(x: x, y: y + 4), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Enables half frame rate; both apply live with Halliday.", at: CGPoint(x: x, y: y + 26), style: .caption,
+        NightGlass.drawText("Auto generates only at half rate; Off shows real frames.", at: CGPoint(x: x, y: y + 26), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Spacewarp can then be switched on or off live.", at: CGPoint(x: x, y: y + 48), style: .caption,
+        NightGlass.drawText("Enabling Spacewarp from Off selects Half.", at: CGPoint(x: x, y: y + 48), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 76
         y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in

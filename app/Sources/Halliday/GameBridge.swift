@@ -28,6 +28,11 @@ final class GameBridge {
     private(set) var halfFrameRate: Bool
     private var frameCadence: GameFrameCadence
     private var cadenceEpoch: UInt64 = 1
+    private var autoFrameRate = GameAutoFrameRate()
+    private(set) var halfFrameRateMode: GameHalfFrameRateMode = .off
+    private var dashboardShown = false
+    var requestedHalfFrameRate: Bool { autoFrameRate.halfFrameRate }
+
     /// Verified physical display rate; the independent host can change cadence in place.
     var physicalDisplayHz: Float { frameCadence.physicalHz }
     var supportsLiveDisplayRate: Bool { bridge != nil }
@@ -255,7 +260,9 @@ final class GameBridge {
         self.queue = queue
         projectionIPD = ipd
         imageRenderPercent = Settings.shared.gameRenderPercent
-        halfFrameRate = Settings.shared.effectiveGameHalfFrameRate
+        halfFrameRateMode = Settings.shared.gameHalfFrameRateMode
+        autoFrameRate = GameAutoFrameRate(mode: halfFrameRateMode)
+        halfFrameRate = autoFrameRate.halfFrameRate
         frameCadence = GameFrameCadence(physicalHz: displayHz, halfFrameRate: halfFrameRate)
         interval = 1 / Double(frameCadence.physicalHz)
         guard Self.installRuntime() else { return nil }
@@ -341,6 +348,33 @@ final class GameBridge {
     }
 
     var nativeGameDisplayHz: Float { frameCadence.gameHz }
+
+    /// Persisted mode and live decision are separate. Reapplying the same mode
+    /// after an unrelated setting change preserves measurements and cooldowns.
+    @discardableResult
+    func setHalfFrameRateMode(_ mode: GameHalfFrameRateMode) -> Bool {
+        autoFrameRate.setMode(mode); halfFrameRateMode = mode
+        return setHalfFrameRate(autoFrameRate.halfFrameRate)
+    }
+
+    private func updateAutoFrameRate(_ b: OpaquePointer, now: Double,
+                                    consumerBlocked: Bool, hostEligible: Bool) {
+        guard halfFrameRateMode == .auto else { return }
+        var client = HallidayBridgeClient()
+        let epoch = halliday_bridge_client_epoch(b)
+        halliday_bridge_client(b, &client)
+        let ready = halliday_bridge_client_status(b) == 1 && client.initialized != 0 &&
+            epoch == halliday_bridge_client_epoch(b)
+        let openVR = epoch == 0 || observedOpenVRSubmitTiming
+        let suspended = openVR && ((lastScene?.0.grid ?? 0) != 0 || (lastScene?.0.suspended ?? 0) != 0)
+        let projection = layer.map { $0.gameImage && ($0.composition == nil || $0.composition?.projectionIndex != nil) } ?? false
+        let eligible = hostEligible && supportsLiveDisplayRate && ready &&
+            isPresenting && framesArriving && !paused && !dashboardShown && !suspended && projection
+        let wanted = autoFrameRate.observe(now: now, frames: client.frames,
+            producer: .init(pid: client.pid, epoch: epoch, revision: producerState.revision),
+            physicalHz: Double(frameCadence.physicalHz), eligible: eligible, consumerBlocked: consumerBlocked)
+        setHalfFrameRate(wanted)
+    }
 
     /// Changes only the game's wake cadence. The public mapping, client/session,
     /// physical display, poses and image dimensions keep their existing lifetimes.
@@ -490,9 +524,12 @@ final class GameBridge {
     /// `ahead`: the head as it is expected `lead` after this frame is seen, when the frame the
     /// game draws with it will be: published instead of `head` (a game that predicts nothing
     /// itself drew for a head 20 to 40 ms old, and its picture had to be moved that far).
-    func tick(head: HeadPose, ahead: HeadPose? = nil, allowImageAcquisition: Bool = true) -> View? {
+    func tick(head: HeadPose, ahead: HeadPose? = nil, allowImageAcquisition: Bool = true, autoCadenceEligible: Bool = true) -> View? {
         guard let b = bridge else { return nil }
         let now = CACurrentMediaTime()
+        // Observe complete producer publications before publishing/waking this
+        // physical tick; source cadence never comes from compositor FPS.
+        updateAutoFrameRate(b, now: now, consumerBlocked: !allowImageAcquisition, hostEligible: autoCadenceEligible)
         let displayTarget = HeadsetView.frameTarget
         let target = displayTarget > 0 && abs(displayTarget - now) < 0.25 ? displayTarget : now
         let notifyGame = frameCadence.shouldNotify(at: target)
@@ -718,6 +755,7 @@ final class GameBridge {
     private var lastShown = ""
 
     private func finishPresentation() {
+        autoFrameRate.resetProducer()
         producerState.invalidateCallbacks()
         let wasPresenting = isPresenting
         if let startedAt {
@@ -729,6 +767,8 @@ final class GameBridge {
         startedAt = nil
         gameProcessID = nil
         setPaused(false)
+        // Clear actual dashboard state as well as the policy cache for the next producer.
+        if dashboardShown { setDashboard(false) }
         inputRearm = [GameControllerInputRearm(), GameControllerInputRearm()]
         layer = nil
         texture = nil
@@ -759,6 +799,7 @@ final class GameBridge {
 
     /// Halliday's own interface is over the game (it should pause) or not.
     func setDashboard(_ shown: Bool) {
+        dashboardShown = shown
         for hand in inputRearm.indices { inputRearm[hand].setFocused(!shown) }
         if !shown { independentHaptics?.setFocused(true) }
         guard let b = bridge else { return }

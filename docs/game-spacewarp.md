@@ -1,11 +1,12 @@
 # Experimental colour-only Spacewarp
 
 **Game image → Spacewarp 2×** is a live switch on the Mac and in the headset.
-It is off by default. Enabling it selects Half frame rate, targeting a 60 game-frame/s budget
-at 120 Hz or 45 at 90 Hz, with a bounded forecast on intervening refreshes.
-Actual game FPS can be lower.
-Disabling Spacewarp retains the chosen half-rate cadence; that switch can then
-be disabled separately. FSR 1 and RCAS remain independent live controls.
+It is off by default. Enabling it from Off selects Half, targeting a 60 game-frame/s
+budget at 120 Hz or 45 at 90 Hz, with a bounded forecast on intervening refreshes.
+Enabling it while Auto preserves Auto and uses its resolved cadence. Actual game
+FPS can be lower. Disabling Spacewarp retains the chosen cadence; selecting Off
+explicitly shows real full-rate frames. FSR 1 and RCAS remain independent live
+controls.
 
 The shared compositor path is:
 
@@ -106,3 +107,9 @@ AMD's pinned revision, source/output hashes and reproduction script are in
 The [composition contract](../app/Resources/spacewarp/README.md) documents queue
 ordering, per-eye isolation and image-only limitations. The original AMD MIT
 notice ships with the shaders and in the application's collected licences.
+
+## Automatic cadence
+
+[Off / Half / Auto](automatic-half-rate.md) selects the live producer budget.
+Arming Spacewarp while Off selects Half; enabling it while Auto preserves Auto.
+Explicit Off keeps real full-rate images even if Spacewarp remains armed.

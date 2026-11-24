@@ -21,12 +21,12 @@ import Foundation
         precondition(!settings.gameSpacewarpEnabled && settings.gameHalfFrameRate && settings.effectiveGameHalfFrameRate)
         settings.gameHalfFrameRate = false
         precondition(!settings.effectiveGameHalfFrameRate)
-        // External settings can select Spacewarp without mutating the saved half-rate choice.
+        // Explicit Off remains authoritative while prediction is armed externally.
         defaults.set(true, forKey: "gameSpacewarpEnabled")
         defaults.set(false, forKey: "gameHalfFrameRate")
         let saved = defaults.persistentDomain(forName: suite)!
         let external = Settings(defaults: defaults)
-        precondition(external.gameSpacewarpEnabled && !external.gameHalfFrameRate && external.effectiveGameHalfFrameRate)
+        precondition(external.gameSpacewarpEnabled && !external.gameHalfFrameRate && !external.effectiveGameHalfFrameRate)
         precondition(NSDictionary(dictionary: saved).isEqual(to: defaults.persistentDomain(forName: suite)!))
         external.setGameSpacewarp(false)
         precondition(!external.effectiveGameHalfFrameRate)
@@ -38,9 +38,9 @@ import Foundation
         let persisted = defaults.persistentDomain(forName: suite)!
         defaults.setVolatileDomain(["gameSpacewarpEnabled": "YES", "gameHalfFrameRate": "NO"], forName: UserDefaults.argumentDomain)
         let arguments = Settings(defaults: defaults)
-        precondition(arguments.gameSpacewarpEnabled && !arguments.gameHalfFrameRate && arguments.effectiveGameHalfFrameRate)
+        precondition(arguments.gameSpacewarpEnabled && !arguments.gameHalfFrameRate && !arguments.effectiveGameHalfFrameRate)
         precondition(NSDictionary(dictionary: persisted).isEqual(to: defaults.persistentDomain(forName: suite)!))
-        defaults.removeVolatileDomain(forName: UserDefaults.argumentDomain)
+        defaults.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
         print("PASS: Spacewarp defaults, live cadence dependency, disable behavior, profile reload, external/argument overrides and unrelated image/audio preferences")
     }
 }

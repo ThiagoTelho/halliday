@@ -579,15 +579,15 @@ private struct SoundPane: View {
                 .font(.callout).foregroundStyle(.secondary).monospacedDigit()
             Text("Lower is faster; higher keeps more detail. Restart the game to apply render scale.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
-            Toggle("Half frame rate", isOn: Binding(get: { s.effectiveGameHalfFrameRate },
-                set: { model.setting(\.gameHalfFrameRate).wrappedValue = $0 })).toggleStyle(.switch)
-                .disabled(s.gameSpacewarpEnabled)
+            Picker("Half frame rate", selection: model.setting(\.gameHalfFrameRateMode)) {
+                ForEach(GameHalfFrameRateMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }.pickerStyle(.segmented)
                 .accessibilityIdentifier("game.halfFrameRate")
-            Text("60 game FPS at 120 Hz, or 45 at 90 Hz. Applies live with Halliday's runtime; headset tracking and display stay at full rate.")
+            Text("Half: 60 game FPS at 120 Hz, or 45 at 90 Hz. Auto switches when the game cannot sustain full rate and checks for recovery. Applies live with Halliday; tracking and display stay at full rate.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("Spacewarp 2×", isOn: Binding(get: { s.gameSpacewarpEnabled }, set: { model.setGameSpacewarp($0) }))
                 .toggleStyle(.switch).accessibilityIdentifier("game.spacewarp")
-            Text("At 120 Hz: 60 game frames + 60 generated frames per second. Enables half frame rate. Both switches apply live with Halliday's runtime. Turn Spacewarp off before disabling half frame rate.")
+            Text("Adds intermediate frames while half rate is active: 60 + 60 at 120 Hz, or 45 + 45 at 90 Hz. Auto uses it only when needed; Off shows real frames. Enabling Spacewarp from Off selects Half.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("RCAS sharpening", isOn: model.setting(\.gameSharpeningEnabled)).toggleStyle(.switch)
             LevelRow(title: "Sharpness", value: "\(Int((s.gameSharpness * 100).rounded()))%",

@@ -1,6 +1,8 @@
 # Live game cadence and PS VR2 refresh
 
-`Half frame rate` is off by default. Enabling it changes the game wake budget
+`Half frame rate` offers Off, Half and Auto, with Off as the default.
+[Auto policy and recovery](automatic-half-rate.md) use complete producer stereo
+publications; manual Half changes the game wake budget
 from 120 to 60 Hz, or 90 to 45 Hz, while head/controller state and the physical
 compositor continue at the display rate. It does not generate frames.
 

@@ -93,7 +93,44 @@ import Foundation
         let arguments = Settings(defaults: defaults)
         precondition(arguments.gameRenderPercent == 80 && arguments.gameSharpness == 0.6 && arguments.gameHalfFrameRate && arguments.headsetRefreshHz == 90)
         precondition(NSDictionary(dictionary: persistedBeforeArguments).isEqual(to: defaults.persistentDomain(forName: suite)!))
-        defaults.removeVolatileDomain(forName: UserDefaults.argumentDomain)
+        defaults.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
+        // New choices persist independently of whether prediction is armed.
+        let modes = Settings(defaults: defaults)
+        modes.gameHalfFrameRateMode = .auto
+        modes.setGameSpacewarp(true)
+        precondition(modes.gameHalfFrameRateMode == .auto && !modes.effectiveGameHalfFrameRate)
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .auto)
+        modes.gameHalfFrameRateMode = .off
+        precondition(modes.gameSpacewarpEnabled && !modes.effectiveGameHalfFrameRate)
+        modes.setGameSpacewarp(false)
+        precondition(modes.gameHalfFrameRateMode == .off)
+        // Migration preserves old effective cadence without writing new keys.
+        defaults.removeObject(forKey: "gameHalfFrameRateMode")
+        defaults.set(false, forKey: "gameSpacewarpEnabled")
+        defaults.set(true, forKey: "gameHalfFrameRate")
+        let oldOn = defaults.persistentDomain(forName: suite)!
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .on)
+        precondition(NSDictionary(dictionary: oldOn).isEqual(to: defaults.persistentDomain(forName: suite)!))
+        defaults.set(false, forKey: "gameHalfFrameRate")
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .off)
+        defaults.set("invalid", forKey: "gameHalfFrameRateMode")
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .off)
+        defaults.removeObject(forKey: "gameHalfFrameRateMode")
+        defaults.set(true, forKey: "gameSpacewarpEnabled")
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .on)
+        for mode in GameHalfFrameRateMode.allCases {
+            let selected = Settings(defaults: defaults)
+            selected.gameHalfFrameRateMode = mode
+            precondition(Settings(defaults: defaults).gameHalfFrameRateMode == mode)
+            precondition(defaults.bool(forKey: "gameHalfFrameRate") == (mode == .on))
+        }
+        defaults.setVolatileDomain(["gameHalfFrameRateMode": "auto", "gameHalfFrameRate": "YES"], forName: UserDefaults.argumentDomain)
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .auto)
+        defaults.setVolatileDomain(["gameHalfFrameRate": "YES"], forName: UserDefaults.argumentDomain)
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .on)
+        defaults.setVolatileDomain(["gameHalfFrameRate": "NO"], forName: UserDefaults.argumentDomain)
+        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .off)
+        defaults.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
         print("PASS: 100% unprocessed defaults, independent FSR/RCAS switches, persisted ranges and five-percent steps, finite sharpness, live half-rate preference, original refresh default and supported refresh choices, one notification per change, existing preferences retained")
     }
 }

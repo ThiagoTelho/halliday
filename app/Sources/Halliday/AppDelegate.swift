@@ -2871,9 +2871,9 @@ if !open, passthroughForVideo {
     private func scheduleGameImageReconfiguration() {
         gameImageReconfiguration?.cancel()
         gameImageReconfiguration = nil
-        if let game { game.setHalfFrameRate(Settings.shared.effectiveGameHalfFrameRate) }
+        if let game { game.setHalfFrameRateMode(Settings.shared.gameHalfFrameRateMode) }
         guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
-            || game.halfFrameRate != Settings.shared.effectiveGameHalfFrameRate
+            || game.halfFrameRate != game.requestedHalfFrameRate
             || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -2886,7 +2886,7 @@ if !open, passthroughForVideo {
     @discardableResult
     private func applyGameImageReconfiguration() -> Bool {
         guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
-            || game.halfFrameRate != Settings.shared.effectiveGameHalfFrameRate
+            || game.halfFrameRate != game.requestedHalfFrameRate
             || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return true }
         guard !pendingNativeAlyxLaunch, !nativeAlyxLauncher.isRunning,
               pendingCrossOverLaunches.isEmpty, !GameLibrary.shared.hasPendingLaunch else { return false }
@@ -4501,7 +4501,8 @@ if !open, passthroughForVideo {
         // A Quest app (an OpenXR application) draws with the pose as given: it gets the head as
         // predicted for when its frame is seen. (Windows games' runtime predicts by itself.)
         let gameLead = QuestApps.shared.runningPackage != nil && Self.predictsForApps ? min(game?.lead ?? 0, 0.08) : 0
-        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead), allowImageAcquisition: renderer.sceneImageAcquisitionAllowed) {
+        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead), allowImageAcquisition: renderer.sceneImageAcquisitionAllowed,
+            autoCadenceEligible: onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected && usb?.headset.status?.worn == true) {
             renderer.projection = shown.projection
             // Its overlays, and Halliday's notices (the hint at its start, "set up" messages).
             renderer.gameLayers = shown.layers + (notice.map { $0.isVisible ? [$0.layer] : [] } ?? [])

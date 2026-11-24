@@ -116,17 +116,28 @@ final class Settings {
         didSet { defaults.set(gameSharpeningEnabled, forKey: "gameSharpeningEnabled"); onChange?() }
     }
 
-    /// Games render every other headset refresh. Tracking and the physical display retain
-    /// their full rate; Halliday's runtime applies cadence changes in the live session.
+    /// Auto is resolved by the live producer, never persisted as an On/Off decision.
+    var gameHalfFrameRateMode: GameHalfFrameRateMode {
+        didSet {
+            defaults.set(gameHalfFrameRateMode.rawValue, forKey: "gameHalfFrameRateMode")
+            // Preserve the old preference for rollback to a pre-Auto build.
+            defaults.set(gameHalfFrameRateMode == .on, forKey: "gameHalfFrameRate")
+            onChange?()
+        }
+    }
+    /// Compatibility for older command-line fixtures and callers. New UI uses the mode.
     var gameHalfFrameRate: Bool {
-        didSet { defaults.set(gameHalfFrameRate, forKey: "gameHalfFrameRate"); onChange?() }
+        get { gameHalfFrameRateMode == .on }
+        set { gameHalfFrameRateMode = newValue ? .on : .off }
     }
 
-    /// Optional in-between game frames; its cadence always requires half-rate rendering.
+    /// Optional in-between game frames, used only while the producer is at half rate.
     var gameSpacewarpEnabled: Bool {
         didSet { defaults.set(gameSpacewarpEnabled, forKey: "gameSpacewarpEnabled"); onChange?() }
     }
-    var effectiveGameHalfFrameRate: Bool { gameHalfFrameRate || gameSpacewarpEnabled }
+    /// Initial cadence, before Auto has observed an active producer. Framegen being armed
+    /// must not override Auto or a deliberate Off selection.
+    var effectiveGameHalfFrameRate: Bool { gameHalfFrameRateMode == .on }
 
     enum NativeOpenXRBackend: String, CaseIterable, Identifiable, Sendable {
         case halliday = "halliday"
@@ -141,7 +152,7 @@ final class Settings {
 
     /// Turning the effect off leaves the chosen cadence in place for live switching.
     func setGameSpacewarp(_ enabled: Bool) {
-        if enabled, !gameHalfFrameRate { gameHalfFrameRate = true }
+        if enabled, gameHalfFrameRateMode == .off { gameHalfFrameRateMode = .on }
         if gameSpacewarpEnabled != enabled { gameSpacewarpEnabled = enabled }
     }
 
@@ -173,6 +184,22 @@ final class Settings {
         sharpness.isFinite ? min(max(sharpness, 0), 1) : 0.3
     }
 
+    /// Explicit old command-line flags retain precedence over a persisted new mode. Reading
+    /// either preference never writes a migration or clobbers unrelated user settings.
+    static func storedHalfFrameRateMode(_ defaults: UserDefaults) -> GameHalfFrameRateMode {
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let value = arguments["gameHalfFrameRateMode"] as? String,
+           let mode = GameHalfFrameRateMode(rawValue: value) { return mode }
+        if arguments["gameHalfFrameRate"] != nil {
+            return defaults.bool(forKey: "gameHalfFrameRate") ? .on : .off
+        }
+        if let saved = defaults.string(forKey: "gameHalfFrameRateMode"),
+           let mode = GameHalfFrameRateMode(rawValue: saved) { return mode }
+        // Old versions ORed both switches. Retain their effective cadence when no new
+        // choice exists; once Off is explicitly saved, Framegen cannot override it.
+        return defaults.bool(forKey: "gameHalfFrameRate") || defaults.bool(forKey: "gameSpacewarpEnabled") ? .on : .off
+    }
+
     /// The Windows panel's layout is remembered for each set of apps open together.
     var rememberLayouts: Bool {
         didSet { defaults.set(rememberLayouts, forKey: "rememberLayouts"); onChange?() }
@@ -182,7 +209,7 @@ final class Settings {
         self.defaults = defaults
         gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
-        gameHalfFrameRate = defaults.bool(forKey: "gameHalfFrameRate")
+        gameHalfFrameRateMode = Self.storedHalfFrameRateMode(defaults)
         gameSpacewarpEnabled = defaults.bool(forKey: "gameSpacewarpEnabled")
         nativeOpenXRBackend = defaults.string(forKey: "nativeOpenXRBackend").flatMap(NativeOpenXRBackend.init(rawValue:)) ?? .halliday
         let renderPercent = defaults.object(forKey: "gameRenderPercent")

@@ -1,5 +1,5 @@
 // Bounded, offscreen snapshots of the actual Mac and headset settings. This path never starts
-// AppDelegate, a game or a headset session, and only navigates between the two settings tabs.
+// AppDelegate, a game or a headset session, and only navigates between settings tabs.
 // Supply ordinary UserDefaults command-line overrides to preview settings without saving them.
 
 import AppKit
@@ -26,21 +26,24 @@ func runGameImageUISnapshot(prefix: String) {
     let gameImage = SettingsPanel(renderer: renderer)
     gameImage.onActivate?("page:gameImage")
     drawGameImageSettingsPanel(gameImage, to: "\(prefix)-headset-game-image.png")
-
-    let expected = Set(["game:fsr", "game:scale", "game:halfFrameRate", "game:spacewarp", "game:sharpening", "game:sharpness"])
-    guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
+    guard general.controls.contains(where: { $0.id == "game:systemAudio" })
+    else { fatal("Game audio control is missing") }
     guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
     else { fatal("Headset refresh selectors are missing") }
-    guard gameImage.controls.contains(where: { $0.id == "game:halfFrameRate" && $0.enabled == !Settings.shared.gameSpacewarpEnabled }),
-          gameImage.controls.contains(where: { $0.id == "game:spacewarp" && $0.enabled })
+
+    let expected = Set(["game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:spacewarp", "game:sharpening", "game:sharpness"])
+    guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
+    let settings = Settings.shared
+    guard ["game:half:off", "game:half:on", "game:half:auto", "game:spacewarp"].allSatisfy({ id in
+        gameImage.controls.contains(where: { $0.id == id && $0.enabled })
+    })
     else { fatal("Spacewarp and half-frame-rate switch states are inconsistent") }
     for panel in [general, gameImage] {
         for control in panel.controls where !panel.surface.contains(control.rect) {
             fatal("Settings control \(control.id) extends outside the panel: \(control.rect)")
         }
     }
-    let settings = Settings.shared
-    print("PASS: Mac settings and both headset tabs; controls within panel; render \(settings.gameRenderPercent)%, FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
+    print("PASS: Mac settings and both headset tabs; image and audio controls within panel; render \(settings.gameRenderPercent)%, half rate \(settings.effectiveGameHalfFrameRate), Spacewarp \(settings.gameSpacewarpEnabled), FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
 }
 
 /// Matches VRPanel's flipped CoreGraphics drawing at its native pixels-per-dmm. Avoids GPU
