@@ -156,6 +156,8 @@ final class GameBridge {
         var position: SIMD3<Float>
         var orientation: simd_quatf
         var trigger: Float
+        /// Digital contact stays separate from analog travel.
+        var triggerPressed = false
         var grip: Bool
         var stick: SIMD2<Float>
         var stickClick: Bool
@@ -165,6 +167,7 @@ final class GameBridge {
         var lower: Bool
         var upper: Bool
         var menu: Bool
+        var motion: GameControllerMotion = .stationary
     }
     /// Right, left (as `trigger`), set every frame by the app while a controller is held and a
     /// game has the input; nil: the hand the mouse and keyboard stand in for.
@@ -378,7 +381,9 @@ final class GameBridge {
         let toGame = originTurn.inverse
         var state = HallidayBridgeState()
         let given = ahead ?? head
-        state.head = Self.pose(toGame.act(given.position - originPlace), toGame * given.orientation, angular: given.angularVelocity)
+        state.head = Self.pose(toGame.act(given.position - originPlace), toGame * given.orientation,
+            angular: GameControllerMotion.angularInGame(body: given.angularVelocity,
+                bodyOrientation: given.orientation, originTurn: originTurn))
         // Numbered, so a frame's pose tells when it was published (`poseAges`).
         stamp = stamp >= 0xFF_FFFF ? 1 : stamp + 1
         state.head.stamp = Float(stamp)
@@ -407,7 +412,9 @@ final class GameBridge {
                 at = head.position + heading.act(SIMD3(0.18 * side, -0.32, -0.32))
             }
             hands[i] = (at, turn)
-            c.pose = Self.pose(toGame.act(at - originPlace), toGame * turn, angular: .zero)
+            let motion = realHands[hand]?.motion.inGame(originTurn: originTurn, now: now)
+            c.pose = Self.pose(toGame.act(at - originPlace), toGame * turn,
+                angular: motion?.angular ?? .zero, linear: motion?.linear ?? .zero)
             c.connected = 1
             c.packet = packet
             var pressed: UInt64 = 0, touched: UInt64 = 0
@@ -434,8 +441,8 @@ final class GameBridge {
                 // Halliday's OpenXR runtime reads the same as a Touch controller's parts.
                 pressed = 0
                 touched = 0
-                if real.trigger > 0.6 { pressed |= bit(33) }
-                if real.trigger > 0.02 { touched |= bit(33) }
+                if real.triggerPressed || real.trigger > 0.6 { pressed |= bit(33) }
+                if real.triggerPressed || real.trigger > 0.02 { touched |= bit(33) }
                 if real.grip { pressed |= bit(2) }
                 if real.stickClick { pressed |= bit(32) }
                 if real.stickTouch || simd_length(real.stick) > 0.1 { touched |= bit(32) }
@@ -788,12 +795,13 @@ final class GameBridge {
 
     private func keysFor(_ hand: Int) -> Set<UInt16> { (hand == 1) == shiftHeld ? heldKeys : [] }
 
-    private static func pose(_ p: SIMD3<Float>, _ q: simd_quatf, angular: SIMD3<Float>) -> HallidayBridgePose {
+    private static func pose(_ p: SIMD3<Float>, _ q: simd_quatf, angular: SIMD3<Float>, linear: SIMD3<Float> = .zero) -> HallidayBridgePose {
         var pose = HallidayBridgePose()
         pose.position = (p.x, p.y, p.z)
         pose.valid = 1
         pose.orientation = (q.imag.x, q.imag.y, q.imag.z, q.real)
         pose.angular_velocity = (angular.x, angular.y, angular.z)
+        pose.velocity = (linear.x, linear.y, linear.z)
         return pose
     }
 

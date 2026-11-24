@@ -251,6 +251,31 @@ pub unsafe extern "C" fn halliday_hand_set_fisheyes(hand: *const HallidayHand, o
         .set_bottom_fisheyes(on);
 }
 
+/// A measured per-headset raw-camera alignment, not an offset of either hand.
+/// Right camera-local rotation vector in radians (x right, y down, z forward).
+/// Zero restores the generic model. Invalid values leave the tracker unchanged.
+///
+/// # Safety
+/// `hand` must be null or a live handle. `rotation` must be null or readable for
+/// three floats. The calibration belongs to the connected headset's identity.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_hand_set_fisheye_alignment(
+    hand: *const HallidayHand,
+    rotation: *const f32,
+) -> bool {
+    if hand.is_null() || rotation.is_null() {
+        return false;
+    }
+    // SAFETY: null checked; the caller guarantees three readable floats.
+    let rotation = unsafe { [*rotation, *rotation.add(1), *rotation.add(2)] };
+    // SAFETY: null checked; the caller supplies a live tracker.
+    unsafe { &*hand }
+        .0
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .set_bottom_fisheye_alignment(rotation.map(f64::from))
+}
+
 /// One exposure: the head's and the controller's orientations in the tracking space at that
 /// moment (x, y, z, w), the bottom pair's two pictures' spots (views 0 and 1) and, in camera
 /// mode 3, the top cameras' (views 2 and 3; null or none when that picture was missed).
@@ -537,6 +562,42 @@ pub unsafe extern "C" fn halliday_sense_led_report(
     unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), out, report.len()) };
 }
 
+/// Monado-documented Bluetooth output report. No USB layout is inferred here.
+/// # Safety
+/// `out` is null or writable for 78 bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_sense_vibration_report(
+    sequence:u8,counter:u8,amplitude:f32,frequency_hz:f32,host_us:u32,out:*mut u8,
+){
+    if out.is_null(){return;}
+    let report=crate::sense::vibration_report(sequence,counter,amplitude,frequency_hz,host_us);
+    unsafe{std::ptr::copy_nonoverlapping(report.as_ptr(),out,report.len());}
+}
+
+/// Vibration output retaining the current connection's LED settings and latch.
+/// A null programmed report means no LED configuration exists yet. False for
+/// null output or a retained packet with an invalid Bluetooth header/checksum.
+/// # Safety
+/// `programmed` is null or readable for 78 bytes; `out` is null or writable for
+/// 78 bytes. The input is copied before output is written, so they may alias.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_sense_vibration_report_with_led(
+    sequence: u8, counter: u8, amplitude: f32, frequency_hz: f32,
+    host_us: u32, programmed: *const u8, out: *mut u8,
+) -> bool {
+    if out.is_null() { return false; }
+    let programmed = if programmed.is_null() { None } else {
+        // SAFETY: the caller provides a complete readable packet; u8 array alignment is 1.
+        Some(unsafe { std::ptr::read(programmed.cast::<[u8; crate::sense::OUTPUT_REPORT_LEN]>()) })
+    };
+    let Some(report) = crate::sense::vibration_report_retaining_led(
+        sequence, counter, amplitude, frequency_hz, host_us, programmed.as_ref(),
+    ) else { return false; };
+    // SAFETY: output is checked and the complete input was copied above.
+    unsafe { std::ptr::copy_nonoverlapping(report.as_ptr(), out, report.len()) };
+    true
+}
+
 /// Makes the direction the controller points now the heading `yaw` (radians about y, 0 forward).
 ///
 /// # Safety
@@ -760,6 +821,36 @@ pub unsafe extern "C" fn halliday_session_status(
         function_button: u8::from(st.function_button),
         ipd_mm: st.ipd_mm,
     };
+    true
+}
+
+/// Copies the connected headset's cached PCB identity, including a trailing NUL.
+/// Returns false and leaves `out` untouched for an unknown device or a short buffer.
+/// This does not issue a USB request.
+/// # Safety
+/// `session` is null/live; `out` is null or writable for `capacity` bytes.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_session_headset_identity(
+    session: *const HallidaySession,
+    out: *mut u8,
+    capacity: u32,
+) -> bool {
+    let Some(id) = (unsafe { self::session(session) }).and_then(|s| s.headset_identity()) else {
+        return false;
+    };
+    // SAFETY: the caller provides the writable destination, or null.
+    unsafe { copy_headset_identity(&id, out, capacity) }
+}
+
+unsafe fn copy_headset_identity(id: &str, out: *mut u8, capacity: u32) -> bool {
+    if out.is_null() || id.len() >= capacity as usize {
+        return false;
+    }
+    // SAFETY: the length check above reserves the terminator as well.
+    unsafe {
+        std::ptr::copy_nonoverlapping(id.as_ptr(), out, id.len());
+        *out.add(id.len()) = 0;
+    }
     true
 }
 
@@ -1486,6 +1577,38 @@ pub unsafe extern "C" fn halliday_apk_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn camera_identity_c_buffer_is_bounded_and_unchanged_on_failure() {
+        let mut bytes = [0xa5; 6];
+        // SAFETY: all non-null destinations address the complete buffer above.
+        unsafe {
+            assert!(!halliday_session_headset_identity(std::ptr::null(), bytes.as_mut_ptr(), 6));
+            assert!(!copy_headset_identity("PCB12", std::ptr::null_mut(), 6));
+            assert!(!copy_headset_identity("PCB12", bytes.as_mut_ptr(), 5));
+            assert!(!copy_headset_identity("PCB12", bytes.as_mut_ptr(), 0));
+            assert_eq!(bytes, [0xa5; 6]);
+            assert!(copy_headset_identity("PCB12", bytes.as_mut_ptr(), 6));
+            assert_eq!(&bytes, b"PCB12\0");
+        }
+    }
+
+    #[test]
+    fn hand_camera_alignment_c_api_validates_pointers_and_values() {
+        let hand = halliday_hand_open(true);
+        let rotation = [-0.0041120713, 0.0033288613, -0.0149200596];
+        // SAFETY: each non-null pointer below addresses three readable floats or
+        // the exclusively owned live handle, which is released exactly once.
+        unsafe {
+            assert!(!halliday_hand_set_fisheye_alignment(std::ptr::null(), rotation.as_ptr()));
+            assert!(!halliday_hand_set_fisheye_alignment(hand, std::ptr::null()));
+            assert!(halliday_hand_set_fisheye_alignment(hand, rotation.as_ptr()));
+            assert!(!halliday_hand_set_fisheye_alignment(hand, [f32::NAN, 0.0, 0.0].as_ptr()));
+            assert!(!halliday_hand_set_fisheye_alignment(hand, [0.0, 0.0, 0.1].as_ptr()));
+            assert!(halliday_hand_set_fisheye_alignment(hand, [0.0; 3].as_ptr()));
+            halliday_hand_close(hand);
+        }
+    }
 
     #[test]
     fn version_is_nul_terminated_and_matches() {

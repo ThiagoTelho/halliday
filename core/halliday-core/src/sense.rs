@@ -240,6 +240,75 @@ pub fn led_report(
     r
 }
 
+/// A Bluetooth vibration-only output report, from Monado's pssense driver
+/// ae43b1893e4544189bb6333c79e19dc3ecfee673 (BSL-1.0; THIRD-PARTY.md).
+/// This standalone builder has no previous tracking-LED settings. Once LEDs
+/// are programmed, use [`vibration_report_retaining_led`] so an unrelated
+/// vibration report cannot latch phase INIT with a zero LED sequence. The actuator
+/// offers 60/120 Hz and classic-rumble modes, rather than arbitrary PCM frequency.
+/// Zero amplitude explicitly stops it. Duration/resend policy belongs to the
+/// caller: Monado documents a five-second device timeout and two-second refresh.
+pub fn vibration_report(
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+) -> [u8; OUTPUT_REPORT_LEN] {
+    let mut report = [0; OUTPUT_REPORT_LEN];
+    report[0] = 0x31;
+    report[1] = (sequence & 0x0f) << 4;
+    report[2] = 0x10;
+    let mode = if frequency_hz.is_finite() && frequency_hz > 0.0 && frequency_hz <= 70.0 {
+        0x20
+    } else if frequency_hz.is_finite() && frequency_hz >= 110.0 {
+        0x00
+    } else {
+        0x40
+    };
+    report[3] = 0x03 | mode;
+    report[5] = if amplitude.is_finite() {
+        (amplitude.clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+    report[18..22].copy_from_slice(&host_us.to_le_bytes());
+    report[41] = counter;
+    let crc = crc32(&[0xa2], &report[..OUTPUT_REPORT_LEN - 4]);
+    report[OUTPUT_REPORT_LEN - 4..].copy_from_slice(&crc.to_le_bytes());
+    report
+}
+
+/// Compose vibration and the same connection's most recently programmed LED
+/// settings. LED settings have their own latch sequence: zeroing them in an
+/// otherwise valid haptic packet is a new LED command, not an omitted field.
+/// Match Monado's per-device output composition without advancing that latch.
+/// `None` retains the standalone, not-yet-programmed output format.
+pub fn vibration_report_retaining_led(
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+    programmed: Option<&[u8; OUTPUT_REPORT_LEN]>,
+) -> Option<[u8; OUTPUT_REPORT_LEN]> {
+    let mut report = vibration_report(sequence, counter, amplitude, frequency_hz, host_us);
+    if let Some(programmed) = programmed {
+        let checksum = u32::from_le_bytes(programmed[74..78].try_into().unwrap());
+        if programmed[0] != 0x31 || programmed[1] & 0x0f != 0 || programmed[2] != 0x10 ||
+            crc32(&[0xa2], &programmed[..74]) != checksum {
+            return None;
+        }
+        // Only pssense_led_settings: phase, latch, duration, absolute/delta
+        // position, cycle and four LED selectors. Keep fresh haptic flags,
+        // amplitude, transport IDs and host timestamp from this output.
+        report[22..37].copy_from_slice(&programmed[22..37]);
+        let checksum = crc32(&[0xa2], &report[..74]);
+        report[74..78].copy_from_slice(&checksum.to_le_bytes());
+    }
+    Some(report)
+}
+
 /// CRC-32 (the common reflected one) over `seed` then `data`, as the controller computes it.
 fn crc32(seed: &[u8], data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -633,6 +702,46 @@ mod tests {
     }
 
     #[test]
+    fn documented_vibration_modes_and_golden_bluetooth_report() {
+        let report = vibration_report(0x13, 7, 0.5, 60.0, 0x0403_0201);
+        assert_eq!(&report[..8], &[0x31, 0x30, 0x10, 0x23, 0, 127, 0, 0]);
+        assert_eq!(&report[18..22], &[1, 2, 3, 4]);
+        assert_eq!(report[41], 7);
+        // Independent standard CRC-32/zlib vector over A2 followed by the
+        // documented report bytes, rather than calling the encoder's CRC.
+        assert_eq!(&report[74..], &[0x37, 0x08, 0xe1, 0x44]);
+        assert!(report[22..41].iter().all(|b| *b == 0)); // standalone, no retained LED configuration
+        assert_eq!(vibration_report(0, 0, 1.0, 120.0, 0)[3], 0x03);
+        assert_eq!(vibration_report(0, 0, 1.0, 90.0, 0)[3], 0x43);
+        assert_eq!(vibration_report(0, 0, 1.0, 0.0, 0)[3], 0x43);
+        assert_eq!(vibration_report(0, 0, 0.0, 160.0, 0)[5], 0);
+        assert_eq!(vibration_report(0, 0, f32::NAN, 160.0, 0)[5], 0);
+    }
+
+    #[test]
+    fn vibration_retains_led_latch_without_replacing_haptic_transport() {
+        let blink = LedBlink {phase: led_phase::PRESCAN, sequence: 255, period_id: 42,
+            cycle_position: 0xfedc_ba98, cycle_length: 50_050_000};
+        let led = led_report(3, 7, blink, 123);
+        let standalone = vibration_report(4, 8, 0.5, 60.0, 456);
+        assert_eq!(standalone[23], 0); // This would change the device's LED latch.
+        let kept = vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&led)).unwrap();
+        assert_eq!(&kept[22..37], &led[22..37]);
+        for i in (0..22).chain(37..74) { assert_eq!(kept[i], standalone[i]); }
+        assert_eq!(u32::from_le_bytes(kept[74..78].try_into().unwrap()), crc32(&[0xa2], &kept[..74]));
+        let stopped = vibration_report_retaining_led(5, 9, 0.0, 0.0, 789, Some(&led)).unwrap();
+        assert_eq!(stopped[5], 0);
+        assert_eq!(&stopped[22..37], &led[22..37]);
+        assert_eq!(vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, None), Some(standalone));
+        let mut damaged = led; damaged[22] ^= 1;
+        assert!(vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&damaged)).is_none());
+        let mut wrong_mode = led; wrong_mode[1] |= 1;
+        let checksum = crc32(&[0xa2], &wrong_mode[..74]);
+        wrong_mode[74..78].copy_from_slice(&checksum.to_le_bytes());
+        assert!(vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&wrong_mode)).is_none());
+    }
+
+    #[test]
     fn a_damaged_report_is_refused() {
         let mut bytes = hex(RIGHT);
         bytes[4] = 0xFF; // a trigger pull the CRC doesn't cover
@@ -671,6 +780,21 @@ mod tests {
         let crc = crc32(&[0xA1], &b[..74]);
         b[74..78].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn analog_trigger_travel_is_independent_of_digital_click_for_both_hands() {
+        for (hand,click_bit) in [(Hand::Left,0x40),(Hand::Right,0x80)] {
+            for pressure in [0u8,64,153,191,255] {
+                for clicked in [false,true] {
+                    let input=InputReport::parse(hand,&report([if clicked{click_bit}else{0},0,0],
+                        pressure,[0;3],[0;3],0,0)).unwrap();
+                    assert_eq!(input.trigger,f32::from(pressure)/255.0);
+                    assert_eq!(input.buttons&buttons::TRIGGER!=0,clicked,
+                        "digital contact must not overwrite the independent HID travel byte");
+                }
+            }
+        }
     }
 
     #[test]

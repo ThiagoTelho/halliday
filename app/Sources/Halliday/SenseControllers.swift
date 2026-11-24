@@ -60,19 +60,25 @@ final class SenseControllers: @unchecked Sendable {
     }
 
     /// One connected controller: the core's handle and the buffer macOS writes reports into.
-    private final class Device {
+    private final class Device: @unchecked Sendable {
         let hand: Hand
         let device: IOHIDDevice
         let core: OpaquePointer
+        let generation: UInt64
+        let bluetooth: Bool
         let buffer: UnsafeMutablePointer<UInt8>
         static let bufferSize = 128
         weak var owner: SenseControllers?
+        /// Owned by outputQueue, independently of the LED/vibration transport counter.
+        var ledProgramming = SenseLEDProgramming()
 
-        init?(hand: Hand, device: IOHIDDevice) {
+        init?(hand: Hand, device: IOHIDDevice, generation: UInt64, transport: String) {
             guard let core = halliday_sense_open(UInt16(hand.productID)) else { return nil }
             self.hand = hand
             self.device = device
             self.core = core
+            self.generation = generation
+            bluetooth = transport.caseInsensitiveCompare("Bluetooth") == .orderedSame
             buffer = .allocate(capacity: Self.bufferSize)
         }
 
@@ -87,10 +93,26 @@ final class SenseControllers: @unchecked Sendable {
     private var manager: IOHIDManager?
     private var thread: Thread?
     private var runLoop: CFRunLoop?
+    private var nextGeneration: UInt64 = 0
+    private var acceptingOutput = true
+    // All output, including the existing LED controls, shares one ordering and
+    // per-connection report sequence. HID writes never run on the main actor.
+    private let outputQueue = DispatchQueue(label: "halliday.sense.output")
+    private var hapticScheduler = SenseHapticScheduler()
+    private var outputTimer: DispatchSourceTimer?
+    // Feature reads can block during wake-up; keep them off the input run loop,
+    // main actor and LED/haptic output queue.
+    private let calibrationQueue = DispatchQueue(label: "halliday.sense.calibration")
+    private final class CalibrationJob: @unchecked Sendable {
+        // Accessed only on calibrationQueue.
+        var collector = SenseCalibrationCollector()
+        var plan = SenseCalibrationRetryPlan()
+    }
 
     /// Starts looking for controllers; they come and go as they wake, sleep and reconnect.
     func start() {
         guard thread == nil else { return }
+        lock.lock(); acceptingOutput = true; lock.unlock()
         let t = Thread { [weak self] in self?.run() }
         t.name = "halliday.sense"
         t.qualityOfService = .userInteractive
@@ -100,10 +122,106 @@ final class SenseControllers: @unchecked Sendable {
 
     func stop() {
         lock.lock()
+        acceptingOutput = false
         let loop = runLoop
         lock.unlock()
         if let loop { CFRunLoopStop(loop) }
         thread = nil
+    }
+
+    /// Queues a vibration for the current Bluetooth connection. True means
+    /// accepted for asynchronous output, not proof that a controller took it.
+    @discardableResult
+    func vibrate(_ hand: Hand, amplitude: Float, frequencyHz: Float, durationNanoseconds: UInt64) -> Bool {
+        guard SenseHapticScheduler.valid(amplitude: amplitude, frequencyHz: frequencyHz,
+                                        durationNanoseconds: durationNanoseconds) else { return false }
+        lock.lock()
+        let target = acceptingOutput ? devices[hand] : nil
+        lock.unlock()
+        guard let target, target.bluetooth else { return false }
+        let requestedAt = DispatchTime.now().uptimeNanoseconds
+        outputQueue.async { [weak self] in
+            guard let self, self.current(target, accepting: true) else { return }
+            let commands = self.hapticScheduler.play(hand: hand.rawValue, generation: target.generation,
+                amplitude: amplitude, frequencyHz: frequencyHz, durationNanoseconds: durationNanoseconds,
+                requestedAt: requestedAt, now: DispatchTime.now().uptimeNanoseconds)
+            self.sendVibration(commands)
+            self.scheduleOutputTimer()
+        }
+        return true
+    }
+
+    func stopVibration(_ hand: Hand) {
+        lock.lock(); let target = devices[hand]; lock.unlock()
+        guard let target else { return }
+        outputQueue.async { [weak self] in
+            guard let self else { return }
+            self.sendVibration(self.hapticScheduler.stop(hand: hand.rawValue, generation: target.generation, force: true))
+            self.scheduleOutputTimer()
+        }
+    }
+
+    func stopAllVibration() {
+        outputQueue.async { [weak self] in
+            guard let self else { return }
+            self.sendVibration(self.hapticScheduler.stopAll(force: true))
+            self.scheduleOutputTimer()
+        }
+    }
+
+    private func current(_ expected: Device, accepting: Bool = false) -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        return (!accepting || acceptingOutput) && devices[expected.hand]?.generation == expected.generation
+    }
+
+    // The following three methods run only on outputQueue. A task holds the
+    // old Device strongly, and revalidates generation before each HID write.
+    private func sendVibration(_ commands: [SenseHapticScheduler.Output]) {
+        dispatchPrecondition(condition: .onQueue(outputQueue))
+        for command in commands {
+            guard let hand = Hand(rawValue: command.hand) else { continue }
+            lock.lock(); let target = devices[hand]; lock.unlock()
+            guard let target, target.bluetooth, target.generation == command.generation,
+                  let reportID = hapticScheduler.nextReport(hand: command.hand, generation: command.generation) else { continue }
+            guard let report = target.ledProgramming.vibrationReport(
+                transportSequence: reportID.sequence, transportCounter: reportID.counter,
+                amplitude: command.amplitude, frequencyHz: command.frequencyHz,
+                hostMicroseconds: UInt32(truncatingIfNeeded: halliday_host_time_ns() / 1000)) else {
+                log("[sense] \(target.hand.name) vibration report rejected invalid retained LED settings")
+                continue
+            }
+            writeOutput(target, report: report, purpose: "vibration")
+        }
+    }
+
+    private func writeOutput(_ target: Device, report: [UInt8], purpose: String) {
+        dispatchPrecondition(condition: .onQueue(outputQueue))
+        let result = IOHIDDeviceSetReport(target.device, kIOHIDReportTypeOutput, 0x31, report, report.count)
+        if result != kIOReturnSuccess {
+            log(String(format: "[sense] %@ %@ report failed (0x%08x)", target.hand.name, purpose, result))
+        }
+    }
+
+    private func scheduleOutputTimer() {
+        dispatchPrecondition(condition: .onQueue(outputQueue))
+        guard let deadline = hapticScheduler.nextDeadline else {
+            outputTimer?.setEventHandler {}; outputTimer?.cancel(); outputTimer = nil
+            return
+        }
+        if outputTimer == nil {
+            let timer = DispatchSource.makeTimerSource(queue: outputQueue)
+            timer.setEventHandler { [weak self] in
+                guard let self else { return }
+                let commands = self.hapticScheduler.advance(now: DispatchTime.now().uptimeNanoseconds)
+                self.sendVibration(commands)
+                self.scheduleOutputTimer()
+            }
+            outputTimer = timer
+            timer.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline), leeway: .microseconds(250))
+            timer.resume()
+        } else {
+            outputTimer?.schedule(deadline: DispatchTime(uptimeNanoseconds: deadline), leeway: .microseconds(250))
+        }
     }
 
     /// The newest state of a hand's controller; nil while it isn't connected or has sent nothing.
@@ -152,6 +270,15 @@ final class SenseControllers: @unchecked Sendable {
         halliday_sense_place_fix(core, ns, &p)
     }
 
+    /// Forget only camera-derived fusion when tracking-camera geometry changes.
+    /// The controller's IMU/mount calibration and physical output are untouched.
+    func clearOpticalPlace(_ hand: Hand) {
+        lock.lock(); defer { lock.unlock() }
+        guard let core = devices[hand]?.core else { return }
+        halliday_sense_place_fix(core, 0, nil)
+        halliday_sense_room_yaw(core, 0)
+    }
+
     /// Where the controller is at host time `ns`, and its velocity; nil when not seen lately.
     func place(_ hand: Hand, atNs ns: Int64) -> (position: SIMD3<Float>, velocity: SIMD3<Float>)? {
         guard let core = core(hand) else { return nil }
@@ -164,46 +291,46 @@ final class SenseControllers: @unchecked Sendable {
     /// Sets every connected controller's tracking LEDs (the core's `led_phase`: 1 blinks, 5 is
     /// off): a pulse of `pulse` × 50 µs every `cycle` seconds, the first one a cycle from now on
     /// each controller's own clock. Not yet in step with the cameras (ROADMAP W11 E.2). Returns
-    /// how many controllers took it.
+    /// how many current connections accepted an asynchronous report request.
     @discardableResult
-    func setLEDs(phase: UInt8, pulse: UInt8 = 42, cycle: Double = 1.0 / 60) -> Int {
+    func setLEDs(phase: UInt8, pulse: UInt8 = 42, cycle: Double = 1.0 / 60, hand: Hand? = nil) -> Int {
+        guard cycle.isFinite, cycle > 0, cycle * 3e9 <= Double(UInt32.max) else { return 0 }
         lock.lock()
-        let targets = devices.values.map { ($0.device, $0.core) }
-        ledSequence &+= 1
-        let sequence = ledSequence
+        let targets = acceptingOutput ? devices.values.filter { hand == nil || $0.hand == hand } : []
         lock.unlock()
-        var taken = 0
-        for (device, core) in targets {
-            var s = HallidaySenseState()
-            guard halliday_sense_state(core, &s) else { continue }
-            var report = [UInt8](repeating: 0, count: 78)
-            let position = s.device_ticks &+ UInt32(cycle * 3_000_000)
-            halliday_sense_led_report(sequence & 0x0F, sequence, phase, 1, pulse, position, UInt32(cycle * 3e9),
-                                      UInt32(truncatingIfNeeded: halliday_host_time_ns() / 1000), &report)
-            if IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 0x31, report, report.count) == kIOReturnSuccess { taken += 1 }
+        for target in targets {
+            outputQueue.async { [weak self] in
+                guard let self, self.current(target),
+                      let reportID = self.hapticScheduler.nextReport(hand: target.hand.rawValue, generation: target.generation) else { return }
+                var state = HallidaySenseState()
+                guard halliday_sense_state(target.core, &state) else { return }
+                let position = state.device_ticks &+ UInt32(cycle * 3_000_000)
+                let report = target.ledProgramming.report(transportSequence: reportID.sequence, transportCounter: reportID.counter,
+                    phase: phase, pulse: pulse, position: position, cycle: UInt32(cycle * 3e9),
+                    hostMicroseconds: UInt32(truncatingIfNeeded: halliday_host_time_ns() / 1000))
+                self.writeOutput(target, report: report, purpose: "LED")
+            }
         }
-        return taken
+        return targets.count
     }
-    private var ledSequence: UInt8 = 0
 
     /// One controller's LEDs put in step: a pulse of `pulse` × 50 µs whose middle is at
     /// `position` on the controller's own clock (thirds of a microsecond, as `deviceTicks`),
     /// then every `cycleNs`. Sent from a queue of its own: a Bluetooth write can take
     /// milliseconds, and this is asked for several times a second.
     func syncLEDs(_ hand: Hand, position: UInt32, cycleNs: Double, pulse: UInt8 = 42) {
-        lock.lock()
-        let device = devices[hand]?.device
-        ledSequence &+= 1
-        let sequence = ledSequence
-        lock.unlock()
-        guard let device else { return }
-        var report = [UInt8](repeating: 0, count: 78)
-        halliday_sense_led_report(sequence & 0x0F, sequence, 1, sequence, pulse, position, UInt32(cycleNs * 3),
-                                  UInt32(truncatingIfNeeded: halliday_host_time_ns() / 1000), &report)
-        let bytes = report
-        ledQueue.async { _ = IOHIDDeviceSetReport(device, kIOHIDReportTypeOutput, 0x31, bytes, bytes.count) }
+        guard cycleNs.isFinite, cycleNs > 0, cycleNs * 3 <= Double(UInt32.max) else { return }
+        lock.lock(); let target = acceptingOutput ? devices[hand] : nil; lock.unlock()
+        guard let target else { return }
+        outputQueue.async { [weak self] in
+            guard let self, self.current(target),
+                  let reportID = self.hapticScheduler.nextReport(hand: hand.rawValue, generation: target.generation) else { return }
+            let report = target.ledProgramming.report(transportSequence: reportID.sequence, transportCounter: reportID.counter,
+                phase: 1, pulse: pulse, position: position, cycle: UInt32(cycleNs * 3),
+                hostMicroseconds: UInt32(truncatingIfNeeded: halliday_host_time_ns() / 1000))
+            self.writeOutput(target, report: report, purpose: "LED")
+        }
     }
-    private let ledQueue = DispatchQueue(label: "halliday.sense.leds")
 
     // --- The reading thread ---
 
@@ -232,6 +359,12 @@ final class SenseControllers: @unchecked Sendable {
         runLoop = CFRunLoopGetCurrent()
         lock.unlock()
         CFRunLoopRun()
+        // Drain on the reader thread, never the main actor. Stop live Bluetooth
+        // actuators before closing HID; queued requests are already disabled.
+        outputQueue.sync {
+            sendVibration(hapticScheduler.stopAll(force: true))
+            scheduleOutputTimer()
+        }
         IOHIDManagerClose(manager, IOOptionBits(kIOHIDOptionsTypeNone))
         lock.lock()
         devices = [:]
@@ -242,30 +375,77 @@ final class SenseControllers: @unchecked Sendable {
 
     private func attach(_ device: IOHIDDevice) {
         let product = IOHIDDeviceGetProperty(device, kIOHIDProductIDKey as CFString) as? Int ?? 0
-        guard let hand = Hand.allCases.first(where: { $0.productID == product }), let d = Device(hand: hand, device: device) else { return }
-        d.owner = self
         let transport = IOHIDDeviceGetProperty(device, kIOHIDTransportKey as CFString) as? String ?? "?"
-        // The IMU's calibration: one feature report, read twice for its two halves.
-        var halves = [[UInt8]](repeating: [UInt8](repeating: 0, count: 64), count: 2)
-        var read = true
-        for i in 0..<2 {
-            var length = 64
-            read = read && IOHIDDeviceGetReport(device, kIOHIDReportTypeFeature, 0x05, &halves[i], &length) == kIOReturnSuccess && length == 64
-        }
-        let calibrated = read && halliday_sense_calibrate(d.core, halves[0], halves[1], 64)
-        // More reports a second (about 133, where it sends 60 by itself): less lag in the hand.
-        var faster = [UInt8](repeating: 0, count: 48)
-        halliday_sense_polling_report(&faster)
-        let asked = IOHIDDeviceSetReport(device, kIOHIDReportTypeFeature, 0x08, faster, faster.count)
-        if asked != kIOReturnSuccess { log(String(format: "[sense] %@ controller didn't take the faster report rate (0x%08x)", hand.name, asked)) }
+        lock.lock(); nextGeneration &+= 1; let generation = nextGeneration; lock.unlock()
+        guard let hand = Hand.allCases.first(where: { $0.productID == product }),
+              let d = Device(hand: hand, device: device, generation: generation, transport: transport) else { return }
+        d.owner = self
         IOHIDDeviceRegisterInputReportCallback(device, d.buffer, Device.bufferSize, { context, _, _, _, _, report, length in
             let d = Unmanaged<Device>.fromOpaque(context!).takeUnretainedValue()
             _ = halliday_sense_report(d.core, report, length)
         }, Unmanaged.passUnretained(d).toOpaque())
         lock.lock()
+        outputQueue.async { [weak self] in
+            guard let self else { return }
+            self.hapticScheduler.connect(hand: hand.rawValue, generation: generation, bluetooth: d.bluetooth)
+            self.scheduleOutputTimer()
+        }
         devices[hand] = d
         lock.unlock()
-        log("[sense] \(hand.name) controller connected (\(transport)), IMU calibration \(calibrated ? "read" : "not read: defaults")")
+        log("[sense] \(hand.name) controller connected (\(transport)), IMU calibration pending")
+        let job = CalibrationJob()
+        calibrationQueue.async { [weak self, d] in self?.calibrate(d, job: job) }
+    }
+
+    private func calibrate(_ target: Device, job: CalibrationJob) {
+        dispatchPrecondition(condition: .onQueue(calibrationQueue))
+        guard job.plan.beginAttempt(isCurrent: current(target, accepting: true)) else { return }
+        // Reading feature 05 also asks Sense to leave compatibility mode. Do not
+        // give up permanently when the first request races Bluetooth wake-up.
+        var calibratedNow = false
+        defer {
+            if (job.plan.attempts == 1 || calibratedNow), current(target, accepting: true) {
+                var faster = [UInt8](repeating: 0, count: 48)
+                halliday_sense_polling_report(&faster)
+                let result = IOHIDDeviceSetReport(target.device, kIOHIDReportTypeFeature, 0x08, faster, faster.count)
+                if result != kIOReturnSuccess {
+                    log(String(format: "[sense] %@ faster polling failed (0x%08x)", target.hand.name, result))
+                }
+            }
+        }
+        for _ in 0..<2 {
+            guard current(target, accepting: true) else { job.plan.complete(); return }
+            var bytes = [UInt8](repeating: 0, count: 64)
+            bytes[0] = 0x05
+            var length = bytes.count
+            // No app lock is held over the blocking HID operation.
+            let result = bytes.withUnsafeMutableBufferPointer {
+                IOHIDDeviceGetReport(target.device, kIOHIDReportTypeFeature, 0x05, $0.baseAddress!, &length)
+            }
+            guard current(target, accepting: true) else { job.plan.complete(); return }
+            guard let pair = job.collector.consume(status: result, length: length, bytes: bytes) else { continue }
+            // Generation and stop state cannot change between validation and
+            // applying the calibration to the retained core handle.
+            lock.lock()
+            let active = acceptingOutput && devices[target.hand]?.generation == target.generation
+            let calibrated = active && halliday_sense_calibrate(target.core, pair.first, pair.second, 64)
+            lock.unlock()
+            guard active else { job.plan.complete(); return }
+            if calibrated {
+                calibratedNow = true
+                job.plan.complete()
+                log("[sense] \(target.hand.name) IMU calibration read (attempt \(job.plan.attempts))")
+                return
+            }
+            job.collector.rejectPair()
+        }
+        let next = job.plan.retryDelay
+        log("[sense] \(target.hand.name) IMU calibration attempt \(job.plan.attempts): \(job.collector.issue)\(next == nil ? "; keeping defaults" : "; retry scheduled")")
+        if let next {
+            calibrationQueue.asyncAfter(deadline: .now() + next) { [weak self, target, job] in
+                self?.calibrate(target, job: job)
+            }
+        }
     }
 
     private func detach(_ device: IOHIDDevice) {
@@ -275,6 +455,12 @@ final class SenseControllers: @unchecked Sendable {
         if let hand, let d = devices[hand] {
             IOHIDDeviceRegisterInputReportCallback(device, d.buffer, Device.bufferSize, nil, nil)
             devices[hand] = nil
+            let generation = d.generation
+            outputQueue.async { [weak self] in
+                guard let self else { return }
+                self.hapticScheduler.disconnect(hand: hand.rawValue, generation: generation)
+                self.scheduleOutputTimer()
+            }
         }
         lock.unlock()
         if let hand { log("[sense] \(hand.name) controller disconnected") }
@@ -300,7 +486,7 @@ final class SenseControllers: @unchecked Sendable {
             // them again restarts the blink's timing).
             if let ledPhase, ledsTaken < 2, sense.connected.count == 2 || Date() > end.addingTimeInterval(2 - seconds) {
                 let taken = sense.setLEDs(phase: ledPhase, cycle: ledCycle)
-                if taken != ledsTaken { ledsTaken = taken; log("[sense] LED phase \(ledPhase): \(taken) controller(s) took the report") }
+                if taken != ledsTaken { ledsTaken = taken; log("[sense] LED phase \(ledPhase): report queued for \(taken) controller(s)") }
             }
             for hand in Hand.allCases {
                 guard let s = sense.state(hand) else { continue }

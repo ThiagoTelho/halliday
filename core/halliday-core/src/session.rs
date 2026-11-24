@@ -245,6 +245,23 @@ impl Session {
         self.shared.firmware.lock().unwrap().clone()
     }
 
+    /// Cached PCB identity for per-headset camera calibration. No USB request is made here.
+    /// Do not return the previous device's identity while reconnecting or replaying.
+    pub fn headset_identity(&self) -> Option<String> {
+        if self.link_state() != LinkState::Connected {
+            return None;
+        }
+        let id = self.firmware()?.pcb_id;
+        if self.link_state() != LinkState::Connected
+            || id.is_empty()
+            || id.len() > 16
+            || !id.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return None;
+        }
+        Some(id)
+    }
+
     pub fn last_error(&self) -> Option<String> {
         self.shared.last_error.lock().unwrap().clone()
     }
@@ -586,9 +603,8 @@ mod usb {
 
     fn run_connected(shared: &Shared, headset: Arc<Headset>) {
         *shared.tracker() = HeadTracker::new(TrackerConfig::default());
-        if let Ok(f) = headset.firmware_info() {
-            *shared.firmware.lock().unwrap() = Some(f);
-        }
+        // A failed read must not attach the previous headset's camera profile to a new device.
+        *shared.firmware.lock().unwrap() = headset.firmware_info().ok();
         match headset.distortion_calibration() {
             Ok(c) => *shared.calibration.lock().unwrap() = Some(c),
             Err(e) => *shared.last_error.lock().unwrap() = Some(format!("calibration: {e}")),
@@ -632,6 +648,31 @@ mod tests {
     use super::*;
     use crate::psvr2::protocol::{IMU_RECORD_SIZE, SLAM_RECORD_SIZE, STATUS_HEADER_SIZE};
     use crate::recording::Writer;
+
+    #[test]
+    fn camera_profile_identity_is_cached_and_connected_only() {
+        let shared = Arc::new(Shared::new(LinkState::Connected));
+        let session = Session { shared: shared.clone(), thread: None };
+        assert_eq!(session.headset_identity(), None);
+        let firmware = |id: &str| FirmwareInfo {
+            version: 1, commit_hash: String::new(), pcb_id: id.into(), recovery_version: 1,
+        };
+        *shared.firmware.lock().unwrap() = Some(firmware("TEST-PCB-1234567"));
+        assert_eq!(session.headset_identity().as_deref(), Some("TEST-PCB-1234567"));
+        for link in [LinkState::Searching, LinkState::Replaying, LinkState::Error] {
+            shared.set_link(link);
+            assert_eq!(session.headset_identity(), None);
+        }
+        shared.set_link(LinkState::Connected);
+        for id in ["", " ", "has space", "bad\0id", "bad\nid", "abcdefghijklmnopq", "nonasciié"] {
+            *shared.firmware.lock().unwrap() = Some(firmware(id));
+            assert_eq!(session.headset_identity(), None, "{id:?}");
+        }
+        *shared.firmware.lock().unwrap() = Some(firmware("OTHER-PCB"));
+        assert_eq!(session.headset_identity().as_deref(), Some("OTHER-PCB"));
+        *shared.firmware.lock().unwrap() = None;
+        assert_eq!(session.headset_identity(), None);
+    }
 
     fn recording(ms: u32) -> PathBuf {
         let mut w = Writer::new(Vec::new(), 0).unwrap();

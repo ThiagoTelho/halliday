@@ -64,6 +64,10 @@ typedef struct {
 
 bool halliday_session_status(const HallidaySession *session, HallidayHeadsetStatus *out);
 
+/* Cached connected headset PCB identity (UTF-8 plus NUL); no USB request.
+ * False and out unchanged when unavailable or capacity is too short. */
+bool halliday_session_headset_identity(const HallidaySession *session, uint8_t *out, uint32_t capacity);
+
 /* full = false: yaw only (keeps the horizon); true: also pitch and roll. */
 void halliday_session_recenter(const HallidaySession *session, bool full);
 
@@ -129,6 +133,12 @@ void halliday_hand_close(HallidayHand *hand);
 /* The bottom pair's spots are the raw fisheyes' (camera mode 0x10, their own pixels): true; the
    rectified pair's (modes 1 and 3): false, as a tracker starts. */
 void halliday_hand_set_fisheyes(const HallidayHand *hand, bool on);
+/* Measured per-headset right raw-camera alignment: rotation vector in radians,
+   camera-local x right/y down/z forward. Used for both stereo pairing and raw
+   reprojection. Zero restores the generic model. False for NULL, nonfinite or
+   >5-degree values; invalid values leave the tracker unchanged. A changed
+   alignment resets old pose hypotheses. Apply the same headset profile to both hands. */
+bool halliday_hand_set_fisheye_alignment(const HallidayHand *hand, const float *rotation);
 /* One exposure: the head's and the controller's orientations in the tracking space at that moment
  * (x, y, z, w), the spots of views 0 and 1 (the bottom pair) and, in camera mode 3, of views 2 and 3
  * (the top cameras; NULL or 0 when missed). True, with out written, when the controller is found. */
@@ -196,6 +206,15 @@ void halliday_sense_polling_report(uint8_t *out);
  * counter go up by one per report sent, led_sequence when the timing changes. */
 void halliday_sense_led_report(uint8_t sequence, uint8_t counter, uint8_t phase, uint8_t led_sequence, uint8_t period_id,
                                uint32_t cycle_position, uint32_t cycle_length, uint32_t host_us, uint8_t *out);
+/* Documented 78-byte Bluetooth vibration output. USB output is not inferred. */
+void halliday_sense_vibration_report(uint8_t sequence, uint8_t counter, float amplitude, float frequency_hz,
+                                     uint32_t host_us, uint8_t *out);
+/* Same vibration output with the current connection's LED settings/latch retained.
+ * programmed is NULL before LEDs are programmed, otherwise a valid 78-byte report.
+ * Returns false for invalid retained packet or NULL out; out is unchanged on failure.
+ * The input and output buffers may alias. No LED latch sequence is advanced. */
+bool halliday_sense_vibration_report_with_led(uint8_t sequence, uint8_t counter, float amplitude, float frequency_hz,
+                                             uint32_t host_us, const uint8_t *programmed, uint8_t *out);
 /* Makes where the controller points now the heading yaw (radians about y, 0 forward). */
 void halliday_sense_recenter(const HallidaySense *sense, float yaw);
 

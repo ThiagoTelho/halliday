@@ -60,6 +60,15 @@ final class Headset: @unchecked Sendable {
 
     var linkState: LinkState { LinkState(rawValue: halliday_session_link_state(session)) ?? .searching }
 
+    /// Already fetched at connection time; polling this never sends another USB command.
+    var hardwareIdentity: String? {
+        var bytes = [UInt8](repeating: 0, count: 64)
+        guard bytes.withUnsafeMutableBufferPointer({
+            halliday_session_headset_identity(session, $0.baseAddress, UInt32($0.count))
+        }), let end = bytes.firstIndex(of: 0), end > 0 else { return nil }
+        return String(bytes: bytes[..<end], encoding: .utf8)
+    }
+
     /// Head pose predicted for a host time in ns (e.g. a display link's target timestamp × 1e9).
     func predict(atHostNs t: Int64) -> HeadPose? {
         var p = HallidayHeadPose()
