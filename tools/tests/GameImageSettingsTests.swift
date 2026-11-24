@@ -22,7 +22,18 @@ import Foundation
         let defaults = UserDefaults(suiteName: suite)!
         defer { defaults.removePersistentDomain(forName: suite) }
         let initial = Settings(defaults: defaults)
-        precondition(!initial.gameFSREnabled && !initial.gameSharpeningEnabled && initial.gameRenderPercent == 100 && initial.gameSharpness == 0.3)
+        precondition(!initial.gameFSREnabled && !initial.gameSharpeningEnabled && !initial.gameHalfFrameRate && initial.gameRenderPercent == 100 && initial.gameSharpness == 0.3)
+        precondition(initial.headsetRefreshHz == 0)
+        initial.headsetRefreshHz = 90
+        precondition(Settings(defaults: defaults).headsetRefreshHz == 90)
+        initial.headsetRefreshHz = 120
+        precondition(Settings(defaults: defaults).headsetRefreshHz == 120)
+        for unsupported in [0, 60, 72, 144, Int.min, Int.max] {
+            defaults.set(unsupported, forKey: "headsetRefreshHz")
+            precondition(Settings(defaults: defaults).headsetRefreshHz == 0)
+            precondition(defaults.integer(forKey: "headsetRefreshHz") == unsupported)
+        }
+        defaults.removeObject(forKey: "headsetRefreshHz")
 
         // Invalid stored values cannot request an unsupported resolution or non-finite gain.
         defaults.set(53, forKey: "gameRenderPercent")
@@ -49,11 +60,17 @@ import Foundation
         precondition(restored.gameSharpness == 0.3 && changes == 4)
         restored.gameSharpness = -.infinity
         precondition(restored.gameSharpness == 0.3 && changes == 5)
+        restored.gameHalfFrameRate = true
+        precondition(changes == 6 && defaults.bool(forKey: "gameHalfFrameRate"))
+        precondition(!restored.gameFSREnabled && !restored.gameSharpeningEnabled && restored.gameRenderPercent == 80 && restored.gameSharpness == 0.3)
         restored.gameFSREnabled = true
         restored.gameSharpeningEnabled = true
         restored.gameSharpness = 0.65
         let reloaded = Settings(defaults: defaults)
-        precondition(reloaded.gameFSREnabled && reloaded.gameSharpeningEnabled && reloaded.gameRenderPercent == 80 && reloaded.gameSharpness == 0.65)
+        precondition(reloaded.gameFSREnabled && reloaded.gameSharpeningEnabled && reloaded.gameHalfFrameRate && reloaded.gameRenderPercent == 80 && reloaded.gameSharpness == 0.65)
+        reloaded.gameHalfFrameRate = false
+        precondition(!defaults.bool(forKey: "gameHalfFrameRate") && reloaded.gameFSREnabled && reloaded.gameSharpeningEnabled)
+        precondition(reloaded.gameRenderPercent == 80 && reloaded.gameSharpness == 0.65)
         precondition(reloaded.volume == 0.7 && defaults.float(forKey: "volume") == 0.7)
         // Neither switch forces the other, and a disabled sharpener keeps its chosen strength.
         reloaded.gameFSREnabled = false
@@ -72,11 +89,11 @@ import Foundation
         precondition(Settings(defaults: defaults).gameRenderPercent == 100)
         // Command-line UserDefaults overrides are strings and must not require persisted writes.
         let persistedBeforeArguments = defaults.persistentDomain(forName: suite)!
-        defaults.setVolatileDomain(["gameRenderPercent": "80", "gameSharpness": "0.6"], forName: UserDefaults.argumentDomain)
+        defaults.setVolatileDomain(["gameRenderPercent": "80", "gameSharpness": "0.6", "gameHalfFrameRate": "YES", "headsetRefreshHz": "90"], forName: UserDefaults.argumentDomain)
         let arguments = Settings(defaults: defaults)
-        precondition(arguments.gameRenderPercent == 80 && arguments.gameSharpness == 0.6)
+        precondition(arguments.gameRenderPercent == 80 && arguments.gameSharpness == 0.6 && arguments.gameHalfFrameRate && arguments.headsetRefreshHz == 90)
         precondition(NSDictionary(dictionary: persistedBeforeArguments).isEqual(to: defaults.persistentDomain(forName: suite)!))
         defaults.removeVolatileDomain(forName: UserDefaults.argumentDomain)
-        print("PASS: 100% unprocessed defaults, independent FSR/RCAS switches, persisted ranges and five-percent steps, finite sharpness, one notification per change, existing preferences retained")
+        print("PASS: 100% unprocessed defaults, independent FSR/RCAS switches, persisted ranges and five-percent steps, finite sharpness, live half-rate preference, original refresh default and supported refresh choices, one notification per change, existing preferences retained")
     }
 }

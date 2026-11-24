@@ -21,13 +21,16 @@ func runGameImageUISnapshot(prefix: String) {
     catch { fatal("UI snapshot renderer failed: \(error)") }
 
     let general = SettingsPanel(renderer: renderer)
+    general.refreshState = { ([90, 120], 120, false) }
     drawGameImageSettingsPanel(general, to: "\(prefix)-headset-general.png")
     let gameImage = SettingsPanel(renderer: renderer)
     gameImage.onActivate?("page:gameImage")
     drawGameImageSettingsPanel(gameImage, to: "\(prefix)-headset-game-image.png")
 
-    let expected = Set(["game:fsr", "game:scale", "game:sharpening", "game:sharpness"])
+    let expected = Set(["game:fsr", "game:scale", "game:halfFrameRate", "game:sharpening", "game:sharpness"])
     guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
+    guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
+    else { fatal("Headset refresh selectors are missing") }
     for panel in [general, gameImage] {
         for control in panel.controls where !panel.surface.contains(control.rect) {
             fatal("Settings control \(control.id) extends outside the panel: \(control.rect)")

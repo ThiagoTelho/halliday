@@ -112,6 +112,9 @@ struct ProjectionLayer {
     /// (WebXR, videos and the interface) retain their original sampling.
     var gameImage = false
     var imageSequence: UInt64 = 0
+    var gameHalfRate = false
+    var sourceFrameInterval = 1.0 / 90
+    var gameCadenceEpoch: UInt64 = 0
 }
 
 /// Must match `LayerData` in Shaders.swift.

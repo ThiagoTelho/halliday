@@ -388,6 +388,10 @@ typedef struct {
 HallidayGameBridge *halliday_bridge_open(const char *path, const HallidayBridgeConfig *config);
 void halliday_bridge_close(HallidayGameBridge *bridge);
 void halliday_bridge_publish(const HallidayGameBridge *bridge, const HallidayBridgeState *state);
+/* Updates pose/input on every display tick; notify_game alone wakes the game's next frame.
+   The shared-memory Header remains v6; legacy publish still always notifies. */
+void halliday_bridge_publish_frame(const HallidayGameBridge *bridge, const HallidayBridgeState *state,
+                                   bool notify_game);
 bool halliday_bridge_begin_read(const HallidayGameBridge *bridge, HallidayBridgeFrame *out);
 void halliday_bridge_end_read(const HallidayGameBridge *bridge);
 uint8_t *halliday_bridge_base(const HallidayGameBridge *bridge);

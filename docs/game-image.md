@@ -68,3 +68,5 @@ These exercise actual pixels, eye isolation, colour, identity bypass, texture
 reuse and the production compositor. They require a Metal device and must not be
 run during a measured game benchmark. CPU/typecheck results do not establish
 visual quality, game FPS or physical headset acceptance.
+
+Game cadence and physical refresh controls are described in [game-cadence.md](game-cadence.md).

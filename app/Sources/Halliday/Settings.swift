@@ -80,6 +80,12 @@ final class Settings {
         didSet { defaults.set(volume, forKey: "volume"); onChange?() }
     }
 
+    /// Zero retains the Mac's current mode until the user chooses 90 or 120 Hz.
+    /// Persist only after a physical mode change has actually been verified.
+    var headsetRefreshHz: Int {
+        didSet { defaults.set(headsetRefreshHz, forKey: "headsetRefreshHz") }
+    }
+
     /// The headset's panel brightness (0.1 … 1, full until the user sets it): the headset's own
     /// command, as Monado and GAV send it.
     static let brightnessRange: ClosedRange<Float> = 0.1...1
@@ -102,6 +108,12 @@ final class Settings {
     /// RCAS sharpening is independent of FSR upscaling and is off by default.
     var gameSharpeningEnabled: Bool {
         didSet { defaults.set(gameSharpeningEnabled, forKey: "gameSharpeningEnabled"); onChange?() }
+    }
+
+    /// Games render every other headset refresh. Tracking and the physical display retain
+    /// their full rate; Halliday's runtime applies cadence changes in the live session.
+    var gameHalfFrameRate: Bool {
+        didSet { defaults.set(gameHalfFrameRate, forKey: "gameHalfFrameRate"); onChange?() }
     }
 
     /// Percentage of the full game image rendered by the game, in five-percent steps.
@@ -141,6 +153,7 @@ final class Settings {
         self.defaults = defaults
         gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
+        gameHalfFrameRate = defaults.bool(forKey: "gameHalfFrameRate")
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)
         let sharpness = defaults.object(forKey: "gameSharpness")
@@ -150,6 +163,8 @@ final class Settings {
         reduceMotion = defaults.bool(forKey: "reduceMotion")
         brightness = min(max(defaults.object(forKey: "brightness") as? Float ?? 1, Self.brightnessRange.lowerBound), 1)
         volume = min(max(defaults.object(forKey: "volume") as? Float ?? 0.5, 0), 1)
+        let savedRefresh = defaults.integer(forKey: "headsetRefreshHz")
+        headsetRefreshHz = [90, 120].contains(savedRefresh) ? savedRefresh : 0
         soundVolume = min(max(defaults.object(forKey: "soundVolume") as? Float ?? 0.5, 0), 1)
         environment = defaults.string(forKey: "environment") ?? "dusk"
         pointerSpeed = min(max(defaults.object(forKey: "pointerSpeed") as? Float ?? 1, Self.pointerSpeedRange.lowerBound), Self.pointerSpeedRange.upperBound)

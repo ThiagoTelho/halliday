@@ -16,7 +16,7 @@ fn config() -> (u32, u32, f32, f32, [[f32; 4]; 2]) {
             (
                 (*h).eye_width,
                 (*h).eye_height,
-                (*h).display_hz,
+                1.0 / crate::scene::frame_interval(),
                 (*h).ipd,
                 (*h).tangents,
             )

@@ -309,6 +309,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var testHeadset: VirtualDisplay?
     /// The headset display's rate (90 without one), told to games.
     private var headsetHz: Float = 90
+    private var refreshSwitchTask: Task<Void, Never>?
+    private var preferredRefreshKey: String?
+    private var lastRefreshPreferencePoll = -Double.infinity
 
     init(replayPath: String?) {
         self.replayPath = replayPath
@@ -345,7 +348,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
         let headsetScreen = launchArgs.contains("--ignore-headset-at-launch") || launchArgs.contains("--ignore-headset") ? nil : NSScreen.screens.first { screen in
             screen.convertRectToBacking(screen.frame).size == headsetPanelPixels
         }
-        headsetHz = headsetScreen.map { Float($0.maximumFramesPerSecond) } ?? 90
+        let initialHz = headsetScreen.map(Self.physicalRefreshRate) ?? 90
+        headsetHz = initialHz > 0 ? initialHz : 90
         LateLatch.displayHz = headsetHz
         let renderer: Renderer
         do {
@@ -575,7 +579,19 @@ if !open, passthroughForVideo {
         // A headset plugged in later is taken on when its display appears (a display's mode
         // settles over a moment: looked at a second after macOS says the displays changed).
         screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { _ = self?.lookForHeadset() } }
+            MainActor.assumeIsolated {
+                if self?.headsetDisplayNow == nil {
+                    self?.preferredRefreshKey = nil
+                    self?.refreshSwitchTask?.cancel()
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.headsetWindow != nil, let screen = self.headsetDisplayNow {
+                    self.adoptHeadsetRefresh(Self.physicalRefreshRate(screen), screen: screen)
+                }
+                _ = self.lookForHeadset()
+            } }
         }
         updateTitle()
         log("[keys] video: O file browser (⇧O Mac dialog) · V watch the browser's video in VR · Space play/pause · ←/→ ±10 s · F projection · G stereo · C subtitles · R recenter · X close")
@@ -957,6 +973,7 @@ if !open, passthroughForVideo {
     func applicationWillTerminate(_ notification: Notification) {
         log("[app] quitting: releasing the mouse and putting windows back")
         discardHandTrackingWork()
+        refreshSwitchTask?.cancel()
         gameImageReconfiguration?.cancel()
         gameImageReconfiguration = nil
         // A game in Halliday is asked to quit too (as SteamVR's do): it reads the request from the
@@ -1956,6 +1973,11 @@ if !open, passthroughForVideo {
                 p.onClose = { [weak self] in self?.settingsOpen = false; self?.lastDockClock = 0 }
                 p.onNotice = { [weak self] text in self?.notify(text) }
                 p.currentPage = { [weak self] in self?.browser?.displayURL }
+                p.onRefreshRate = { [weak self] hz in self?.requestHeadsetRefresh(hz) }
+                p.refreshState = { [weak self] in
+                    guard let self else { return ([], 0, false) }
+                    return (self.availableHeadsetRefreshRates, Int(self.headsetHz.rounded()), self.refreshSwitchTask != nil)
+                }
                 settingsPanel = p
                 return p
             }()
@@ -2689,6 +2711,8 @@ if !open, passthroughForVideo {
     private func scheduleGameImageReconfiguration() {
         gameImageReconfiguration?.cancel()
         gameImageReconfiguration = nil
+        // Cadence changes are live and never replace a client mapping or image.
+        _ = game?.setHalfFrameRate(Settings.shared.gameHalfFrameRate)
         guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -3479,6 +3503,92 @@ if !open, passthroughForVideo {
         NSScreen.screens.first { $0.convertRectToBacking($0.frame).size == headsetPanelPixels }
     }
 
+    private static func displayID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    private static func physicalRefreshRate(_ screen: NSScreen) -> Float {
+        if let id = displayID(screen), let hz = PSVR2RefreshModes.currentRate(for: id) { return Float(hz) }
+        let reported = Float(screen.maximumFramesPerSecond)
+        return reported > 0 ? reported : 90
+    }
+
+    private var availableHeadsetRefreshRates: [Int] {
+        guard onHeadset, let screen = headsetDisplayNow, let id = Self.displayID(screen) else { return [] }
+        return PSVR2RefreshModes.rates(for: id)
+    }
+
+    private func adoptHeadsetRefresh(_ hz: Float, screen: NSScreen) {
+        guard hz.isFinite, hz > 0 else { return }
+        let changed = abs(headsetHz - hz) > 0.1
+        headsetHz = hz
+        LateLatch.displayHz = hz
+        if let game, !game.setPhysicalDisplayHz(hz) { scheduleGameImageReconfiguration() }
+        if let id = Self.displayID(screen) { view?.refreshHeadsetTiming(display: id, hz: Double(hz)) }
+        if changed {
+            log("[display] live headset refresh \(Int(hz.rounded())) Hz")
+            settingsPanel?.setNeedsDisplay()
+            companion?.model.refresh()
+        }
+    }
+
+    private func requestHeadsetRefresh(_ hz: Int) {
+        guard [90, 120].contains(hz), let screen = headsetDisplayNow,
+              let id = Self.displayID(screen), availableHeadsetRefreshRates.contains(hz) else { return }
+        guard refreshSwitchTask == nil else { return }
+        if PSVR2RefreshModes.currentRate(for: id) == hz {
+            adoptHeadsetRefresh(Float(hz), screen: screen)
+            Settings.shared.headsetRefreshHz = hz
+            return
+        }
+        guard game?.isPresenting != true || game?.supportsLiveDisplayRate == true else {
+            notify("Live refresh switching needs Halliday's game runtime. Close this legacy session first.", kind: .warning)
+            return
+        }
+        refreshSwitchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.refreshSwitchTask = nil
+                self.settingsPanel?.setNeedsDisplay()
+                self.companion?.model.refresh()
+            }
+            do {
+                try PSVR2RefreshModes.request(hz, for: id)
+                for _ in 0..<20 {
+                    try Task.checkCancellation()
+                    if let current = self.headsetDisplayNow, Self.displayID(current) == id,
+                       PSVR2RefreshModes.currentRate(for: id) == hz {
+                        self.adoptHeadsetRefresh(Float(hz), screen: current)
+                        Settings.shared.headsetRefreshHz = hz
+                        self.notify("Headset: \(hz) Hz", symbol: "display", seconds: 2)
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                throw NSError(domain: "HallidayDisplay", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "macOS did not confirm the requested refresh rate"])
+            } catch is CancellationError { }
+              catch { self.notify(error.localizedDescription, kind: .warning) }
+        }
+        settingsPanel?.setNeedsDisplay()
+        companion?.model.refresh()
+    }
+
+    /// Restore a deliberately chosen mode once per display connection, after
+    /// the real headset view and game bridge exist. No repeated failed requests.
+    private func applyPreferredHeadsetRefresh() {
+        guard onHeadset, let screen = headsetDisplayNow, let id = Self.displayID(screen) else {
+            preferredRefreshKey = nil
+            return
+        }
+        let wanted = Settings.shared.headsetRefreshHz
+        let key = "\(id):\(wanted)"
+        guard refreshSwitchTask == nil, key != preferredRefreshKey else { return }
+        preferredRefreshKey = key
+        if wanted == 90 || wanted == 120 { requestHeadsetRefresh(wanted) }
+        else { adoptHeadsetRefresh(Self.physicalRefreshRate(screen), screen: screen) }
+    }
+
     /// Looks for the headset (at every change of the Mac's displays, and when the companion's
     /// "Look for the headset" is pressed): one that appeared since Halliday started is taken on at
     /// once, as if it had been there at launch. Returns what was found, for the companion.
@@ -3510,7 +3620,9 @@ if !open, passthroughForVideo {
         w.level = .screenSaver
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         headsetWindow = w
-        headsetHz = Float(screen.maximumFramesPerSecond)
+        let detectedHz = Self.physicalRefreshRate(screen)
+        headsetHz = detectedHz > 0 ? detectedHz : 90
+        _ = game?.setPhysicalDisplayHz(headsetHz)
         LateLatch.displayHz = headsetHz
         renderer.setEyeSize(Headsets.current.renderEyeSize)
         if usb == nil { usb = TrackedSource(name: "headset", headset: Headsets.current.openSession()) }
@@ -3611,6 +3723,7 @@ if !open, passthroughForVideo {
                     self.companion?.model.notice = "Couldn't bring \(c.appName)'s window into VR"
                 }
             }
+            m.onRefreshRate = { [weak self] hz in self?.requestHeadsetRefresh(hz) }
             m.onPrediction = { [weak self] ms in
                 self?.view?.lookaheadTrimNs = Int64(ms) * 1_000_000
                 self?.companion?.model.refresh()
@@ -3644,6 +3757,8 @@ if !open, passthroughForVideo {
             }
         }
         s.displayHz = onHeadset ? Int(headsetHz.rounded()) : 0
+        s.refreshRates = availableHeadsetRefreshRates
+        s.refreshSwitching = refreshSwitchTask != nil
         s.framesPerSecond = shownFramesPerSecond
         for (hand, name) in [(SenseControllers.Hand.left, "Left"), (.right, "Right")] {
             if let state = sense.state(hand) { s.controllers.append("\(name) · \(state.batteryPercent)%\(state.charging ? ", charging" : "")") }
@@ -3799,6 +3914,13 @@ if !open, passthroughForVideo {
     private func frameTick(head: HeadPose) {
         guard let view, let renderer else { return }
         lastHead = head
+        // Restore a deliberately chosen physical mode at most twice a second;
+        // a connection key prevents repeated requests after a failure.
+        let refreshNow = CACurrentMediaTime()
+        if refreshNow - lastRefreshPreferencePoll >= 0.5 {
+            lastRefreshPreferencePoll = refreshNow
+            applyPreferredHeadsetRefresh()
+        }
         updateSense(head: head)
         updateCameras()
         updatePassthrough()
