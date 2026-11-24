@@ -12,6 +12,7 @@
 #include "panel_bridge.hpp"
 #include "panel_readback.hpp"
 #include "motion_bridge.hpp"
+#include "controller_frames_bridge.hpp"
 #include "projection_geometry.hpp"
 #include "source_timing_bridge.hpp"
 #include "helper_game_identity.hpp"
@@ -80,6 +81,7 @@ struct TimedState {
     XrPosef localOrigin{};
     bool haveLocalOrigin = false;
     uint32_t motionMask = halliday::motion::kAll;
+    halliday::controller_frames::Kinds controllerFrames = halliday::controller_frames::kLegacy;
 };
 std::array<TimedState,64> gTimedStates{};
 size_t gNextTimedState = 0;
@@ -264,7 +266,8 @@ void referenceOriginLocked(const halliday::State& state) {
     gHaveLocalOrigin = true;
 }
 bool sampleLocked(XrSession session, halliday::State* state, XrTime time = 0,
-                  XrPosef* localOrigin = nullptr, bool* haveLocalOrigin = nullptr,uint32_t* motionMask=nullptr) {
+                  XrPosef* localOrigin = nullptr, bool* haveLocalOrigin = nullptr,uint32_t* motionMask=nullptr,
+                  halliday::controller_frames::Kinds* controllerFrames=nullptr) {
     if (!activeLocked(session)) return false;
     // Observe a host recenter before sampling new times. Historical samples
     // retain their own origin rather than mixing an old pose with today's one.
@@ -281,6 +284,7 @@ bool sampleLocked(XrSession session, halliday::State* state, XrTime time = 0,
             if (localOrigin) *localOrigin = sample.localOrigin;
             if (haveLocalOrigin) *haveLocalOrigin = sample.haveLocalOrigin;
             if (motionMask) *motionMask=sample.motionMask;
+            if (controllerFrames) *controllerFrames=sample.controllerFrames;
            return true;
         }
         // Unknown older times cannot be assigned today's input under an old
@@ -288,14 +292,16 @@ bool sampleLocked(XrSession session, halliday::State* state, XrTime time = 0,
         if (time < gNewestSampleTime) return false;
     }
     uint32_t mask=0;
-    if (!halliday::motion::readState(gHeader,state,&mask)) return false;
+    halliday::controller_frames::Kinds frames=halliday::controller_frames::kLegacy;
+    if (!halliday::controller_frames::readState(gHeader,state,&mask,&frames)) return false;
     referenceOriginLocked(*state);
     if (localOrigin) *localOrigin = gLocalOrigin;
     if (haveLocalOrigin) *haveLocalOrigin = gHaveLocalOrigin;
     if(motionMask)*motionMask=mask;
+    if(controllerFrames)*controllerFrames=frames;
     if (time > 0) {
         gTimedStates[gNextTimedState++ % gTimedStates.size()] =
-            {time, *state, gLocalOrigin, gHaveLocalOrigin,mask};
+            {time, *state, gLocalOrigin, gHaveLocalOrigin,mask,frames};
         gNewestSampleTime=std::max(gNewestSampleTime,time);
     }
     return true;
@@ -614,7 +620,8 @@ bool controlInputSnapshot(XrSession session, ControlInputSnapshot* output, XrTim
     *output = {};
     halliday::State state{};
     uint32_t mask=0;
-    if (!sampleLocked(session, &state, time,nullptr,nullptr,&mask)) return false;
+    halliday::controller_frames::Kinds frames=halliday::controller_frames::kLegacy;
+    if (!sampleLocked(session, &state, time,nullptr,nullptr,&mask,&frames)) return false;
     constexpr uint64_t profile = 0x0812fd85c84384a6ULL; // frontend's Touch-compatible controls
     // IDs are internal keys inherited from Basalt's action mapper, not network traffic.
     constexpr uint64_t ids[2][12] = {
@@ -630,7 +637,15 @@ bool controlInputSnapshot(XrSession session, ControlInputSnapshot* output, XrTim
         const auto& c = state.controllers[hand]; auto& out = output->controllers[hand];
         out.profileActive = c.connected != 0; out.profileId = profile;
         out.poseActive = c.connected && c.pose.valid && isPoseWellFormed(fromPose(c.pose));
-        out.poseInLocal = fromPose(c.pose); out.questTimestampNanoseconds = c.packet;
+        out.poseInLocal = fromPose(c.pose); out.aimPoseInLocal = out.poseInLocal;
+        const auto convert = [&](halliday::controller_frames::Target target, XrPosef& pose) {
+            float q[4]{};
+            halliday::controller_frames::orientation(frames[hand],target,c.pose.orientation,q);
+            pose.orientation={q[0],q[1],q[2],q[3]};
+        };
+        convert(halliday::controller_frames::Target::OpenXrGrip,out.poseInLocal);
+        convert(halliday::controller_frames::Target::OpenXrAim,out.aimPoseInLocal);
+        out.questTimestampNanoseconds = c.packet;
         out.linearVelocity = {c.pose.velocity[0],c.pose.velocity[1],c.pose.velocity[2]};
         out.angularVelocity = {c.pose.angularVelocity[0],c.pose.angularVelocity[1],c.pose.angularVelocity[2]};
         out.motionFlags=(mask>>((hand+1)*2))&3;

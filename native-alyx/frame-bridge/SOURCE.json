@@ -42,6 +42,9 @@
     "Use wire namespace for copied wire types/constants.",
     "Call Halliday coherent_frame_reader.hpp through a stateless local Access adapter; retain original SharedBridge object members/layout.",
     "No benchmark instrumentation or trace code is included.",
+    "Convert the independent native runtime Touch OpenXR grip into the advertised guest OpenVR raw frame with a clean-room inverse model component; preserve original external runtime behavior.",
+    "Adjust known world linear velocity for the converted raw origin while retaining world angular velocity and existing finite-difference fallback.",
+    "Select the boundary from negotiated exact Halliday runtime identity/version, covering ordinary launches without editing the game or Steam entry.",
     "Require an explicitly selected native runtime instead of an installed-provider fallback; use a neutral source-built application identity while retaining the historical public guest compatibility boundary."
   ],
   "source_frozen": true,
@@ -50,15 +53,18 @@
     "loading_bridge.h": "3b0086438f939ee5c75eca5523e4bfdae21296162d1443f8693de5b9e135eedb",
     "wire_layout.hpp": "0d8d594b1fc694371ca96dd90bbda3aa002828ff01fb8b7704e9ac5da27a31c7",
     "OpenVR-BSD.txt": "f56ff606104d4ef18e617921a75c73ad73b5a1a1d70c69590c29de16919e04ad",
-    "controllers.h": "cb786427427b7b8ca72290631c0aa92cb6e18d8da2d0500e2067addfbda7d516",
+    "controllers.h": "47bf9113f6ec94aa47e547c5223e66dff66e1f1fa1b8eee7c4e6e989a90f4cc4",
     "shared_bridge.h": "9c6cd0440231728d606f660589b73d953d49cdae60626ced4fa86fbb2d4001f0",
-    "README.md": "4fe738c60fb456f9075d3904b94a72c9dec4fcf308b3cc267fe89189f20cf8a7",
+    "README.md": "66906490070968bdf8af4a182c5942f0d1071c040086302db8a18190ee1dd4b1",
     "openxr_loader_negotiation.h": "454e87fea1e749ca6da7a5e8a362de153216f245219267a24ce9d7fb5b5e6560",
-    "bridge.cpp": "238c36fb2d51d9bdebbdbc43f3699041b209d0608c783ad6c9f3177a40e8e481",
+    "bridge.cpp": "c14118c2a4ac1ffcb0524a2dac044869bed464b9191b73baf95e4e5a8674a8b3",
     "Native-Alyx-Bridge-MIT.txt": "b2982281b11b00cff6e423515c8eab3c1afb675be925c9b4b0f95b51f4c52af9",
     "upload.h": "2cc8fc05f960bb6982db1f547ff9d194bef50a55bf8a24179565143d2c7788e9",
+    "touch_raw_frame.hpp": "7c683581a6e6fd329aca9eb37488f67d85148209cfda94597216cf6ddc1ba2ae",
     "runtime_selection.hpp": "785220dc4ec81a11248468639610c53ee05b63be346fbdb43a324cb1b849b0d3"
   },
   "coherent_reader_sha256": "bd86d55de0dcb6c4c1d8abc85afa5a1b63bed668655b011b9cd668562d6c2387",
-  "build_script_sha256": "f60177b1e666884808a6a3e95ff3b6126ab890f79b86e6e419695c3edb657614"
+  "build_script_sha256": "f60177b1e666884808a6a3e95ff3b6126ab890f79b86e6e419695c3edb657614",
+  "new_numeric_contract_reference": "https://github.com/GameNative/opencomposite/blob/35c2ce526ed1c9460924b1c2880def198f63a7b7/OpenOVR/Misc/Input/OculusInteractionProfile.cpp#L85",
+  "new_implementation_provenance": "Clean-room quaternion/rigid-transform composition from numeric controller-model metadata. No OpenComposite implementation copied."
 }

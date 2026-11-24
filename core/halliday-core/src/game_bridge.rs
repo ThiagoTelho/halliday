@@ -264,6 +264,7 @@ impl GameBridge {
             bridge::motion::initialize(h);
             bridge::projection::initialize(h);
             bridge::frame_timing::initialize(h);
+            bridge::controller_frames::initialize(h);
             (*h).halliday_alive.store(1, Ordering::SeqCst);
             // Last: a game seeing the magic sees a complete header.
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*h).magic), bridge::MAGIC);
@@ -303,6 +304,11 @@ impl GameBridge {
 
     pub fn publish_frame_with_motion(&self, state: &State, notify_game: bool, mask: u32) {
         unsafe { bridge::publish_with_motion(self.header(), state, notify_game, Some(mask)) };
+    }
+
+    pub fn publish_frame_with_controller_frames(&self, state: &State, notify_game: bool,
+        mask: u32, frames: [bridge::controller_frames::FrameKind; 2]) {
+        unsafe { bridge::publish_with_controller_frames(self.header(), state, notify_game, Some(mask), frames) };
     }
 
     /// Claims the game's newest frame; release it with [`GameBridge::end_read`].
@@ -833,6 +839,10 @@ impl GameSide {
     pub fn state_snapshot_with_motion(&self) -> Option<(State, u32)> {
         unsafe { bridge::read_state_with_motion(self.header()) }
     }
+    pub fn state_snapshot_with_controller_frames(&self)
+        -> Option<(State, u32, [bridge::controller_frames::FrameKind; 2])> {
+        unsafe { bridge::read_state_with_controller_frames(self.header()) }
+    }
 
     pub fn host_tick(&self) -> u64 {
         unsafe { (*self.header()).vsync_count.load(Ordering::SeqCst) }
@@ -982,6 +992,10 @@ impl GameSide {
         self.wait_frame_with_motion(timeout).map(|(state, _)| state)
     }
     pub fn wait_frame_with_motion(&mut self, timeout: std::time::Duration) -> Option<(State, u32)> {
+        self.wait_frame_with_controller_frames(timeout).map(|(state, mask, _)| (state, mask))
+    }
+    pub fn wait_frame_with_controller_frames(&mut self, timeout: std::time::Duration)
+        -> Option<(State, u32, [bridge::controller_frames::FrameKind; 2])> {
         let h = self.header();
         let start = std::time::Instant::now();
         loop {
@@ -997,7 +1011,7 @@ impl GameSide {
             std::thread::sleep(std::time::Duration::from_millis(1));
         }
         // SAFETY: our mapping.
-        unsafe { bridge::read_state_with_motion(h) }
+        unsafe { bridge::read_state_with_controller_frames(h) }
     }
 
     /// Halliday's state if a display frame has passed since the last call, without waiting.
@@ -1005,6 +1019,10 @@ impl GameSide {
         self.poll_frame_with_motion().map(|(state, _)| state)
     }
     pub fn poll_frame_with_motion(&mut self) -> Option<(State, u32)> {
+        self.poll_frame_with_controller_frames().map(|(state, mask, _)| (state, mask))
+    }
+    pub fn poll_frame_with_controller_frames(&mut self)
+        -> Option<(State, u32, [bridge::controller_frames::FrameKind; 2])> {
         let h = self.header();
         // SAFETY: our mapping.
         let v = unsafe { (*h).vsync_count.load(Ordering::SeqCst) };
@@ -1013,7 +1031,7 @@ impl GameSide {
         }
         self.last_vsync = v;
         // SAFETY: our mapping.
-        unsafe { bridge::read_state_with_motion(h) }
+        unsafe { bridge::read_state_with_controller_frames(h) }
     }
 
     /// Writes a frame: `fill(eye, pixels)` paints each eye's RGBA8 rows, bottom row first (as

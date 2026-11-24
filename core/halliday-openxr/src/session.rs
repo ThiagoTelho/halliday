@@ -191,7 +191,20 @@ struct PoseSample {
     time: i64,
     state: bridge::State,
     motion_mask: u32,
+    controller_frames: [bridge::controller_frames::FrameKind; 2],
     local: Option<xr::Posef>,
+}
+
+/// Resolve the declared local orientation frame from this exact historical
+/// sample. The controller origin and its world-space motion stay unchanged.
+fn controller_action_pose(sample: &PoseSample, hand: usize, part: Part) -> bridge::Pose {
+    let target = if part == Part::GripPose {
+        bridge::controller_frames::Target::OpenXrGrip
+    } else {
+        bridge::controller_frames::Target::OpenXrAim
+    };
+    bridge::controller_frames::pose(sample.controller_frames[hand], target,
+        sample.state.controllers[hand].pose)
 }
 
 /// The head a frame was drawn for: of the heads `given` to the application, the one its layer's
@@ -386,6 +399,7 @@ struct Session {
     /// Halliday's newest state, taken at `xrWaitFrame`.
     newest: Option<bridge::State>,
     newest_motion: u32,
+    newest_controller_frames: [bridge::controller_frames::FrameKind; 2],
     pose_samples: VecDeque<PoseSample>,
     /// Uncached times before the last reference change cannot be reconstructed.
     pose_epoch_start: i64,
@@ -975,6 +989,7 @@ unsafe extern "system" fn create_session(
             swapchains: HashMap::new(),
             newest: None,
             newest_motion: bridge::motion::ALL,
+            newest_controller_frames: bridge::controller_frames::LEGACY,
             pose_samples: Default::default(),
             pose_epoch_start: 0,
             pose_latest_time: 0,
@@ -1283,19 +1298,21 @@ impl Session {
                 time,
                 state: bridge::State::default(),
                 motion_mask: 0,
+                controller_frames: bridge::controller_frames::LEGACY,
                 local: None,
             };
         }
-        let (state,motion_mask) = self
+        let (state,motion_mask,controller_frames) = self
             .side
-            .state_snapshot_with_motion()
-            .or(self.newest.map(|state|(state,self.newest_motion)))
-            .unwrap_or((bridge::State::default(),0));
+            .state_snapshot_with_controller_frames()
+            .or(self.newest.map(|state|(state,self.newest_motion,self.newest_controller_frames)))
+            .unwrap_or((bridge::State::default(),0,bridge::controller_frames::LEGACY));
         self.anchor_local(&state);
         self.remember_pose_sample(PoseSample {
             time,
             state,
             motion_mask,
+            controller_frames,
             local: self.local,
         })
     }
@@ -1353,9 +1370,8 @@ impl Session {
                             && source.kinds[hand].is_some_and(Part::is_pose) =>
                     {
                         let c = &state.controllers[hand];
-                        // The legacy bridge has one canonical pose per hand. Grip/aim
-                        // identities remain distinct, without inventing a mount offset.
-                        (from_bridge(&c.pose), c.connected != 0 && c.pose.valid != 0)
+                        let pose = controller_action_pose(sample, hand, source.kinds[hand].unwrap());
+                        (from_bridge(&pose), c.connected != 0 && c.pose.valid != 0)
                     }
                     _ => (IDENTITY, false),
                 }
@@ -1411,7 +1427,9 @@ impl Session {
             SpaceKind::View => Some((state.head,0)),
             SpaceKind::Action { action, hand } => self.pose_sources.get(&action)
                 .and_then(|source| hand.or(source.selected).filter(|&hand| source.eligible[hand]))
-                .map(|hand| (state.controllers[hand].pose,hand+1)),
+                .and_then(|hand| self.pose_sources.get(&action)?.kinds[hand]
+                    .filter(|part| part.is_pose())
+                    .map(|part| (controller_action_pose(sample, hand, part),hand+1))),
             _ => None,
         };
         let Some((pose,device)) = source else {return (zero,zero,true,true)};
@@ -1940,18 +1958,19 @@ unsafe extern "system" fn wait_frame(
             }
             let late = s.state == xr::SessionState::STOPPING
                 || start.elapsed() > Duration::from_millis(250);
-            let state = match s.side.poll_frame_with_motion() {
+            let state = match s.side.poll_frame_with_controller_frames() {
                 Some(state) => Some(state),
-                None if late => s.side.wait_frame_with_motion(Duration::ZERO),
+                None if late => s.side.wait_frame_with_controller_frames(Duration::ZERO),
                 None => None,
             };
             if state.is_none() && !late {
                 return Ok(None);
             }
-            if let Some((state,motion_mask)) = state {
+            if let Some((state,motion_mask,controller_frames)) = state {
                 s.anchor_local(&state);
                 s.newest = Some(state);
                 s.newest_motion = motion_mask;
+                s.newest_controller_frames = controller_frames;
                 if state.head.valid != 0 {
                     if s.given.len() == GIVEN {
                         s.given.pop_front();
@@ -1970,6 +1989,7 @@ unsafe extern "system" fn wait_frame(
                 time: s.display_time,
                 state: s.newest.unwrap_or_default(),
                 motion_mask: s.newest_motion,
+                controller_frames: s.newest_controller_frames,
                 local: s.local,
             });
             s.waited = true;
@@ -3730,6 +3750,47 @@ unsafe extern "system" fn stop_haptic_feedback(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_frames_resolve_the_exact_historical_hand_sample() {
+        use bridge::controller_frames::{FrameKind, LEGACY};
+        let mut state = bridge::State::default();
+        for hand in 0..2 {
+            state.controllers[hand].pose = bridge::Pose {
+                position: [hand as f32 * 0.4 - 0.2,1.1,-0.4], valid: 1,
+                orientation: [0.,0.,0.,1.], velocity: [0.2,-0.3,0.4],
+                angular_velocity: [-0.4,0.6,1.2], stamp: 7., ..Default::default()
+            };
+        }
+        let old = PoseSample { time: 1, state, motion_mask: 63,
+            controller_frames: [FrameKind::SenseAim,FrameKind::Legacy], local: None };
+        let new = PoseSample { time: 2,
+            controller_frames: [FrameKind::Legacy,FrameKind::SenseAim], ..old };
+        let legacy = PoseSample { controller_frames: LEGACY, ..old };
+        for hand in 0..2 {
+            for sample in [old,new,legacy] {
+                let input = sample.state.controllers[hand].pose;
+                assert_eq!(controller_action_pose(&sample,hand,Part::AimPose),input);
+                let grip = controller_action_pose(&sample,hand,Part::GripPose);
+                assert_eq!(grip.position,input.position);
+                assert_eq!(grip.velocity,input.velocity);
+                assert_eq!(grip.angular_velocity,input.angular_velocity);
+                assert_eq!(grip.valid,input.valid); assert_eq!(grip.stamp,input.stamp);
+                if sample.controller_frames[hand] == FrameKind::SenseAim {
+                    assert!((grip.orientation[0]-0.5).abs()<1e-6);
+                    assert!((grip.orientation[3]-0.8660254).abs()<1e-6);
+                    // App-defined offsets use the declared API axes. World
+                    // velocity at the natural controller origin is unchanged.
+                    let lever = rotate(from_bridge(&grip).orientation,vector([0.,0.,-0.1]));
+                    assert!(near(lever,[0.,0.08660254,-0.05]));
+                } else { assert_eq!(grip,input); }
+            }
+        }
+        assert_ne!(controller_action_pose(&old,0,Part::GripPose).orientation,
+            controller_action_pose(&new,0,Part::GripPose).orientation);
+        // Re-requesting the old display-time sample cannot use a newer tag.
+        assert_eq!(controller_action_pose(&old,0,Part::GripPose).orientation,[0.5,0.,0.,0.8660254]);
+    }
 
     fn near(a: xr::Vector3f, b: [f32; 3]) -> bool {
         (a.x - b[0]).abs() < 1e-5 && (a.y - b[1]).abs() < 1e-5 && (a.z - b[2]).abs() < 1e-5

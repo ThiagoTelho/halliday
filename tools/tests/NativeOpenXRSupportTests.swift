@@ -105,6 +105,13 @@ private final class Fixture {
 
 @main private struct NativeOpenXRSupportTests {
     @MainActor static func main() throws {
+        let raw = try NativeOpenXRSupport.launchEnvironment(["KEEP": "yes"], backend: .halliday, displayHz: 60)
+        try check(raw["HALLIDAY_ALYX_TOUCH_RAW_POSE"] == "1" && raw["KEEP"] == "yes",
+                  "native raw-device contract defaults on without replacing inherited settings")
+        let rollback = try NativeOpenXRSupport.launchEnvironment(
+            ["HALLIDAY_ALYX_TOUCH_RAW_POSE": "0"], backend: .halliday, displayHz: 60)
+        try check(rollback["HALLIDAY_ALYX_TOUCH_RAW_POSE"] == "0",
+                  "explicit native raw-device rollback is preserved")
         guard CommandLine.arguments.count == 2 else { throw Failure(message: "one fixture parent required") }
         let parent = URL(fileURLWithPath: CommandLine.arguments[1])
         try FileManager.default.createDirectory(at: parent, withIntermediateDirectories: true)

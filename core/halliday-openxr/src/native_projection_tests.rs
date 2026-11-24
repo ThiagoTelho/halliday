@@ -40,7 +40,7 @@ fn both_submitted_cameras_match_independent_double_matrix_oracle_in_stage_local_
     let _fixture=Fixture::new();
     with(|r| {
         let s=r.session.as_mut().unwrap();
-        let mut sample=PoseSample {time:1234,state:s.newest.unwrap(),motion_mask:0,local:Some(camera(1,0.7,[0.4,0.2,-0.3]))};
+        let mut sample=PoseSample {time:1234,state:s.newest.unwrap(),motion_mask:0,controller_frames:bridge::controller_frames::LEGACY,local:Some(camera(1,0.7,[0.4,0.2,-0.3]))};
         sample.state.controllers[0].pose=bridge_pose(camera(0,-0.4,[-0.35,1.1,-0.45]));
         sample.state.controllers[1].pose=bridge_pose(camera(2,0.5,[0.32,0.9,-0.5]));
         s.pose_sources.insert(99,PoseSources{eligible:[true,true],kinds:[Some(Part::GripPose),Some(Part::GripPose)],selected:Some(0)});

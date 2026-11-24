@@ -455,6 +455,11 @@ void halliday_bridge_publish_frame(const HallidayGameBridge *bridge, const Halli
 /* Bits0/1=head linear/angular,2/3=left,4/5=right. Legacy publish APIs remain unchanged. */
 void halliday_bridge_publish_frame_with_motion(const HallidayGameBridge *bridge, const HallidayBridgeState *state,
                                              bool notify_game, uint32_t motion_mask);
+/* Optional orientation declaration: 0 legacy/mouse, 1 existing Sense AIM frame.
+   Old APIs remain valid and clear tags; v6 fields/positions/velocities unchanged. */
+void halliday_bridge_publish_frame_with_controller_frames(const HallidayGameBridge *bridge,
+    const HallidayBridgeState *state, bool notify_game, uint32_t motion_mask,
+    uint32_t left_frame, uint32_t right_frame);
 bool halliday_bridge_begin_read(const HallidayGameBridge *bridge, HallidayBridgeFrame *out);
 void halliday_bridge_end_read(const HallidayGameBridge *bridge);
 uint8_t *halliday_bridge_base(const HallidayGameBridge *bridge);

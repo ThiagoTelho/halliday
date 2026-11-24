@@ -187,7 +187,7 @@ bool spacePanelOrigin(XrSession session,XrSpace space,XrTime time,XrPosef* pose,
     if(!getActionPoseSource(session,record.action,record.subactionPath,&hand,&aim)||hand>=2)return false;
     ControlInputSnapshot input{};
     if(!controlInputSnapshot(session,&input,time)||!input.controllers[hand].poseActive)return false;
-    *pose=poseCompose(input.controllers[hand].poseInLocal,record.pose);return true;
+    *pose=poseCompose(aim ? input.controllers[hand].aimPoseInLocal : input.controllers[hand].poseInLocal,record.pose);return true;
 }
 
 bool spacePoseInLocal(XrSession session, XrSpace space, XrTime time, XrPosef* pose) {
@@ -437,12 +437,12 @@ XrResult XRAPI_CALL locateSpace(
         controlInputSnapshot(target.session, &input, time);
 
         auto localFromSpace = [&](const SpaceRecord& record, bool actionResolved,
-                                  uint32_t hand, XrPosef* pose) -> bool {
+                                  uint32_t hand, bool aim, XrPosef* pose) -> bool {
             if (record.kind == SpaceKind::kAction) {
                 if (!actionResolved || hand >= 2 || !input.controllers[hand].poseActive) {
                     return false;
                 }
-                *pose = poseCompose(input.controllers[hand].poseInLocal, record.pose);
+                *pose = poseCompose(aim ? input.controllers[hand].aimPoseInLocal : input.controllers[hand].poseInLocal, record.pose);
                 return true;
             }
             // Only VIEW follows the head. LOCAL has a measured, fixed initial
@@ -463,8 +463,8 @@ XrResult XRAPI_CALL locateSpace(
 
         XrPosef targetInLocal{};
         XrPosef baseInLocal{};
-        if (!localFromSpace(target, targetActionResolved, targetHand, &targetInLocal) ||
-            !localFromSpace(base, baseActionResolved, baseHand, &baseInLocal)) {
+        if (!localFromSpace(target, targetActionResolved, targetHand, targetAim, &targetInLocal) ||
+            !localFromSpace(base, baseActionResolved, baseHand, baseAim, &baseInLocal)) {
             location->locationFlags = 0;
             location->pose = identityPose();
             setChainedSpaceVelocity(
@@ -585,7 +585,7 @@ XrResult XRAPI_CALL locateViews(
         controlInputSnapshot(session, &input, viewLocateInfo->displayTime);
         if (getActionPoseSource(session, base.action, base.subactionPath, &hand, &aim) &&
             hand < 2 && input.controllers[hand].poseActive) {
-            baseInLocal = poseCompose(input.controllers[hand].poseInLocal, base.pose);
+            baseInLocal = poseCompose(aim ? input.controllers[hand].aimPoseInLocal : input.controllers[hand].poseInLocal, base.pose);
             baseTracked = true;
         }
     }

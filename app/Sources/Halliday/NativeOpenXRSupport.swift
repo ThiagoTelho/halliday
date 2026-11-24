@@ -88,6 +88,9 @@ enum NativeOpenXRSupport {
                                   root: URL = GameBridge.folder, displayHz: Float?) throws -> [String: String] {
         var environment = inherited
         environment["HALLIDAY_BRIDGE"] = root.appendingPathComponent("halliday-bridge.shm").path
+        // The verified OpenVR guest consumes Touch raw-device poses. Preserve an
+        // explicit rollback; runtime identity/version also gates the conversion.
+        environment["HALLIDAY_ALYX_TOUCH_RAW_POSE"] = inherited["HALLIDAY_ALYX_TOUCH_RAW_POSE"] == "0" ? "0" : "1"
         if let displayHz {
             guard displayHz.isFinite, (20...240).contains(displayHz) else { throw LaunchFailure("The native game's frame rate is invalid.") }
             environment["HALLIDAY_DISPLAY_HZ"] = String(format: "%.6g", Double(displayHz))

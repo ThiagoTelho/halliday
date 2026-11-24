@@ -1657,6 +1657,27 @@ pub unsafe extern "C" fn halliday_bridge_publish_frame_with_motion(
     }
 }
 
+/// Optional per-hand canonical orientation frame, paired with this state.
+/// Unknown declarations retain legacy behavior; no position is transformed.
+/// # Safety
+/// Same pointer requirements as `halliday_bridge_publish_frame`.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_publish_frame_with_controller_frames(
+    bridge: *const HallidayGameBridge,
+    state: *const HallidayBridgeState,
+    notify_game: bool,
+    motion_mask: u32,
+    left_frame: u32,
+    right_frame: u32,
+) {
+    if let (Some(b), Some(s)) = unsafe { (bridge.as_ref(), state.as_ref()) } {
+        use halliday_bridge::controller_frames::FrameKind;
+        b.0.publish_frame_with_controller_frames(s, notify_game, motion_mask,
+            [FrameKind::from_wire(left_frame).unwrap_or(FrameKind::Legacy),
+             FrameKind::from_wire(right_frame).unwrap_or(FrameKind::Legacy)]);
+    }
+}
+
 /// Claims the game's newest frame; false if there is none. Release it with `halliday_bridge_end_read`.
 ///
 /// # Safety
@@ -1980,6 +2001,43 @@ pub unsafe extern "C" fn halliday_apk_manifest(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn controller_frames_c_api_pairs_both_hands_and_legacy_publish_clears_tags() {
+        use halliday_bridge::controller_frames::{FrameKind, LEGACY};
+        let folder = std::env::temp_dir().join(format!("halliday-controller-frames-{}-{}",
+            std::process::id(), crate::time::host_time_ns()));
+        std::fs::create_dir(&folder).unwrap();
+        let path = folder.join("bridge.shm");
+        {
+            let config = crate::game_bridge::Config {
+                eye_width: 16, eye_height: 16, display_hz: 120., ipd: 0.063,
+                tangents: [[-1.,1.,1.,-1.];2],
+            };
+            let host = HallidayGameBridge(crate::game_bridge::GameBridge::create(&path, config).unwrap());
+            let game = crate::game_bridge::GameSide::view(&path).unwrap();
+            let mut state = HallidayBridgeState::default();
+            state.controllers[0].pose.orientation = [0.,0.,0.,1.];
+            state.controllers[1].pose.orientation = [0.1,0.2,0.3,0.92736185];
+            state.controllers[0].pose.position = [0.2,0.6,-0.5];
+            state.controllers[1].pose.velocity = [0.3,-0.4,0.1];
+            // SAFETY: every non-null pointer refers to the owned live objects above.
+            unsafe {
+                halliday_bridge_publish_frame_with_controller_frames(std::ptr::null(), &state, false, 63, 1, 1);
+                halliday_bridge_publish_frame_with_controller_frames(&host, std::ptr::null(), false, 63, 1, 1);
+                halliday_bridge_publish_frame_with_controller_frames(&host, &state, false, 23, 1, 0);
+            }
+            assert_eq!(game.state_snapshot_with_controller_frames(), Some((state,23,[FrameKind::SenseAim,FrameKind::Legacy])));
+            unsafe { halliday_bridge_publish_frame_with_controller_frames(&host,&state,false,42,0,1) };
+            assert_eq!(game.state_snapshot_with_controller_frames(), Some((state,42,[FrameKind::Legacy,FrameKind::SenseAim])));
+            unsafe { halliday_bridge_publish_frame_with_controller_frames(&host,&state,false,63,99,1) };
+            assert_eq!(game.state_snapshot_with_controller_frames(), Some((state,63,[FrameKind::Legacy,FrameKind::SenseAim])));
+            unsafe { halliday_bridge_publish_frame_with_motion(&host,&state,false,15) };
+            assert_eq!(game.state_snapshot_with_controller_frames(), Some((state,15,LEGACY)));
+            assert_eq!(game.state_snapshot_with_motion(), Some((state,15)));
+        }
+        std::fs::remove_dir_all(folder).unwrap();
+    }
 
     #[test]
     fn camera_identity_c_buffer_is_bounded_and_unchanged_on_failure() {

@@ -16,7 +16,7 @@ inline uint32_t mask(const Header* header,uint32_t sequence) {
     if(ext->magic!=kMagic||ext->version!=kVersion||!(ext->flags.load(std::memory_order_relaxed)&kExplicit))return kAll;
     return ext->stateSequence.load(std::memory_order_relaxed)==sequence?ext->mask.load(std::memory_order_relaxed)&kAll:0;
 }
-inline bool readState(const Header* header,State* state,uint32_t* validity) {
+inline bool readState(const Header* header,State* state,uint32_t* validity,uint32_t* sequence=nullptr) {
     for(unsigned retry=0;retry<64;++retry) {
         const auto before=header->stateSeq.load(std::memory_order_acquire);if(before&1)continue;
         auto* dst=reinterpret_cast<uint8_t*>(state);
@@ -24,7 +24,7 @@ inline bool readState(const Header* header,State* state,uint32_t* validity) {
         for(size_t i=0;i<sizeof(State);++i)dst[i]=src[i];
         const auto bits=mask(header,before);
         std::atomic_thread_fence(std::memory_order_acquire);
-        if(before==header->stateSeq.load(std::memory_order_relaxed)){if(validity)*validity=bits;return true;}
+        if(before==header->stateSeq.load(std::memory_order_relaxed)){if(validity)*validity=bits;if(sequence)*sequence=before;return true;}
     }
     return false;
 }

@@ -216,6 +216,7 @@ final class GameBridge {
         var menu: Bool
         /// Existing measured room motion, separate from the calibrated aim pose.
         var motion: GameControllerMotion = .stationary
+        var poseFrame: GameControllerPoseFrame = .legacy
     }
     /// Right, left (as `trigger`), set every frame by the app while a controller is held and a
     /// game has the input; nil: the hand the mouse and keyboard stand in for.
@@ -513,6 +514,7 @@ final class GameBridge {
                 bodyOrientation: given.orientation, originTurn: originTurn),
             linear: toGame.act(given.linearVelocity))
         var motionMask = given.motionFlags & 3
+        var controllerFrames = [GameControllerPoseFrame.legacy, .legacy]
         // Numbered, so a frame's pose tells when it was published (`poseAges`).
         stamp = stamp >= 0xFF_FFFF ? 1 : stamp + 1
         state.head.stamp = Float(stamp)
@@ -531,6 +533,7 @@ final class GameBridge {
             if let real = realHands[hand] {
                 at = real.position
                 turn = real.orientation
+                controllerFrames[i] = real.poseFrame
             } else if let aim = aims[hand] {
                 // Placed by the mouse: from the shoulder, turned with the body.
                 turn = heading * simd_quatf(angle: aim.yaw, axis: [0, 1, 0]) * simd_quatf(angle: aim.pitch, axis: [1, 0, 0])
@@ -595,7 +598,8 @@ final class GameBridge {
             c.axes.2.0 = input.grip
             if i == 1 { state.controllers.1 = c } else { state.controllers.0 = c }
         }
-        halliday_bridge_publish_frame_with_motion(b, &state, notifyGame, motionMask)
+        halliday_bridge_publish_frame_with_controller_frames(b, &state, notifyGame, motionMask,
+            controllerFrames[0].rawValue, controllerFrames[1].rawValue)
 
         var client = HallidayBridgeClient()
         halliday_bridge_client(b, &client)

@@ -40,6 +40,7 @@ struct ControlControllerState {
     // Legacy upstream field names: these now carry Halliday sample stamps.
     uint64_t questTimestampNanoseconds,profileId;
     XrPosef poseInLocal;
+    XrPosef aimPoseInLocal;
     XrVector3f linearVelocity,angularVelocity;
     uint32_t motionFlags;
     float triggerValue; // measured pressure, independent of the digital click

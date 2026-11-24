@@ -19,10 +19,12 @@ Reference: Monado revision `2069b76b3a66fb5916e3cedae84d9524c1ebab4a`:
 In Halliday's unchanged sensor axes the resolved AIM chain is
 `qIMU × Rx(50.2703°) × Rx(39°) × Rx(-39.4°)`.
 
-This corrects Halliday's existing **aim-derived** shared game frame. It does not
-implement Monado's distinct grip frame, copy its translations, or establish a
-measured anatomical wrist angle. Physical acceptance in a game remains separate
-from the source-chain and rotation regressions.
+This defines Halliday's existing **aim-derived** shared orientation. The optional
+controller-frame contract now lets OpenXR resolve its distinct grip orientation
+at the action binding, without changing the host, pointer or OpenVR orientation.
+It copies no reference translations and establishes no measured anatomical wrist
+angle. See [controller orientation frames](controller-pose-frames.md). Physical
+acceptance in a game remains separate from source-chain and rotation regressions.
 
 Validation: `tools/test-game-controller-alignment.sh` compares the complete
 reference chain across yaw/pitch/roll and previous pointer calibrations. It also

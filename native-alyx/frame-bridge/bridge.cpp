@@ -43,7 +43,7 @@ int main() {
 
  LOAD(xrPollEvent);LOAD(xrBeginSession);LOAD(xrEndSession);LOAD(xrCreateReferenceSpace);LOAD(xrDestroySpace);LOAD(xrEnumerateViewConfigurationViews);LOAD(xrEnumerateSwapchainFormats);LOAD(xrCreateSwapchain);LOAD(xrEnumerateSwapchainImages);LOAD(xrDestroySwapchain);LOAD(xrWaitFrame);LOAD(xrBeginFrame);LOAD(xrEndFrame);LOAD(xrLocateViews);LOAD(xrAcquireSwapchainImage);LOAD(xrWaitSwapchainImage);LOAD(xrReleaseSwapchainImage);
  XrReferenceSpaceCreateInfo rsi{XR_TYPE_REFERENCE_SPACE_CREATE_INFO};rsi.referenceSpaceType=XR_REFERENCE_SPACE_TYPE_LOCAL;rsi.poseInReferenceSpace.orientation.w=1;XrSpace space;check(xrCreateReferenceSpace(session,&rsi,&space),"local tracking space");
- NativeControllers controllers;controllers.init(instance,session,gipa);
+ NativeControllers controllers;controllers.init(instance,session,gipa,halliday::alyx::touch_raw::forRuntime(properties,getenv("HALLIDAY_ALYX_TOUCH_RAW_POSE")));
  uint32_t vc=0;check(xrEnumerateViewConfigurationViews(instance,system,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,0,&vc,nullptr),"view count");if(vc!=2){puts("Expected stereo");return 4;}std::vector<XrViewConfigurationView> views(vc,{XR_TYPE_VIEW_CONFIGURATION_VIEW});check(xrEnumerateViewConfigurationViews(instance,system,XR_VIEW_CONFIGURATION_TYPE_PRIMARY_STEREO,vc,&vc,views.data()),"view sizes");
  uint32_t fc=0;check(xrEnumerateSwapchainFormats(session,0,&fc,nullptr),"format count");std::vector<int64_t> formats(fc);check(xrEnumerateSwapchainFormats(session,fc,&fc,formats.data()),"formats");int64_t format=0;for(auto f:formats)if(f==VK_FORMAT_B8G8R8A8_UNORM||f==VK_FORMAT_R8G8B8A8_UNORM){format=f;break;}if(!format){puts("No supported color format");return 4;}
  XrSwapchain chains[2]{};std::vector<XrSwapchainImageVulkan2KHR> images[2];

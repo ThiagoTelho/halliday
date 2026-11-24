@@ -80,6 +80,7 @@ impl Fixture {
                     swapchains: HashMap::new(),
                     newest: Some(state),
                     newest_motion: bridge::motion::ALL,
+                    newest_controller_frames: bridge::controller_frames::LEGACY,
                     pose_samples: Default::default(),
                     pose_epoch_start: 0,
                     pose_latest_time: 0,
@@ -1092,6 +1093,66 @@ fn heartbeat_keeps_loading_client_alive_and_joins_before_release() {
     let stopped = f._host.client().heartbeat;
     std::thread::sleep(Duration::from_millis(230));
     assert_eq!(f._host.client().heartbeat, stopped);
+}
+
+#[test]
+fn controller_frames_public_actions_keep_grip_aim_offsets_motion_and_historical_tags_together() {
+    use bridge::controller_frames::FrameKind;
+    let _lock = crate::TEST_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let f = Fixture::new();
+    let set = set();
+    let hands = [path("/user/hand/left"),path("/user/hand/right")];
+    let grip = action(set,xr::ActionType::POSE_INPUT,&hands);
+    let aim = action(set,xr::ActionType::POSE_INPUT,&hands);
+    assert_eq!(bind(&[(grip,"/user/hand/left/input/grip/pose"),
+        (grip,"/user/hand/right/input/grip/pose"),(aim,"/user/hand/left/input/aim/pose"),
+        (aim,"/user/hand/right/input/aim/pose")]),xr::Result::SUCCESS);
+    attach(set); events();
+    f.state(|s| for c in &mut s.controllers {
+        c.pose.velocity=[0.3,0.4,0.5]; c.pose.angular_velocity=[0.,2.,0.];
+    });
+    let state = with(|r| r.session.as_ref().unwrap().newest.unwrap());
+    f._host.publish_frame_with_controller_frames(&state,false,63,[FrameKind::SenseAim;2]);
+    assert_eq!(sync(&[(set,xr::Path::NULL)]),xr::Result::SUCCESS);
+    let grips=hands.map(|h|space(grip,h,IDENTITY).unwrap());
+    let aims=hands.map(|h|space(aim,h,IDENTITY).unwrap());
+    let offset=xr::Posef{position:vector([0.,0.,-0.1]),..IDENTITY};
+    let offsets=hands.map(|h|space(grip,h,offset).unwrap());
+    let mut frame:xr::FrameState=unsafe{std::mem::zeroed()};
+    assert_eq!(unsafe{wait_frame(session(),std::ptr::null(),&mut frame)},xr::Result::SUCCESS);
+    let time=frame.predicted_display_time.as_nanos();
+    let grip_rotation=xr::Quaternionf{x:0.5,y:0.,z:0.,w:0.8660254};
+    let stage=xr::Space::from_raw(0x300);
+    for hand in 0..2 {
+        let source=from_bridge(&state.controllers[hand].pose);
+        let expected=xr::Posef{orientation:grip_rotation,..source};
+        near(locate_at(grips[hand],time).pose,expected);
+        near(locate_at(aims[hand],time).pose,source);
+        near(locate_at(offsets[hand],time).pose,compose(expected,offset));
+        let mut velocity:xr::SpaceVelocity=unsafe{std::mem::zeroed()};
+        velocity.ty=xr::SpaceVelocity::TYPE;
+        let mut out=xr::SpaceLocation{ty:xr::SpaceLocation::TYPE,
+            next:(&mut velocity as *mut xr::SpaceVelocity).cast(),
+            location_flags:xr::SpaceLocationFlags::EMPTY,pose:IDENTITY};
+        assert_eq!(unsafe{locate_space(grips[hand],aims[hand],xr::Time::from_nanos(time),&mut out)},xr::Result::SUCCESS);
+        near(out.pose,xr::Posef{orientation:grip_rotation,..IDENTITY});
+        assert!(near_vector(velocity.linear_velocity,[0.;3]));
+        assert!(near_vector(velocity.angular_velocity,[0.;3]));
+        assert_eq!(unsafe{locate_space(offsets[hand],stage,xr::Time::from_nanos(time),&mut out)},xr::Result::SUCCESS);
+        assert!(near_vector(velocity.linear_velocity,[0.2,0.4,0.5]));
+        assert!(near_vector(velocity.angular_velocity,[0.,2.,0.]));
+    }
+    // An old API/mouse publication resets tags for new samples. Cached old
+    // display-time samples must retain their own type, pose and velocity.
+    f._host.publish_frame_with_motion(&state,false,63);
+    for hand in 0..2 {
+        near(locate_at(grips[hand],time+1).pose,from_bridge(&state.controllers[hand].pose));
+        assert!((locate_at(grips[hand],time).pose.orientation.x-0.5).abs()<1e-6);
+    }
+}
+
+fn near_vector(actual:xr::Vector3f,expected:[f32;3])->bool {
+    [actual.x,actual.y,actual.z].into_iter().zip(expected).all(|(a,b)|(a-b).abs()<1e-6)
 }
 
 #[test]

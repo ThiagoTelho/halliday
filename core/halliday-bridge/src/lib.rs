@@ -26,6 +26,7 @@
 
 #![no_std]
 
+pub mod controller_frames;
 pub mod focus;
 pub mod glsl;
 pub mod haptics;
@@ -538,6 +539,20 @@ pub unsafe fn publish_with_motion(
     notify_game: bool,
     mask: Option<u32>,
 ) {
+    unsafe { publish_with_controller_frames(h, state, notify_game, mask, controller_frames::LEGACY) };
+}
+
+/// Candidate optional per-hand orientation-frame declaration. Existing callers
+/// publish Legacy so old/mouse poses never inherit a preceding Sense tag.
+/// # Safety
+/// Same complete mapping/single-writer requirements as `publish_with_motion`.
+pub unsafe fn publish_with_controller_frames(
+    h: *mut Header,
+    state: &State,
+    notify_game: bool,
+    mask: Option<u32>,
+    frames: [controller_frames::FrameKind; 2],
+) {
     // SAFETY: `h` is valid (caller); the atomics may be shared.
     let (seq, vsync) = unsafe { (&(*h).state_seq, &(*h).vsync_count) };
     let s = seq.load(Ordering::Relaxed) | 1;
@@ -546,6 +561,7 @@ pub unsafe fn publish_with_motion(
     // SAFETY: Halliday is the only writer of `state`; readers retry on a torn read.
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!((*h).state), *state) };
     unsafe { motion::extension(h) }.publish(s.wrapping_add(1), mask);
+    unsafe { controller_frames::write(h, s.wrapping_add(1), frames) };
     seq.store(s.wrapping_add(1), Ordering::Release);
     if notify_game {
         vsync.fetch_add(1, Ordering::SeqCst);
@@ -564,6 +580,16 @@ pub unsafe fn read_state(h: *const Header) -> Option<State> {
 /// # Safety
 /// The caller maps the complete v6 bridge header, including reserved bytes.
 pub unsafe fn read_state_with_motion(h: *const Header) -> Option<(State, u32)> {
+    unsafe { read_state_with_controller_frames(h) }.map(|(state, mask, _)| (state, mask))
+}
+
+/// Reads state, velocity validity and optional orientation declarations from
+/// one publication. Legacy/unknown declarations never trigger a conversion.
+/// # Safety
+/// Complete v6 mapping, including its reserved extension bytes.
+pub unsafe fn read_state_with_controller_frames(
+    h: *const Header,
+) -> Option<(State, u32, [controller_frames::FrameKind; 2])> {
     // SAFETY: `h` is valid (caller).
     let seq = unsafe { &(*h).state_seq };
     for _ in 0..64 {
@@ -575,9 +601,10 @@ pub unsafe fn read_state_with_motion(h: *const Header) -> Option<(State, u32)> {
         // SAFETY: a copy, validated by the sequence check below.
         let s = unsafe { core::ptr::read_volatile(core::ptr::addr_of!((*h).state)) };
         let mask = unsafe { motion::extension(h) }.read(a);
+        let frames = unsafe { controller_frames::read(h, a) }.unwrap_or(controller_frames::LEGACY);
         fence(Ordering::Acquire);
         if seq.load(Ordering::Relaxed) == a {
-            return Some((s, mask));
+            return Some((s, mask, frames));
         }
     }
     None

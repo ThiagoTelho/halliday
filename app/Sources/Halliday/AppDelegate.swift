@@ -1915,7 +1915,7 @@ if !open, passthroughForVideo {
                     trigger: state.trigger, triggerPressed: state.buttons.contains(.trigger), grip: state.buttons.contains(.grip),
                     stick: adjusting ? .zero : state.stick, stickClick: state.buttons.contains(.stick), stickTouch: state.buttons.contains(.stickTouch),
                     lower: state.buttons.contains(.lower), upper: state.buttons.contains(.upper), menu: state.buttons.contains(.menu),
-                    motion: gameHandMotion(hand, state: state, now: now))
+                    motion: gameHandMotion(hand, state: state, now: now), poseFrame: .senseAim)
                 continue
             }
             game?.realHands[slot] = nil

@@ -65,7 +65,7 @@ print('PASS: producer-bound target remains sticky after death/PID reuse; new pro
 bridge = (root / 'app/Sources/Halliday/GameBridge.swift').read_text()
 tick = body(bridge, 'func tick(head:')
 assert tick.index('if let real = realHands[hand]') < tick.index('let input = inputRearm[hand].filter')
-assert tick.index('c.axes.2.0 = input.grip') < tick.index('halliday_bridge_publish_frame_with_motion')
+assert tick.index('c.axes.2.0 = input.grip') < tick.index('halliday_bridge_publish_frame_with_controller_frames')
 assert 'inputRearm[hand].setFocused(!shown)' in body(bridge, 'func setDashboard(')
 assert bridge.count('inputRearm = [GameControllerInputRearm(), GameControllerInputRearm()]') == 2
 print('PASS: central per-hand rearm filters assembled real/emulated controls before independent publication, follows dashboard focus, and resets for the next producer')

@@ -42,3 +42,36 @@ VeRantyx port. It has no dependency on an external source checkout.
 `SOURCE.json` records the original source hashes. The copied source is covered
 by `Native-Alyx-Bridge-MIT.txt`; the Khronos negotiation header retains its
 MIT/Apache SPDX notice. `OpenVR-BSD.txt` preserves the upstream attribution.
+
+## Native Touch controller-frame boundary
+
+The verified guest advertises Oculus Touch and binds its hand action poses to
+OpenVR `/pose/raw`. The intermediate adapter receives OpenXR `/input/grip/pose`.
+These frames differ: the Touch model puts its OpenXR grip at local X rotation
++20.6 degrees and a mirrored model origin relative to raw. The adapter therefore
+composes the inverse component before publishing the guest raw pose. World
+angular velocity is unchanged; known linear velocity moves to the new origin
+with the angular-velocity lever arm. Without known angular motion, the old
+raw-origin finite-difference fallback remains responsible for linear velocity.
+
+This clean-room math uses numeric frame metadata, not OpenComposite code. See
+[the pinned primary profile](https://github.com/GameNative/opencomposite/blob/35c2ce526ed1c9460924b1c2880def198f63a7b7/OpenOVR/Misc/Input/OculusInteractionProfile.cpp#L85).
+The guest's existing Touch wrist skeleton already uses the standard OpenHand
+root and does not cancel this missing basis conversion.
+
+Only the exact currently verified independent runtime identity, `Halliday`
+version `0.0.1`, enables this boundary. The launcher supplies
+`HALLIDAY_ALYX_TOUCH_RAW_POSE=1`, preserving an explicit `0` rollback. An ordinary
+launch without the flag uses the same negotiated runtime properties. A legacy/unknown runtime or version preserves
+its prior adapter behavior, including with a stale inherited opt-in. An explicit
+direct value other than `1` disables the conversion. No game launcher or game settings are
+modified, and common Sense mounting, OpenXR poses and Windows consumers stay
+unchanged.
+
+The reported visual estimate of about 7 degrees is not used as a calibration.
+The demonstrated raw/grip basis difference is 20.6 degrees. The full raw origin
+moves about 102 mm as required by the Touch model; the existing guest wrist bone
+then composes from raw. The host currently preserves its natural controller
+origin when declaring Sense API axes, so actual wrist position and orientation
+still require a native headset check. CPU frame-contract success alone does not
+establish anatomical hand alignment.
