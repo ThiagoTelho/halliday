@@ -23,7 +23,8 @@ def save():
 def run(name, fsr, rcas, percent=80, extra=()):
     command = [str(exe), '--game-image-render-snapshot', str(output / (name + '.png')),
                '--game-image-input-percent', str(percent),
-               '-gameFSREnabled', 'YES' if fsr else 'NO',
+               '-gameSpacewarpEnabled', 'NO',
+                '-gameFSREnabled', 'YES' if fsr else 'NO',
                '-gameSharpeningEnabled', 'YES' if rcas else 'NO',
                '-gameRenderPercent', str(percent), '-gameSharpness', '0.6', *extra]
     result = subprocess.run(command, capture_output=True, timeout=45)

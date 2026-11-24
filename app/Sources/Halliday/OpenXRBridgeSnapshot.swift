@@ -30,8 +30,8 @@ func runOpenXRBridgeSnapshot(path: String, arguments: [String]) {
         try require(arguments.contains("--copy-frames"), "Acceptance must never create a virtual display or screen capture")
         try require(NativeOpenXRSupport.selectedBackend == .halliday, "Acceptance must use the independent public bridge")
         let settings = Settings.shared
-        try require(!settings.gameFSREnabled && !settings.gameSharpeningEnabled &&
-            !settings.gameHalfFrameRate && settings.gameRenderPercent == 100, "Use command-line image defaults for the pixel oracle")
+        try require(!settings.gameFSREnabled && !settings.gameSharpeningEnabled && !settings.gameSpacewarpEnabled &&
+            !settings.effectiveGameHalfFrameRate && settings.gameRenderPercent == 100, "Use command-line image defaults for the pixel oracle")
         guard let producerPath = value("--panel-producer"), let device = MTLCreateSystemDefaultDevice() else {
             throw Failure(message: "Missing fixture producer or Metal device")
         }

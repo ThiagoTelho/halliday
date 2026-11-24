@@ -1,0 +1,3 @@
+
+# Preserve generated AMD shader bytes for the pinned output hashes.
+app/Resources/amd-optical-flow/*.metal whitespace=-blank-at-eol,-blank-at-eof

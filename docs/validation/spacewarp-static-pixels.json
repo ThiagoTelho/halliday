@@ -1,0 +1,146 @@
+{
+  "scope": "Synthetic GPU pixel correctness with genuine production AMD Optical Flow and independent production synthesis; not a game FPS, optical-latency or physical headset result",
+  "captured_date": "2026-11-24",
+  "units": {
+    "RGB_error": "absolute 8-bit channel levels",
+    "changed_pixels": "maximum per output, stereo pixels"
+  },
+  "before": [
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 0,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 2,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 2016,
+      "height": 2048,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 8257536,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 4200,
+      "changed_pixels_over_one_level_max": 4200,
+      "max_rgb_error": 206
+    },
+    {
+      "eye_width": 2016,
+      "height": 2048,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+      "pixel_count": 8257536,
+      "changed_pixels_any_max": 155337,
+      "changed_pixels_over_one_level_max": 155277,
+      "max_rgb_error": 206
+    }
+  ],
+  "after": [
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 0,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 2,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 2016,
+      "height": 2048,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0,
+      "pixel_count": 8257536,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 512,
+      "height": 512,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+      "pixel_count": 524288,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    },
+    {
+      "eye_width": 2016,
+      "height": 2048,
+      "pattern": 1,
+      "frames": 10,
+      "head_locked_menu_camera_yaw_jitter_deg": 0.05,
+      "pixel_count": 8257536,
+      "changed_pixels_any_max": 0,
+      "changed_pixels_over_one_level_max": 0,
+      "max_rgb_error": 0
+    }
+  ],
+  "fixture": "tools/test-game-spacewarp-static-metal.sh",
+  "physical_acceptance": "Pending a new headset test after these guards; previous judder/ghosting reports are not considered resolved by synthetic tests"
+}

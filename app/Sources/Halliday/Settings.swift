@@ -122,6 +122,12 @@ final class Settings {
         didSet { defaults.set(gameHalfFrameRate, forKey: "gameHalfFrameRate"); onChange?() }
     }
 
+    /// Optional in-between game frames; its cadence always requires half-rate rendering.
+    var gameSpacewarpEnabled: Bool {
+        didSet { defaults.set(gameSpacewarpEnabled, forKey: "gameSpacewarpEnabled"); onChange?() }
+    }
+    var effectiveGameHalfFrameRate: Bool { gameHalfFrameRate || gameSpacewarpEnabled }
+
     enum NativeOpenXRBackend: String, CaseIterable, Identifiable, Sendable {
         case halliday = "halliday"
         var id: String { rawValue }
@@ -131,6 +137,12 @@ final class Settings {
     /// Native games use Halliday's source-built runtime.
     var nativeOpenXRBackend: NativeOpenXRBackend {
         didSet { defaults.set(nativeOpenXRBackend.rawValue, forKey: "nativeOpenXRBackend"); onChange?() }
+    }
+
+    /// Turning the effect off leaves the chosen cadence in place for live switching.
+    func setGameSpacewarp(_ enabled: Bool) {
+        if enabled, !gameHalfFrameRate { gameHalfFrameRate = true }
+        if gameSpacewarpEnabled != enabled { gameSpacewarpEnabled = enabled }
     }
 
     /// Percentage of the full game image rendered by the game, in five-percent steps.
@@ -171,6 +183,7 @@ final class Settings {
         gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
         gameHalfFrameRate = defaults.bool(forKey: "gameHalfFrameRate")
+        gameSpacewarpEnabled = defaults.bool(forKey: "gameSpacewarpEnabled")
         nativeOpenXRBackend = defaults.string(forKey: "nativeOpenXRBackend").flatMap(NativeOpenXRBackend.init(rawValue:)) ?? .halliday
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)

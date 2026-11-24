@@ -23,7 +23,7 @@ when disabled. FSR 1 is spatial reconstruction, not temporal anti-aliasing.
 
 ## Image and lifetime contract
 
-Game projection → optional display-colour preparation → EASU/RCAS → existing
+Game projection → optional Spacewarp prediction → display-colour preparation → EASU/RCAS → existing
 latest-head reprojection → lens correction → display.
 
 The shared renderer processes opaque, full-frame side-by-side game images.
@@ -70,3 +70,5 @@ run during a measured game benchmark. CPU/typecheck results do not establish
 visual quality, game FPS or physical headset acceptance.
 
 Game cadence and physical refresh controls are described in [game-cadence.md](game-cadence.md).
+
+Experimental image-only frame prediction and its independent live switch are described in [game-spacewarp.md](game-spacewarp.md). It is off by default; FSR and RCAS remain independent.

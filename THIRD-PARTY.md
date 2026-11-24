@@ -33,6 +33,17 @@ RCAS sharpener (v1.20210629), translated to Metal with separate bounds for each
 eye. The source and full AMD notice ship in `Contents/Resources/fsr1/`.
 The additional colour-preparation pass is local Halliday integration code.
 
+## AMD FidelityFX Optical Flow
+
+https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+
+Optional Spacewarp uses AMD's MIT-licensed Optical Flow 1.1.2 from FidelityFX SDK
+v1.1.4, translated from the original HLSL programs through SPIR-V to Metal 3.2.
+The complete notice and pinned shader provenance ship in
+`Contents/Resources/amd-optical-flow/`. The stereo adapter, forward-prediction
+shader, cadence and compositor integration are local Halliday code. No GPL
+FrameGen/OFXR composition code is included.
+
 ## Monado
 
 https://gitlab.freedesktop.org/monado/monado

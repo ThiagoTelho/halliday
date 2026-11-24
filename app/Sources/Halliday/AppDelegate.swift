@@ -2798,6 +2798,7 @@ if !open, passthroughForVideo {
     /// Applies the settings that take effect at once (the rest are read where they are used).
     private func applySettings() {
         let s = Settings.shared
+        renderer?.prepareSpacewarpIfEnabled()
         Motion.reduced = s.reduceMotion
         windowManager?.remembersLayouts = s.rememberLayouts
         let ipd = renderer?.ipd ?? 0.064
@@ -2832,9 +2833,9 @@ if !open, passthroughForVideo {
     private func scheduleGameImageReconfiguration() {
         gameImageReconfiguration?.cancel()
         gameImageReconfiguration = nil
-        if let game { game.setHalfFrameRate(Settings.shared.gameHalfFrameRate) }
+        if let game { game.setHalfFrameRate(Settings.shared.effectiveGameHalfFrameRate) }
         guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
-            || game.halfFrameRate != Settings.shared.gameHalfFrameRate
+            || game.halfFrameRate != Settings.shared.effectiveGameHalfFrameRate
             || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return }
         let work = DispatchWorkItem { [weak self] in
             guard let self else { return }
@@ -2847,7 +2848,7 @@ if !open, passthroughForVideo {
     @discardableResult
     private func applyGameImageReconfiguration() -> Bool {
         guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
-            || game.halfFrameRate != Settings.shared.gameHalfFrameRate
+            || game.halfFrameRate != Settings.shared.effectiveGameHalfFrameRate
             || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return true }
         guard !pendingNativeAlyxLaunch, !nativeAlyxLauncher.isRunning,
               pendingCrossOverLaunches.isEmpty, !GameLibrary.shared.hasPendingLaunch else { return false }

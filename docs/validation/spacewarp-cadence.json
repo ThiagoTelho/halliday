@@ -1,0 +1,52 @@
+{
+  "scope": "Synthetic CPU scheduler replay; no game, GPU or headset",
+  "fixture": "tools/test-game-spacewarp-cadence.sh",
+  "marker_units": "arbitrary image coordinate; latest real position20, already shown forecast25",
+  "display_rates_hz": {
+    "90.0": {
+      "before_backward_steps": 1,
+      "after_backward_steps": 0,
+      "before_positions": [
+        25,
+        25,
+        20,
+        20,
+        20,
+        20,
+        20
+      ],
+      "after_positions": [
+        25,
+        25,
+        25,
+        25,
+        25,
+        25,
+        25
+      ]
+    },
+    "120.0": {
+      "before_backward_steps": 1,
+      "after_backward_steps": 0,
+      "before_positions": [
+        25,
+        25,
+        25,
+        20,
+        20,
+        20,
+        20
+      ],
+      "after_positions": [
+        25,
+        25,
+        25,
+        25,
+        25,
+        25,
+        25
+      ]
+    }
+  },
+  "physical_acceptance": "Pending"
+}

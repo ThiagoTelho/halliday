@@ -65,11 +65,13 @@ $(BUILD)/halliday: $(SWIFT_SRCS) $(CORE_LIB) $(SPARKLE) core/halliday-core/inclu
 		-framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework ApplicationServices -framework WebKit -framework AVFoundation -framework CoreGraphics -framework IOKit -framework CoreFoundation -framework Security \
 		$(SWIFT_SRCS) -o $@
 
-$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns app/Halliday-dev.entitlements docs/extensions.md $(wildcard extensions/example/*) $(wildcard app/Resources/fsr1/*)
+$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns app/Halliday-dev.entitlements docs/extensions.md $(wildcard extensions/example/*) $(wildcard app/Resources/fsr1/*) $(wildcard app/Resources/amd-optical-flow/*) $(wildcard app/Resources/spacewarp/*)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp app/Info.plist $(APP)/Contents/Info.plist
 	cp app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns $(APP)/Contents/Resources/
 	rm -rf $(APP)/Contents/Resources/fsr1 && cp -R app/Resources/fsr1 $(APP)/Contents/Resources/fsr1
+	rm -rf $(APP)/Contents/Resources/amd-optical-flow $(APP)/Contents/Resources/spacewarp
+	cp -R app/Resources/amd-optical-flow app/Resources/spacewarp $(APP)/Contents/Resources/
 	@# The extensions guide and example, for the companion (docs/extensions.md).
 	cp docs/extensions.md $(APP)/Contents/Resources/extensions.md
 	rm -rf $(APP)/Contents/Resources/extension-example && cp -R extensions/example $(APP)/Contents/Resources/extension-example
@@ -284,3 +286,10 @@ windows-haptic-feed-check:
 system-game-audio-check:
 	bash tools/test-system-game-audio.sh
 	bash tools/test-system-game-audio-settings.sh
+
+# CPU-only feature checks. GPU fixtures are explicit separate tools.
+.PHONY: spacewarp-check
+spacewarp-check:
+	bash tools/test-game-spacewarp-cadence.sh
+	bash tools/test-game-spacewarp-settings.sh
+	python3 tools/test-amd-optical-flow-provenance.py

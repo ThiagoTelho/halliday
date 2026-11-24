@@ -1,0 +1,69 @@
+{
+  "repository": "https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK",
+  "revision": "c6efa6bf7f2027b3ec94f28578bb5965eabb9e55",
+  "sdk_tag": "v1.1.4",
+  "effect_version": "1.1.2",
+  "msl_version": "3.2",
+  "passes": [
+    {
+      "name": "compute_luminance_pyramid",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_compute_luminance_pyramid_pass.hlsl",
+      "hlsl_sha256": "6e999ff6bd10879e015119fdc92403e358a1f772429890dbe3b655bded141b52",
+      "metal_sha256": "a92f21ecb6e4127b6194b2d0b009331cb9a08689062319e372468228063e7cfd"
+    },
+    {
+      "name": "compute_optical_flow_advanced_v5",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_compute_optical_flow_advanced_pass_v5.hlsl",
+      "hlsl_sha256": "c6729ee9032ab6d2e05d567c147b7cb6d4aa7f3b58701057bf6805f277166032",
+      "metal_sha256": "2fd3c6519c585bfb2334040ce234e72c9a062acf71478eb4cb252210afb47e78"
+    },
+    {
+      "name": "compute_scd_divergence",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_compute_scd_divergence_pass.hlsl",
+      "hlsl_sha256": "f6172f5d4cf8bf732e0e041dcb98fa07fce408de328e61dd29bb0314b753fe94",
+      "metal_sha256": "aac5b9f3a16dab34f39cc8f47b349dee1563d5ddf9408cba3889358bd143b209"
+    },
+    {
+      "name": "filter_optical_flow_v5",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_filter_optical_flow_pass_v5.hlsl",
+      "hlsl_sha256": "fdd674553f1af0dbb369db419aacde4b15c81a585bb9bdd7a82c7e3fc1ae1d1d",
+      "metal_sha256": "9d859d4dd9027825263b5ae36e2ab091941ed778620f8025f4edebc7f8fe1a72"
+    },
+    {
+      "name": "generate_scd_histogram",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_generate_scd_histogram_pass.hlsl",
+      "hlsl_sha256": "9b823a2a9a718d59a91643b7d0264d4fe1a153275af9a40146779c7919bafd7e",
+      "metal_sha256": "ad2bdbabadc9799048ac89853e1af4cbc2d072d83956d66c95d732b998673827"
+    },
+    {
+      "name": "prepare_luma",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_prepare_luma_pass.hlsl",
+      "hlsl_sha256": "8025aa36539f2f0fe0d084e22556c5d574129c9514f779ab1236e4dfb27a4473",
+      "metal_sha256": "13cbb2f85a24e70e8d14b0e3100d3eff469a79c456f564da531933b530b15cbb"
+    },
+    {
+      "name": "scale_optical_flow_advanced_v5",
+      "hlsl": "sdk/src/backends/dx12/shaders/opticalflow/ffx_opticalflow_scale_optical_flow_advanced_pass_v5.hlsl",
+      "hlsl_sha256": "2df837bc4eec19aebcb47916190aaad624016015eea2ba0db224cb9ed2a258dd",
+      "metal_sha256": "5b1a66f4567b31f63fb64041b2afc8a688e43e1b1d77779ba775f61ddcb9b21f"
+    }
+  ],
+  "gpu_header_sha256": {
+    "sdk/include/FidelityFX/gpu/ffx_common_types.h": "a19560f837c09f0c990e98b5925b731135d908e372af41c5895cbfa70cc9e5c8",
+    "sdk/include/FidelityFX/gpu/ffx_core.h": "e439aa5f516b2d2ebf070ff1d24561f04fa5f00262a2e4f760764a7d07de7997",
+    "sdk/include/FidelityFX/gpu/ffx_core_gpu_common.h": "0e3c50cb0b4592c051d87e028a1dfa54fbd097942ebb3146964db801dec095d0",
+    "sdk/include/FidelityFX/gpu/ffx_core_gpu_common_half.h": "d10466cbf027c8c23858a25f8e8cbbbf521d29f373db663c9354221651e9a498",
+    "sdk/include/FidelityFX/gpu/ffx_core_hlsl.h": "98722d4b1331c437f5aee645e6f12ed722b721f2ffcb0ec523ee817857f394c7",
+    "sdk/include/FidelityFX/gpu/ffx_core_portability.h": "a7c3a1c213ec083bec401181036cffe7a222af2c430c0bab6bd8c14e83e8a567",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_callbacks_hlsl.h": "9161766e8f639d573591362822b4ff6a06dbbbda4e412ce80d6b7fb12504260b",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_common.h": "9d4b9466bf831e7d4a9c1c3e5e61af4977582c4e24439751eca8b866feadb33a",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_compute_luminance_pyramid.h": "c5cda3dbbceffe27b9837952b04440a3095fb16fbe15092f8568b5b78f6c6d69",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_compute_optical_flow_v5.h": "8360c1840cb067b47485cbef4853392eae5f8826e9de17fa50af746502acb7a0",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_compute_scd_divergence.h": "c254d8777507fccfaffdcaad304d5bd484473c0b19f38e35a3d05396537aa7b6",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_filter_optical_flow_v5.h": "b4818d2e0ad597d2dcfee9c3d4f2b513f483cebb94098012ececc01a7c126a61",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_generate_scd_histogram.h": "0c941d937d2dcb87e423016fb41fe24c39e6b4884c74445e41a276cb282f2351",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_prepare_luma.h": "6f3cec87a8ad0d68c2d8bd78e8b0862eea7143e708580946eea85cfbfe5a32a4",
+    "sdk/include/FidelityFX/gpu/opticalflow/ffx_opticalflow_scale_optical_flow_advanced_v5.h": "8e1f3d2e2b98a25e836e1dadb97fcbba5b0b126a2113f1551be45cdc1e696d4d",
+    "sdk/include/FidelityFX/gpu/spd/ffx_spd.h": "d276f32ee18948cb053c991f3c8821f9664c93f12cb2483dd2978f333bca67b2"
+  }
+}

@@ -223,7 +223,7 @@ final class GameBridge {
         self.queue = queue
         projectionIPD = ipd
         imageRenderPercent = Settings.shared.gameRenderPercent
-        halfFrameRate = Settings.shared.gameHalfFrameRate
+        halfFrameRate = Settings.shared.effectiveGameHalfFrameRate
         frameCadence = GameFrameCadence(physicalHz: displayHz, halfFrameRate: halfFrameRate)
         interval = 1 / Double(frameCadence.physicalHz)
         guard Self.installRuntime() else { return nil }

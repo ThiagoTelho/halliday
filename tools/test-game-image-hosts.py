@@ -40,6 +40,7 @@ for percent, per_eye, half_rate in [(100, (2016, 2048), False),
             process = subprocess.Popen([str(app / 'Contents/MacOS/halliday'),
                 '--no-activate', '--no-companion', '--no-sense', '--ignore-headset',
                 '-gameRenderPercent', str(percent), '-gameHalfFrameRate', 'YES' if half_rate else 'NO',
+                '-gameSpacewarpEnabled', 'NO',
                 '-gameFSREnabled', 'NO',
                 '-gameSharpeningEnabled', 'NO'], stdout=log, stderr=log)
             deadline = time.monotonic() + 25

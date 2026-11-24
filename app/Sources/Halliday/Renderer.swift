@@ -402,6 +402,122 @@ final class Renderer {
     private let library: MTLLibrary
     private var gameUpscaler: GameUpscaler?
     private var gameUpscalerFailed = false
+    private let spacewarpPreparation = GameSpacewarpPreparation()
+    private var spacewarpCadence = GameSpacewarpCadence()
+    private var spacewarpEligible = false
+    private var spacewarpFailureReported = false
+    private struct SpacewarpGeometry: Equatable {
+        var size: SIMD2<Int>
+        var format: UInt
+        var uv: SIMD4<Float>
+        var colours: SIMD2<UInt32>
+        var left: SIMD4<Float>
+        var right: SIMD4<Float>
+        var sourceInterval: Double
+        var cadenceEpoch: UInt64
+    }
+    private var spacewarpGeometry: SpacewarpGeometry?
+    private var spacewarpSourcePose: (sequence: UInt64, orientation: SIMD4<Float>, position: SIMD3<Float>, eyes: ProjectionEyeViews?)?
+    private var spacewarpPredictionKey: SIMD2<UInt64>?
+    private(set) var spacewarpSourceFrames: UInt64 = 0
+    private(set) var spacewarpGeneratedFrames: UInt64 = 0
+    var spacewarpPrepared: Bool { spacewarpPreparation.ready != nil }
+    var spacewarpFailure: String? { spacewarpPreparation.failure }
+
+    func prepareSpacewarpIfEnabled() {
+        if Settings.shared.gameSpacewarpEnabled { spacewarpPreparation.start(device: device) }
+    }
+
+    private func resetSpacewarp() {
+        if spacewarpEligible {
+            spacewarpPreparation.ready?.reset()
+            processedGameKey = nil
+        }
+        spacewarpEligible = false
+        spacewarpCadence.reset()
+        spacewarpGeometry = nil
+        spacewarpSourcePose = nil
+        spacewarpPredictionKey = nil
+    }
+
+    /// Predict only opaque game images whose producer actually negotiated half rate.
+    /// Game pose/FOV remain those of the latest real frame; fresh-head reprojection follows.
+    private func spacewarpProjection(_ original: ProjectionLayer, cb: MTLCommandBuffer) -> ProjectionLayer {
+        guard Settings.shared.gameSpacewarpEnabled, original.gameImage, original.gameHalfRate,
+              !original.seeThrough, original.imageSequence > 0,
+              original.sourceFrameInterval.isFinite,
+              (1.0 / 120...1.0 / 20).contains(original.sourceFrameInterval),
+              original.uvRect.x == 0, original.uvRect.z == 1,
+              abs(original.uvRect.w) == 1,
+              min(original.uvRect.y, original.uvRect.y + original.uvRect.w) == 0 else {
+            resetSpacewarp(); return original
+        }
+        prepareSpacewarpIfEnabled()
+        guard let processor = spacewarpPreparation.ready else {
+            if let problem = spacewarpPreparation.failure, !spacewarpFailureReported {
+                spacewarpFailureReported = true
+                log("[spacewarp] AMD Optical Flow unavailable: \(problem); keeping real frames")
+            }
+            return original
+        }
+        spacewarpEligible = true
+        let geometry = SpacewarpGeometry(size: SIMD2(original.texture.width, original.texture.height),
+            format: original.texture.pixelFormat.rawValue, uv: original.uvRect,
+            colours: original.colourSpaces, left: original.renderedTangents.left, right: original.renderedTangents.right,
+            sourceInterval: original.sourceFrameInterval, cadenceEpoch: original.gameCadenceEpoch)
+        var discontinuity = spacewarpGeometry != geometry
+        if let prior = spacewarpSourcePose {
+            let sameFrameChangedPose = prior.sequence == original.imageSequence &&
+                (prior.orientation != original.renderOrientation.vector || prior.position != original.renderPosition || prior.eyes != original.eyeViews)
+            let jumped = simd_distance(prior.position, original.renderPosition) > 0.25 ||
+                abs(simd_dot(prior.orientation, original.renderOrientation.vector)) < 0.866
+            let eyesJumped = original.eyeViews.flatMap { now in prior.eyes.map { now.jumped(from: $0) } } ?? false
+            discontinuity = discontinuity || sameFrameChangedPose || jumped || eyesJumped || ((prior.eyes == nil) != (original.eyeViews == nil))
+        }
+        if discontinuity {
+            processor.reset(); spacewarpCadence.reset(); spacewarpPredictionKey = nil
+            processedGameKey = nil
+        }
+        spacewarpGeometry = geometry
+        spacewarpSourcePose = (original.imageSequence, original.renderOrientation.vector, original.renderPosition, original.eyeViews)
+        let now = CACurrentMediaTime()
+        let lateTarget = Double(lateTargetNs) * 1e-9
+        let target = lateTarget > 0 && abs(lateTarget - now) < 0.25 ? lateTarget : now
+        switch spacewarpCadence.update(sequence: original.imageSequence, sourceTime: original.imageTime,
+                                       target: target, sourceInterval: original.sourceFrameInterval) {
+        case .source(let reset):
+            if reset { processor.reset() }
+            let descriptor = GameSpacewarp.Descriptor(orientation: original.renderOrientation.vector,
+                position: original.renderPosition, tangentsLeft: original.renderedTangents.left,
+                tangentsRight: original.renderedTangents.right, flipped: original.uvRect.w < 0,
+                colourSpaces: original.colourSpaces, reprojectionDepth: Self.reprojectionDepth,
+                eyeViews: original.eyeViews)
+            if processor.prepare(source: original.texture, sequence: original.imageSequence,
+                                 descriptor: descriptor, commandBuffer: cb) { spacewarpSourceFrames &+= 1 }
+            else { spacewarpCadence.reset(); processor.reset() }
+            return original
+        case .predict(let phase):
+            guard let generated = processor.synthesize(alpha: phase, commandBuffer: cb),
+                  let srgb = generated.makeTextureView(pixelFormat: .rgba8Unorm_srgb) else { return original }
+            var result = original
+            result.texture = generated
+            result.srgbTexture = srgb
+            result.uvRect = SIMD4(0, 0, 1, 1)
+            result.colourSpaces = SIMD2(original.colourSpaces.x == 0 ? 0 : 2,
+                                       original.colourSpaces.y == 0 ? 0 : 2)
+            let predictionKey = SIMD2(original.imageSequence, UInt64(phase.bitPattern))
+            if spacewarpPredictionKey != predictionKey {
+                // The same real sequence may be forecast at a different phase.
+                // Its output texture is reused; invalidate downstream FSR's cache.
+                processedGameKey = nil
+                spacewarpPredictionKey = predictionKey
+            }
+            spacewarpGeneratedFrames &+= 1
+            return result
+        case .original:
+            return original
+        }
+    }
     private struct GameImageKey: Equatable {
         let source: ObjectIdentifier
         let sequence: UInt64
@@ -872,9 +988,14 @@ final class Renderer {
         // Runs on the same GPU queue before reprojection and lens correction;
         // a repeated game frame reuses its already processed texture.
         let sourceProjection = projection
-        if let sourceProjection, sourceProjection.composition == nil || sourceProjection.composition?.projectionIndex != nil {
-            projection = gameProjection(sourceProjection, cb: cb)
-        }
+        if let sourceProjection {
+            if let composition = sourceProjection.composition, composition.projectionIndex == nil {
+                // Quad-only carriers must not seed optical flow or upscale submitted UI.
+                resetSpacewarp()
+            } else {
+                projection = gameProjection(spacewarpProjection(sourceProjection, cb: cb), cb: cb)
+            }
+        } else { resetSpacewarp() }
         defer { projection = sourceProjection }
         // scene_fs never reads the place or its geometry while a projection or
         // surrounding video is active (its `surround` branch, including glass).

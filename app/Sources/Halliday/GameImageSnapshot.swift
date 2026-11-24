@@ -27,10 +27,13 @@ func runGameImageUISnapshot(prefix: String) {
     gameImage.onActivate?("page:gameImage")
     drawGameImageSettingsPanel(gameImage, to: "\(prefix)-headset-game-image.png")
 
-    let expected = Set(["game:fsr", "game:scale", "game:halfFrameRate", "game:sharpening", "game:sharpness"])
+    let expected = Set(["game:fsr", "game:scale", "game:halfFrameRate", "game:spacewarp", "game:sharpening", "game:sharpness"])
     guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
     guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
     else { fatal("Headset refresh selectors are missing") }
+    guard gameImage.controls.contains(where: { $0.id == "game:halfFrameRate" && $0.enabled == !Settings.shared.gameSpacewarpEnabled }),
+          gameImage.controls.contains(where: { $0.id == "game:spacewarp" && $0.enabled })
+    else { fatal("Spacewarp and half-frame-rate switch states are inconsistent") }
     for panel in [general, gameImage] {
         for control in panel.controls where !panel.surface.contains(control.rect) {
             fatal("Settings control \(control.id) extends outside the panel: \(control.rect)")

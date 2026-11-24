@@ -44,7 +44,8 @@ final class SettingsPanel: VRPanel {
         case "page:gameImage": showingGameImage = true
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
-        case "game:halfFrameRate": settings.gameHalfFrameRate.toggle()
+        case "game:halfFrameRate": if !settings.gameSpacewarpEnabled { settings.gameHalfFrameRate.toggle() }
+        case "game:spacewarp": settings.setGameSpacewarp(!settings.gameSpacewarpEnabled)
         case "game:systemAudio": settings.gameSystemAudio.toggle()
         case "display:90": onRefreshRate?(90)
         case "display:120": onRefreshRate?(120)
@@ -226,17 +227,31 @@ final class SettingsPanel: VRPanel {
                             at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
         NightGlass.drawText("Lower is faster; higher keeps more detail.", at: CGPoint(x: x, y: y + 30), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Restart the game to apply render scale.", at: CGPoint(x: x, y: y + 56), style: .caption,
-                            color: NightGlass.secondary, width: width)
-        y += 100
+        y += 60
         y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:halfFrameRate"], x: rx, y: y, width: rw) { r in
-            self.toggle(ctx, "game:halfFrameRate", self.settings.gameHalfFrameRate, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+            let rect = CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34)
+            if self.settings.gameSpacewarpEnabled {
+                self.control("game:halfFrameRate", rect.insetBy(dx: -6, dy: -4), enabled: false)
+                NightGlass.fill(ctx, rect, radius: 17, color: NightGlass.accent.withAlphaComponent(0.35))
+                NightGlass.fill(ctx, CGRect(x: rect.maxX - 31, y: rect.minY + 3, width: 28, height: 28), radius: 14,
+                                color: NSColor(white: 1, alpha: 0.45))
+            } else { self.toggle(ctx, "game:halfFrameRate", self.settings.effectiveGameHalfFrameRate, rect) }
         }
         NightGlass.drawText("Every other refresh: 60 game FPS at 120 Hz; 45 at 90 Hz.", at: CGPoint(x: x, y: y + 4), style: .caption,
                             color: NightGlass.secondary, width: width)
         NightGlass.drawText("Headset tracking and display stay at full rate.", at: CGPoint(x: x, y: y + 26), style: .caption,
                             color: NightGlass.secondary, width: width)
         NightGlass.drawText("Half rate is live with Halliday; restart for render scale.", at: CGPoint(x: x, y: y + 48), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 76
+        y = row(ctx, "Spacewarp 2×", "square.stack.3d.up", (0x7FD3FF, 0x2A7FBF), ids: ["game:spacewarp"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:spacewarp", self.settings.gameSpacewarpEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("At 120 Hz: 60 game frames + 60 generated frames per second.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Enables half frame rate; both apply live with Halliday.", at: CGPoint(x: x, y: y + 26), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Spacewarp can then be switched on or off live.", at: CGPoint(x: x, y: y + 48), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 76
         y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in
@@ -246,9 +261,9 @@ final class SettingsPanel: VRPanel {
                       CGFloat(settings.gameSharpness), x: rx, y: y, width: rw)
         NightGlass.drawText("Sharpening works with FSR on or off.", at: CGPoint(x: x, y: y + 8), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Both switches and sharpness apply immediately.", at: CGPoint(x: x, y: y + 34), style: .caption,
+        NightGlass.drawText("FSR and sharpening changes apply immediately.", at: CGPoint(x: x, y: y + 34), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("100%, both off: the game image is shown unchanged.", at: CGPoint(x: x, y: y + 60), style: .caption,
+        NightGlass.drawText("100%, all image effects off: original game image.", at: CGPoint(x: x, y: y + 60), style: .caption,
                             color: NightGlass.secondary, width: width)
     }
 
