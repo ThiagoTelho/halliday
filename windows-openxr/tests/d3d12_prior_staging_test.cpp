@@ -167,6 +167,7 @@ void makeSources(DXGI_FORMAT left,DXGI_FORMAT right){
 }
 basalt::PriorProjectionFrame submitted(unsigned frame,unsigned leftFlip=0,unsigned rightFlip=0){
     basalt::PriorProjectionFrame result{};result.producerEpoch=7;result.spaceEpoch=11;result.focusGeneration=2;result.fullGeometry=true;
+    result.sourceDisplayTimeNs=5'000'000'000LL+frame*23'255'813LL;result.sourceClockKind=1;
     result.head.valid=1;result.head.stamp=float(frame);result.head.position[0]=frame*.01f;result.head.position[1]=1.6f;result.head.orientation[3]=1;
     for(unsigned eye=0;eye<2;++eye){
         auto& view=result.views[eye];view.swapchainId=eye+10;view.imageIndex=frame%3;view.imageArrayIndex=eye;view.rect={{1,1},{5,3}};
@@ -182,6 +183,8 @@ basalt::PriorStagingResult capture(const basalt::PriorProjectionFrame& frame,bas
 }
 void verify(const basalt::ReadbackImage images[2],const basalt::PriorProjectionFrame& got,const basalt::PriorProjectionFrame& expected){
     check(basalt::samePriorProjectionLayout(got,expected)&&!std::memcmp(&got.head,&expected.head,sizeof(got.head)),"prior head and complete semantic packet retained");
+    check(got.sourceDisplayTimeNs==expected.sourceDisplayTimeNs&&got.sourceClockKind==expected.sourceClockKind,
+          "prior source timestamp retains actual 43 Hz spacing, never current completion time or nominal cadence");
     const auto order=basalt::stereoReadbackOrder(images,true);
     for(unsigned eye=0;eye<2;++eye){
         check(!std::memcmp(&got.views[eye].pose,&expected.views[eye].pose,sizeof(XrPosef))&&
@@ -241,11 +244,12 @@ int main(){SetErrorMode(SEM_FAILCRITICALERRORS|SEM_NOGPFAULTERRORBOX);SetUnhandl
     auto seed=submitted(20);basalt::ReadbackImage images[2];basalt::PriorProjectionFrame old{};
     const auto warm=[&](const basalt::PriorProjectionFrame& f){check(capture(f,images,&old)==basalt::PriorStagingResult::Warmup&&!activeMaps,"generation/layout transition drops the old pair");};
     warm(seed);
-    for(unsigned change=0;change<10;++change){auto next=seed;next.head.stamp+=change+1;
+    for(unsigned change=0;change<11;++change){auto next=seed;next.head.stamp+=change+1;
         switch(change){case 0:++next.spaceEpoch;break;case 1:++next.producerEpoch;break;case 2:next.focusGeneration+=2;break;
         case 3:++next.views[0].rect.offset.x;break;case 4:--next.views[1].rect.extent.width;break;case 5:++next.views[0].rect.offset.y;break;
         case 6:next.views[0].imageArrayIndex=1;break;case 7:++next.projectionOrder;break;case 8:colors[0]=halliday::kColorSrgb;break;
-        case 9:for(auto* s:sources[1])s->desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;break;}warm(next);seed=next;
+        case 9:for(auto* s:sources[1])s->desc.Format=DXGI_FORMAT_R8G8B8A8_UNORM;break;
+        case 10:next.sourceClockKind=2;break;}warm(next);seed=next;
     }
     check(capture(seed,images,&old,&device,&otherQueue)==basalt::PriorStagingResult::Warmup,"queue replacement drops old pair");
     check(capture(seed,images,&old,&otherDevice,&otherQueue)==basalt::PriorStagingResult::Warmup,"device replacement drops old pair");

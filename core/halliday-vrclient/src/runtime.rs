@@ -9,11 +9,56 @@ use core::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicUsiz
 use halliday_bridge::{self as bridge, Header, State};
 
 static HEADER: AtomicPtr<Header> = AtomicPtr::new(core::ptr::null_mut());
+static LEASE_PID: AtomicU32 = AtomicU32::new(0);
+static LEASE_EPOCH: AtomicU64 = AtomicU64::new(0);
+static NEXT_EPOCH: AtomicU64 = AtomicU64::new(1);
+static CONNECTION: Locked<()> = Locked::new(());
+fn current_lease() -> bridge::producer_lease::Lease { bridge::producer_lease::Lease {
+    pid: LEASE_PID.load(Ordering::Acquire), epoch: LEASE_EPOCH.load(Ordering::Acquire),
+} }
+fn lease_active(h: *const Header, lease: bridge::producer_lease::Lease) -> bool {
+    !h.is_null() && unsafe { bridge::producer_lease::active(h, lease) }
+}
+// Lease nonce only, not an image timestamp. Monotonic across init/reinit in this DLL.
+fn fresh_epoch() -> u64 {
+    let now=qpc();NEXT_EPOCH.fetch_update(Ordering::SeqCst,Ordering::SeqCst,
+        |last|Some(now.max(last.wrapping_add(1).max(1)))).unwrap().wrapping_add(1).max(now).max(1)
+}
+fn activate_mapping(h: *mut Header) -> bool {
+    let pid=unsafe { win::GetCurrentProcessId() };
+    let Some(lease)=(unsafe { bridge::producer_lease::claim(h,pid,fresh_epoch()) }) else { return false; };
+    LEASE_PID.store(lease.pid,Ordering::Release);LEASE_EPOCH.store(lease.epoch,Ordering::Release);
+    unsafe { (*h).present_state.store(bridge::present::OFF,Ordering::SeqCst);
+        (*h).present_width.store(0,Ordering::SeqCst);(*h).present_height.store(0,Ordering::SeqCst);write_app_name(h); }
+    SHARED.with(|s| {s.eyes=0;s.frame_index=0;s.copied_texture=0;});
+    HEADER.store(h,Ordering::Release);true
+}
+/// Release only this init's admission. Finish CPU slot writes first, without issuing GPU cleanup.
+pub fn disconnect() {
+    CONNECTION.with(|_| {
+        let h=HEADER.load(Ordering::Acquire);let lease=current_lease();
+        if !lease_active(h,lease) { return; }
+        // Copy helpers can still own a shared slot. If they stall, preserve ownership and
+        // stop heartbeat/callbacks; the host's bounded retirement handles the abandoned lease.
+        for _ in 0..100 { if JOB_DONE.load(Ordering::Acquire) { break; } unsafe {win::Sleep(1)}; }
+        if !JOB_DONE.load(Ordering::Acquire) { LEASE_PID.store(0,Ordering::Release);return; }
+        if unsafe {bridge::producer_lease::release(h,lease)} {
+            LEASE_PID.store(0,Ordering::Release);LEASE_EPOCH.store(0,Ordering::Release);
+            PENDING.with(|p|*p=[NO_PENDING;2]);SHARED.with(|s|s.eyes=0);
+        }
+    });
+}
+/// Producer-side first-eye Submit entry time, captured before readback/window work.
+pub fn submit_time_ns() -> i64 {
+    let ticks=qpc();let mut frequency=0i64;unsafe {win::QueryPerformanceFrequency(&mut frequency)};
+    if frequency<=0 {return 0;}let ns=(ticks as u128)*1_000_000_000/(frequency as u128);
+    if ns==0 || ns>i64::MAX as u128 {0} else {ns as i64}
+}
 
 /// The mapped bridge, if Halliday's file was found.
 pub fn header() -> Option<*mut Header> {
     let h = HEADER.load(Ordering::Acquire);
-    (!h.is_null()).then_some(h)
+    lease_active(h,current_lease()).then_some(h)
 }
 
 /// Halliday is running with the file mapped.
@@ -115,10 +160,31 @@ impl core::fmt::Display for Folder {
     }
 }
 
+/// Availability queries never admit a producer or start a heartbeat.
+pub fn is_hmd_present() -> bool {
+    if halliday_alive() { return true; }
+    let Some(folder)=Folder::of_this_dll() else {return false;};
+    let path=folder.join(bridge::FILE_NAME);
+    unsafe {
+        let file=win::CreateFileW(path.as_ptr(),win::GENERIC_READ,win::FILE_SHARE_READ|win::FILE_SHARE_WRITE,
+            core::ptr::null_mut(),win::OPEN_EXISTING,win::FILE_ATTRIBUTE_NORMAL,core::ptr::null_mut());
+        if file==win::INVALID_HANDLE_VALUE {return false;}
+        let mapping=win::CreateFileMappingW(file,core::ptr::null_mut(),2,0,0,core::ptr::null()); // PAGE_READONLY
+        win::CloseHandle(file);if mapping.is_null(){return false;}
+        let view=win::MapViewOfFile(mapping,4,0,0,bridge::HEADER_BYTES); // FILE_MAP_READ
+        win::CloseHandle(mapping);if view.is_null(){return false;}
+        let present=bridge::producer_lease::present(view.cast::<Header>());
+        win::UnmapViewOfFile(view);present
+    }
+}
+
 /// Maps Halliday's bridge file from the runtime folder. False if Halliday isn't running.
-pub fn connect() -> bool {
-    if header().is_some() {
-        return true;
+pub fn connect() -> bool { CONNECTION.with(|_| connect_locked()) }
+fn connect_locked() -> bool {
+    if header().is_some() { return true; }
+    let old=HEADER.load(Ordering::Acquire);
+    if !old.is_null() && unsafe {(*old).halliday_alive.load(Ordering::SeqCst)!=0} {
+        return activate_mapping(old);
     }
     let Some(folder) = Folder::of_this_dll() else {
         log!("can't tell where this DLL is");
@@ -178,14 +244,10 @@ pub fn connect() -> bool {
             win::UnmapViewOfFile(base);
             return false;
         }
-        (*h).client_pid = win::GetCurrentProcessId();
-        // A game before this one may have left its window's state.
-        (*h).present_state
-            .store(bridge::present::OFF, Ordering::SeqCst);
-        (*h).present_width.store(0, Ordering::SeqCst);
-        (*h).present_height.store(0, Ordering::SeqCst);
-        write_app_name(h);
-        HEADER.store(h, Ordering::Release);
+        if !activate_mapping(h) {
+            log!("another producer owns the bridge, or its admission is not ready");
+            win::UnmapViewOfFile(base);return false;
+        }
         crate::scene::start_heartbeat();
         log!(
             "connected to Halliday: eye {}x{} at {} Hz",
@@ -264,6 +326,8 @@ pub struct Shared {
     /// The texture of the eye already submitted for this frame (both eyes may share one).
     pub copied_texture: usize,
     pub frame_index: u64,
+    pub submit_time_ns: i64,
+    pub submit_lease: bridge::producer_lease::Lease,
 }
 
 pub static SHARED: Locked<Shared> = Locked::new(Shared {
@@ -312,6 +376,8 @@ pub static SHARED: Locked<Shared> = Locked::new(Shared {
     eyes: 0,
     copied_texture: 0,
     frame_index: 0,
+    submit_time_ns: 0,
+    submit_lease: bridge::producer_lease::Lease{pid:0,epoch:0},
 });
 
 pub static TRACKING_SPACE: AtomicU32 = AtomicU32::new(1); // standing
@@ -512,6 +578,8 @@ struct Pending {
     pose: bridge::Pose,
     /// The frame's number (`Frame::frame_index`), given when its second eye is submitted.
     index: u64,
+    source_time_ns: i64,
+    lease: bridge::producer_lease::Lease,
     /// Copied straight into `slot` (no pixel buffers: the old, waiting way).
     direct: Option<usize>,
 }
@@ -534,6 +602,8 @@ const NO_PENDING: Pending = Pending {
         stamp: 0.0,
     },
     index: 0,
+    source_time_ns: 0,
+    lease: bridge::producer_lease::Lease{pid:0,epoch:0},
     direct: None,
 };
 
@@ -580,6 +650,7 @@ fn ticks_per_ms() -> f64 {
 
 /// Writes `p`'s metadata into `slot` and makes it the newest frame.
 fn publish(h: *mut Header, slot: usize, p: &Pending) {
+    if !lease_active(h,p.lease) { return; }
     // SAFETY: a mapped header; the slot is this side's until published.
     let frame = unsafe { &mut *core::ptr::addr_of_mut!((*h).frames[slot]) };
     let index = p.index;
@@ -590,6 +661,10 @@ fn publish(h: *mut Header, slot: usize, p: &Pending) {
     frame.frame_index = index;
     frame.bottom_up = (p.kind == ovr::TEXTURE_OPENGL) as u32;
     frame.texture_type = p.kind as u32;
+    let times=unsafe {bridge::frame_timing::extension(h)};times.clear(slot);
+    if times.write(slot,p.lease.epoch,index,bridge::frame_timing::Time{
+        nanoseconds:p.source_time_ns,clock_kind:bridge::frame_timing::SUBMIT_MONOTONIC_NS})
+        && lease_active(h,p.lease) { frame.texture_type |= bridge::FRAME_SOURCE_TIMING; }
     frame.shared = p.shared as u32;
     frame.bgra = p.bgra as u32;
     frame.see_through = 0;
@@ -663,6 +738,7 @@ fn publish(h: *mut Header, slot: usize, p: &Pending) {
 /// A copy for the worker thread: the mapped images of a frame, into a slot, then published.
 #[derive(Clone, Copy)]
 struct Job {
+    header: *mut Header,
     slot: usize,
     pending: Pending,
     /// Each eye's mapped rows and their pitch (one when both eyes share a texture).
@@ -690,6 +766,7 @@ static HELPERS: AtomicUsize = AtomicUsize::new(0);
 
 /// Copies stripe `k` of `n` (a band of rows of each eye) of the job into its slot.
 fn copy_stripe(h: *mut Header, job: &Job, k: usize, n: usize) {
+    if !lease_active(h,job.pending.lease) { return; }
     let row = job.pending.width as usize * 4;
     let height = job.pending.height as usize;
     let (y0, y1) = (height * k / n, height * (k + 1) / n);
@@ -718,10 +795,8 @@ unsafe extern "system" fn worker(_: *mut core::ffi::c_void) -> u32 {
         let Some(job) = JOB.with(|j| *j) else {
             continue;
         };
-        let Some(h) = header() else {
-            JOB_DONE.store(true, Ordering::Release);
-            continue;
-        };
+        let h=job.header;
+        if !lease_active(h,job.pending.lease) { JOB_DONE.store(true,Ordering::Release);continue; }
         let t0 = qpc();
         let helpers = HELPERS.load(Ordering::Acquire);
         for k in 0..helpers {
@@ -749,8 +824,8 @@ unsafe extern "system" fn helper(arg: *mut core::ffi::c_void) -> u32 {
         unsafe {
             win::WaitForSingleObject(HELPER_WAKE[k - 1].load(Ordering::Acquire), 0xFFFF_FFFF)
         };
-        if let (Some(job), Some(h)) = (JOB.with(|j| *j), header()) {
-            copy_stripe(h, &job, k, HELPERS.load(Ordering::Acquire) + 1);
+        if let Some(job) = JOB.with(|j| *j) {
+            copy_stripe(job.header, &job, k, HELPERS.load(Ordering::Acquire) + 1);
         }
         HELPER_DONE[k - 1].store(true, Ordering::Release);
     }
@@ -835,7 +910,7 @@ fn settle_job() {
 fn finish_previous(h: *mut Header, parity: usize) {
     settle_job();
     let p = PENDING.with(|p| core::mem::replace(&mut p[parity], NO_PENDING));
-    if !p.active || p.direct.is_some() {
+    if !p.active || p.direct.is_some() || !lease_active(h,p.lease) {
         return;
     }
     if !p.shared && !bridge::fits(p.width, p.height) {
@@ -883,6 +958,7 @@ fn finish_previous(h: *mut Header, parity: usize) {
         }
     }
     let job = Job {
+        header: h,
         slot,
         pending: p,
         source,
@@ -931,6 +1007,7 @@ fn drop_copies() {
 /// top-down.
 pub fn submit(eye: u32, texture: &ovr::Texture, bounds: Option<[f32; 4]>, flags: i32) -> i32 {
     use crate::present::Route;
+    let source_submit_time=submit_time_ns();
     let Some(h) = header() else {
         return ovr::COMPOSITOR_NONE;
     };
@@ -957,7 +1034,11 @@ pub fn submit(eye: u32, texture: &ovr::Texture, bounds: Option<[f32; 4]>, flags:
         crate::d3d11::note_submit_thread();
     }
     let handle = texture.handle as usize;
-    let first = SHARED.with(|s| s.eyes == 0);
+    let first = SHARED.with(|s| {
+        let first=s.eyes==0;
+        if first {s.submit_time_ns=source_submit_time;s.submit_lease=current_lease();}
+        first
+    });
     let route = if first {
         let route = crate::present::route(h, kind);
         let before = ROUTE.with(|r| {
@@ -1043,15 +1124,15 @@ pub fn submit(eye: u32, texture: &ovr::Texture, bounds: Option<[f32; 4]>, flags:
             s.eyes = 0;
             s.slot = s.slot.wrapping_add(1); // the next frame uses the other parity
             s.frame_index += 1;
-            Some((s.frame_index, s.render_head))
+            Some((s.frame_index, s.render_head, s.submit_time_ns, s.submit_lease))
         } else {
             None
         }
     });
-    if let Some((index, pose)) = complete {
+    if let Some((index, pose, source_time_ns, lease)) = complete {
         if route != Route::Bridge {
             // SAFETY: on the game's render thread (see above).
-            let shown = unsafe { crate::present::present(h, kind, index, pose) };
+            let shown = unsafe { crate::present::present(h, kind, index, pose, source_time_ns, lease) };
             // Not shown: the window path just failed; this one frame is lost, the next ones are
             // copied.
             if route == Route::Window && shown {
@@ -1067,6 +1148,8 @@ pub fn submit(eye: u32, texture: &ovr::Texture, bounds: Option<[f32; 4]>, flags:
         if route != Route::Window {
             p.pose = pose;
             p.index = index;
+            p.source_time_ns = source_time_ns;
+            p.lease = lease;
             p.active = p.width > 0 && p.kind >= 0;
             if let Some(slot) = p.direct {
                 publish(h, slot, &p);

@@ -2451,7 +2451,7 @@ unsafe extern "system" fn end_frame(
             .collect();
         s.side.see_through = projection_flags & bridge::panels::SOURCE_ALPHA != 0;
         let readback = &s.readback;
-        let published = s.side.submit_layers_with_geometry(
+        let published = s.side.submit_layers_with_geometry_and_timing(
             pose,
             size,
             false,
@@ -2461,6 +2461,9 @@ unsafe extern "system" fn end_frame(
             projection_order,
             projection_flags,
             projection_geometry.as_ref(),
+            projection_order.map(|_| bridge::frame_timing::Time {
+                nanoseconds: info.display_time.as_nanos(), clock_kind: bridge::frame_timing::XR_DISPLAY_TIME_NS,
+            }),
             &images,
             |eye, pixels| pixels.copy_from_slice(&readback[eye]),
         );

@@ -23,6 +23,9 @@ mod projection_tests;
 #[cfg(test)]
 #[path = "game_retirement_tests.rs"]
 mod retirement_tests;
+#[cfg(test)]
+#[path = "game_frame_timing_tests.rs"]
+mod frame_timing_tests;
 
 unsafe extern "C" {
     fn mmap(
@@ -260,6 +263,7 @@ impl GameBridge {
             bridge::focus::initialize(h);
             bridge::motion::initialize(h);
             bridge::projection::initialize(h);
+            bridge::frame_timing::initialize(h);
             (*h).halliday_alive.store(1, Ordering::SeqCst);
             // Last: a game seeing the magic sees a complete header.
             std::ptr::write_volatile(std::ptr::addr_of_mut!((*h).magic), bridge::MAGIC);
@@ -472,6 +476,39 @@ impl GameBridge {
             return Err(());
         }
         Ok(Some(result))
+    }
+
+    /// Optional timing for the exact leased pixel slot. Bad timing never invalidates pixels.
+    pub fn frame_timing(&self, slot: usize, frame_index: u64)
+        -> Result<Option<bridge::frame_timing::Snapshot>, ()> {
+        if slot >= bridge::SLOTS || frame_index == 0 { return Err(()); }
+        let h = unsafe { &*self.header() };
+        if h.reading.load(Ordering::SeqCst) != slot as u32 + 1 { return Err(()); }
+        let frame = &h.frames[slot];
+        let sequence = frame.seq.load(Ordering::Acquire);
+        if sequence == 0 || sequence & 1 != 0 || frame.frame_index != frame_index { return Err(()); }
+        if frame.texture_type & bridge::FRAME_SOURCE_TIMING == 0 { return Ok(None); }
+        let epoch = self.client_epoch();
+        if unsafe {(*self.header()).halliday_alive.load(Ordering::SeqCst)} == 0 { return Err(()); }
+        let value = unsafe { bridge::frame_timing::extension(self.header()) }
+            .read(slot, epoch, frame_index).ok_or(())?;
+        if frame.seq.load(Ordering::Acquire) != sequence || self.client_epoch() != epoch || h.halliday_alive.load(Ordering::SeqCst) == 0 { return Err(()); }
+        Ok(Some(value))
+    }
+
+    /// Captured window metadata uses its own ring; validate its number/index both before and after timing.
+    pub fn present_frame_timing(&self, number: u32, frame_index: u64)
+        -> Result<Option<bridge::frame_timing::Snapshot>, ()> {
+        if frame_index == 0 { return Err(()); }
+        let before = unsafe { bridge::read_present_frame(self.header(), number) }.ok_or(())?;
+        if before.frame_index != frame_index { return Err(()); }
+        if before.texture_type & bridge::FRAME_SOURCE_TIMING == 0 { return Ok(None); }
+        let epoch = self.client_epoch();
+        if unsafe {(*self.header()).halliday_alive.load(Ordering::SeqCst)} == 0 { return Err(()); }
+        let value = unsafe { bridge::frame_timing::extension(self.header()) }
+            .read(bridge::frame_timing::present_index(number), epoch, frame_index).ok_or(())?;
+        if self.client_epoch() != epoch || unsafe {(*self.header()).halliday_alive.load(Ordering::SeqCst)} == 0 || unsafe { bridge::read_present_frame(self.header(), number) } != Some(before) { return Err(()); }
+        Ok(Some(value))
     }
 
     pub fn claim_panel(&self, index: usize, sequence: u32) -> Option<PictureInfo> {
@@ -1086,6 +1123,29 @@ impl GameSide {
         projection_flags: u32,
         geometry: Option<&[bridge::projection::View; 2]>,
         panels: &[PanelImage<'_>],
+        fill: impl FnMut(usize, &mut [u8]),
+    ) -> bool {
+        self.submit_layers_with_geometry_and_timing(
+            pose, size, bottom_up, bgra, api, color_spaces, projection_order,
+            projection_flags, geometry, None, panels, fill,
+        )
+    }
+
+    /// An immutable producer timestamp travels with this exact image, not with its later import.
+    #[allow(clippy::too_many_arguments)]
+    pub fn submit_layers_with_geometry_and_timing(
+        &mut self,
+        pose: bridge::Pose,
+        size: (u32, u32),
+        bottom_up: bool,
+        bgra: bool,
+        api: u32,
+        color_spaces: [u32; 2],
+        projection_order: Option<u32>,
+        projection_flags: u32,
+        geometry: Option<&[bridge::projection::View; 2]>,
+        timing: Option<bridge::frame_timing::Time>,
+        panels: &[PanelImage<'_>],
         mut fill: impl FnMut(usize, &mut [u8]),
     ) -> bool {
         let h = self.header();
@@ -1218,6 +1278,17 @@ impl GameSide {
                     return false;
                 }
                 f.texture_type |= bridge::FRAME_PROJECTION_GEOMETRY;
+            }
+            let times = bridge::frame_timing::extension(h);
+            times.clear(slot);
+            if let Some(time) = timing {
+                if (*h).client_initialized.load(Ordering::SeqCst) == 1
+                    && control.owner_pid.load(Ordering::SeqCst) == (*h).client_pid
+                    && control.client_epoch.load(Ordering::SeqCst) == epoch
+                    && times.write(slot, epoch, self.frame_index, time)
+                    && control.client_epoch.load(Ordering::SeqCst) == epoch {
+                    f.texture_type |= bridge::FRAME_SOURCE_TIMING;
+                }
             }
             f.shared = 0;
             f.bgra = u32::from(bgra);

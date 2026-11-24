@@ -117,6 +117,9 @@ struct ProjectionLayer {
     var imageSequence: UInt64 = 0
     /// Reception time of this real game image, separate from its predicted head pose.
     var imageTime: Double = 0
+    /// Optional producer timestamp bound to this exact image. Nil means legacy;
+    /// an invalid advertised record keeps real pixels but disables prediction.
+    var imageTiming: GameSourceImageTime? = nil
     var gameHalfRate = false
     var sourceFrameInterval: Double = 0
     /// Changes when cadence changes even if no new real image has arrived.
@@ -484,7 +487,8 @@ final class Renderer {
         let lateTarget = Double(lateTargetNs) * 1e-9
         let target = lateTarget > 0 && abs(lateTarget - now) < 0.25 ? lateTarget : now
         switch spacewarpCadence.update(sequence: original.imageSequence, sourceTime: original.imageTime,
-                                       target: target, sourceInterval: original.sourceFrameInterval) {
+                                       target: target, sourceInterval: original.sourceFrameInterval,
+                                       imageTiming: original.imageTiming) {
         case .source(let reset):
             if reset { processor.reset() }
             let descriptor = GameSpacewarp.Descriptor(orientation: original.renderOrientation.vector,

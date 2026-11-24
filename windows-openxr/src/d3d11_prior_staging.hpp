@@ -10,6 +10,10 @@ struct PriorProjectionFrame {
     halliday::Pose head{};
     halliday::projection::View geometry[2]{};
     uint64_t producerEpoch = 0;
+    // The application's submitted XrFrameEndInfo::displayTime belongs to these
+    // exact pixels. It is not the readback-completion or host-import time.
+    int64_t sourceDisplayTimeNs = 0;
+    uint32_t sourceClockKind = 0;
     uint32_t spaceEpoch = 0;
     uint32_t focusGeneration = 0;
     uint32_t projectionOrder = 0, projectionFlags = 0;
@@ -27,6 +31,7 @@ inline bool priorProjectionEligible(uint32_t count, uint32_t quads,
 inline bool samePriorProjectionLayout(const PriorProjectionFrame& a,
                                       const PriorProjectionFrame& b) {
     if (a.producerEpoch != b.producerEpoch || a.spaceEpoch != b.spaceEpoch || a.focusGeneration != b.focusGeneration ||
+        a.sourceClockKind != b.sourceClockKind ||
         a.projectionOrder != b.projectionOrder || a.projectionFlags != b.projectionFlags ||
         a.fullGeometry != b.fullGeometry || a.requiredBatch != b.requiredBatch) return false;
     for (unsigned eye = 0; eye < 2; ++eye) {

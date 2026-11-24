@@ -81,6 +81,10 @@ final class GameBridge {
     private var captureStarting = false
     private var captureRetry = 0.0
     private var presentState: UInt32 = 0
+    /// New OpenVR producers have guarded ownership epochs too. Their paired
+    /// submit-clock record identifies the legacy window/overlay protocol after
+    /// the first copied image, without treating every nonzero epoch as OpenXR.
+    private var observedOpenVRSubmitTiming = false
     private var textureCache: CVMetalTextureCache?
     private var windowFrames = 0
     private var windowGaps = 0
@@ -591,7 +595,7 @@ final class GameBridge {
             lastBeatTime = now
             // Independent OpenXR already publishes complete CPU frame slots;
             // only legacy OpenVR negotiates the captured presentation window.
-            if client.initialized != 0 && publicEpoch == 0 { prepareFramesDisplay(b) }
+            if client.initialized != 0 && (publicEpoch == 0 || observedOpenVRSubmitTiming) { prepareFramesDisplay(b) }
         }
         // Only while it beats: a game that crashed or was killed never shut VR down, and its
         // `initialized` stays set (it was taken for a new launch that stopped at once, again and
@@ -639,12 +643,14 @@ final class GameBridge {
         if notifyGame { framesAtLastTick = client.frames }
         if late { halliday_bridge_frame_shown(b, UInt64(gameInterval * 1e9), true) }
         guard isPresenting else { return nil }
-        if publicEpoch != 0 {
+        if publicEpoch != 0 && !observedOpenVRSubmitTiming {
             // Independent OpenXR publishes projection frames only. A previous
             // OpenVR client may have left a window, grid, fade or overlays here.
             if !reading { takeFrame(b) }
-            return View(projection: framesArriving ? layer : nil, layers: [], skybox: nil,
-                        fade: .zero, backgroundFade: .zero)
+            if !observedOpenVRSubmitTiming {
+                return View(projection: framesArriving ? layer : nil, layers: [], skybox: nil,
+                            fade: .zero, backgroundFade: .zero)
+            }
         }
         takeWindowFrame(b, now: now, pid: client.pid)
         if !reading { takeFrame(b) }
@@ -694,6 +700,7 @@ final class GameBridge {
         captureStarting = false
         captureRetry = 0
         presentState = 0
+        observedOpenVRSubmitTiming = false
         lastNumber = 0
         windowFrames = 0
         windowGaps = 0
@@ -968,6 +975,13 @@ final class GameBridge {
         var geometry = HallidayBridgeProjectionGeometry()
         let geometryStatus = halliday_bridge_projection_geometry(b, f.slot, f.frame_index, &geometry)
         guard geometryStatus == 0 || geometryStatus == 1 else { halliday_bridge_end_read(b); return }
+        var timing = HallidayBridgeFrameTiming()
+        let timingStatus = halliday_bridge_frame_timing(b, f.slot, f.frame_index, &timing)
+        let imageTiming = Self.sourceImageTiming(timingStatus, timing)
+        if let imageTiming, imageTiming.isValid, imageTiming.clockKind == 2 {
+            observedOpenVRSubmitTiming = true
+            prepareFramesDisplay(b)
+        }
         var eyeViews: ProjectionEyeViews?
         if geometryStatus == 1 {
             func decode(_ view: HallidayBridgeProjectionView) -> ProjectionEyeView {
@@ -1046,7 +1060,8 @@ final class GameBridge {
         lastFrameIndex = f.frame_index
         // OpenGL rows run bottom-up, Direct3D's top-down; bounds with v min > v max ask for a flip.
         let flipped = (f.bottom_up != 0) == (bounds[0].1 <= bounds[0].3)
-        layer = projectionLayer(texture: texture, flipped: flipped, pose: f.pose, eyeViews: eyeViews)
+        layer = projectionLayer(texture: texture, flipped: flipped, pose: f.pose, eyeViews: eyeViews,
+                                imageTiming: imageTiming)
         layer?.seeThrough = f.see_through != 0
         layer?.srgbTexture = transferView
         layer?.colourSpaces = colourSpaces
@@ -1224,6 +1239,9 @@ final class GameBridge {
         var rec = HallidayBridgePresentFrame()
         guard f.width == Int(status.width), f.height == Int(status.height),
               halliday_bridge_present_frame(b, f.number, &rec), rec.frame_index > lastFrameIndex else { return }
+        var timing = HallidayBridgeFrameTiming()
+        let timingStatus = halliday_bridge_present_frame_timing(b, f.number, rec.frame_index, &timing)
+        let imageTiming = Self.sourceImageTiming(timingStatus, timing)
         let band = Int(HALLIDAY_BRIDGE_PRESENT_BAND)
         let ew = Int(rec.eye_width), eh = Int(rec.eye_height)
         guard ew * 2 <= f.width, eh + band <= f.height else { return }
@@ -1254,7 +1272,8 @@ final class GameBridge {
         cb.commit() // the renderer draws on the same queue, after this copy
         lastFrameIndex = rec.frame_index
         lastFrameTime = now
-        layer = projectionLayer(texture: texture, flipped: rec.flipped != 0, pose: rec.pose)
+        layer = projectionLayer(texture: texture, flipped: rec.flipped != 0, pose: rec.pose,
+                                imageTiming: imageTiming)
     }
 
     // How old a frame's pose is when the frame reaches the eyes: Halliday published the pose, the
@@ -1288,8 +1307,16 @@ final class GameBridge {
         }
     }
 
+    private static func sourceImageTiming(_ status: Int32, _ record: HallidayBridgeFrameTiming) -> GameSourceImageTime? {
+        guard status != 0 else { return nil }
+        guard status == 1 else { return .invalid }
+        return GameSourceImageTime(epoch: record.epoch, frameIndex: record.frame_index,
+                                   nanoseconds: record.nanoseconds, clockKind: record.clock_kind)
+    }
+
     private func projectionLayer(texture: MTLTexture, flipped: Bool, pose p: HallidayBridgePose,
-                                 eyeViews: ProjectionEyeViews? = nil) -> ProjectionLayer {
+                                 eyeViews: ProjectionEyeViews? = nil,
+                                 imageTiming: GameSourceImageTime? = nil) -> ProjectionLayer {
         notePoseAge(p)
         Self.nextImageSequence &+= 1
         func tangents(_ eye: Eye) -> SIMD4<Float> {
@@ -1302,7 +1329,7 @@ final class GameBridge {
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
                                tangents: (tangents(.left), tangents(.right)),
                                gameImage: true, imageSequence: Self.nextImageSequence,
-                               imageTime: CACurrentMediaTime(), gameHalfRate: halfFrameRate,
+                               imageTime: CACurrentMediaTime(), imageTiming: imageTiming, gameHalfRate: halfFrameRate,
                                sourceFrameInterval: frameCadence.gameInterval, gameCadenceEpoch: cadenceEpoch)
         if let eyeViews, !eyeViews.matchesLegacy(position: projection.renderPosition, orientation: projection.renderOrientation,
             ipd: projectionIPD, leftTangents: projection.tangents.left, rightTangents: projection.tangents.right) {

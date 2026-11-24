@@ -31,6 +31,8 @@ pub mod glsl;
 pub mod haptics;
 pub mod math;
 pub mod motion;
+pub mod frame_timing;
+pub mod producer_lease;
 pub mod panels;
 pub mod picture;
 pub mod projection;
@@ -48,6 +50,8 @@ pub const FRAME_TEXTURE_API_MASK: u32 = 0xff;
 pub const FRAME_PROJECTION_GEOMETRY: u32 = 1 << 16;
 /// Ordered layers, source alpha or an explicit empty frame require their batch.
 pub const FRAME_LAYER_BATCH: u32 = 1 << 17;
+/// Optional paired producer timing. Failure invalidates timing, never the real pixels.
+pub const FRAME_SOURCE_TIMING: u32 = 1 << 18;
 pub const FRAME_COLOR_LEGACY: u32 = 0;
 pub const FRAME_COLOR_LINEAR: u32 = 1;
 pub const FRAME_COLOR_SRGB: u32 = 2;

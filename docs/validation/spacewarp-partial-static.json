@@ -1,0 +1,72 @@
+{
+  "scope": "Bounded synthetic images with genuine production AMD Optical Flow and synthesis; not game/headset performance",
+  "baseline": "Preview32 production GameSpacewarp and shader retained before this change",
+  "camera_yaw_jitter_degrees": 0.05,
+  "animated_indicator_per_eye": [
+    8,
+    8
+  ],
+  "static_background_exclusion_top_left_per_eye": [
+    96,
+    96
+  ],
+  "cases": [
+    {
+      "per_eye": [
+        512,
+        512
+      ],
+      "pattern": 1,
+      "changed_background_pixels_above_one_level": {
+        "before": 4200,
+        "after": 0
+      },
+      "maximum_8bit_rgb_error": {
+        "before": 206,
+        "after": 0
+      }
+    },
+    {
+      "per_eye": [
+        512,
+        512
+      ],
+      "pattern": 2,
+      "changed_background_pixels_above_one_level": {
+        "before": 419549,
+        "after": 0
+      },
+      "maximum_8bit_rgb_error": {
+        "before": 249,
+        "after": 0
+      }
+    },
+    {
+      "per_eye": [
+        2016,
+        2048
+      ],
+      "pattern": 1,
+      "changed_background_pixels_above_one_level": {
+        "before": 155277,
+        "after": 0
+      },
+      "maximum_8bit_rgb_error": {
+        "before": 206,
+        "after": 0
+      }
+    }
+  ],
+  "all_nine_full_and_partial_static_cases_pass": true,
+  "mechanism": "Per-eye16x16 real-source change map; candidate needs change at target or current pull source; no motion from an older-only correspondence",
+  "production_source_sha256": {
+    "app/Sources/Halliday/GameSpacewarp.swift": "61547446d3129de054776165126e0d9ec211a94258e69f7367fe67d8bdb416ae",
+    "app/Resources/spacewarp/composition.metal": "4d65ecf670eebfac7fc289a1b36e11c9b58b62e2ab00477e3b4d27e0d346eff7"
+  },
+  "no_cpu_readback_or_wait_added_to_production": true,
+  "acceptance_pending": [
+    "physical judder/ghosting",
+    "real game motion/disocclusion",
+    "end-to-end latency and FPS"
+  ]
+}

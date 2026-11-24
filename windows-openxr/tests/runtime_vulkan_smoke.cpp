@@ -260,6 +260,7 @@ static void run(const char* runtimePath,const char* driverPath,const char* hostP
         XrFrameState nextFrame{XR_TYPE_FRAME_STATE};halliday::Pose nextPose{};
         struct Submitted {
             halliday::Pose pose{};unsigned pattern=0,flip=0;
+            int64_t displayTime=0;
             XrCompositionLayerProjectionView views[2]{};
         } prior;
         // Three independently changing ordinary pictures per optical layout,
@@ -387,6 +388,7 @@ static void run(const char* runtimePath,const char* driverPath,const char* hostP
             const XrCompositionLayerBaseHeader* layers[]{reinterpret_cast<const XrCompositionLayerBaseHeader*>(&layer)};
             XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO};end.displayTime=frame.predictedDisplayTime;end.environmentBlendMode=XR_ENVIRONMENT_BLEND_MODE_OPAQUE;end.layerCount=1;end.layers=layers;
             Submitted current{};current.pose=rendered;current.pattern=pattern;current.flip=pass;
+            current.displayTime=end.displayTime;
             std::copy(std::begin(projected),std::end(projected),std::begin(current.views));
             const uint64_t previous=host.header->clientFrames.load();const auto previousLatest=host.header->latest.load();vulkan_counting::reset();
             xrcheck(xr<PFN_xrEndFrame>("xrEndFrame")(session,&end),"runtime orders app GPU commands and transports stereo crops");
@@ -404,6 +406,7 @@ static void run(const char* runtimePath,const char* driverPath,const char* hostP
                 check(host.header->clientFrames.load()==previous+1,"exactly one older complete stereo pair per ordinary EndFrame");
                 host.verify(prior.pose,prior.pattern,bgra,srgb,previous,prior.flip);
                 projection_checks::verify(host.header,prior.views);++verified;
+                source_timing_checks::verify(host.header,prior.displayTime);
                 if(repeat==3)++drains;
             }
             prior=current;

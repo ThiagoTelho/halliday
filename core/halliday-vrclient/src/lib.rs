@@ -159,7 +159,7 @@ unsafe extern "C" fn core_get_generic_interface(
 
 unsafe extern "C" fn core_is_hmd_present(_: This) -> bool {
     crate::log::seen!("IVRClientCore::core_is_hmd_present");
-    runtime::connect() && runtime::halliday_alive()
+    runtime::is_hmd_present()
 }
 
 unsafe extern "C" fn core_error_string(_: This, error: i32) -> *const c_char {

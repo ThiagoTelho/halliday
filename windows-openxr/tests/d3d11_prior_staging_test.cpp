@@ -4,6 +4,7 @@
 #include <windows.h>
 #include "d3d11_prior_staging.hpp"
 #include "projection_geometry.hpp"
+#include "source_timing_bridge.hpp"
 #include "stereo_readback_order.hpp"
 #include <array>
 #include <cmath>
@@ -113,6 +114,9 @@ void makeSources(DXGI_FORMAT left, DXGI_FORMAT right) {
 basalt::PriorProjectionFrame submitted(unsigned frame, unsigned leftFlip = 0, unsigned rightFlip = 0) {
     basalt::PriorProjectionFrame result{};
     result.producerEpoch = 7; result.spaceEpoch = 11; result.focusGeneration = 2;
+    // Deliberately 43 Hz rather than the host's nominal half-rate budget.
+    result.sourceDisplayTimeNs = 5'000'000'000LL + frame * 23'255'813LL;
+    result.sourceClockKind = 1;
     result.fullGeometry = true;
     result.head.valid = 1; result.head.stamp = float(frame);
     result.head.position[0] = frame * .01f; result.head.position[1] = 1.6f;
@@ -139,7 +143,8 @@ basalt::PriorStagingResult capture(const basalt::PriorProjectionFrame& frame,
     return basalt::prepareD3D11PriorFrame(reinterpret_cast<ID3D11Device*>(on),frame,images,old);
 }
 bool samePacket(const basalt::PriorProjectionFrame& a, const basalt::PriorProjectionFrame& b) {
-    if (!basalt::samePriorProjectionLayout(a,b) || std::memcmp(&a.head,&b.head,sizeof(a.head))) return false;
+    if (!basalt::samePriorProjectionLayout(a,b) || std::memcmp(&a.head,&b.head,sizeof(a.head)) ||
+        a.sourceDisplayTimeNs != b.sourceDisplayTimeNs || a.sourceClockKind != b.sourceClockKind) return false;
     for (unsigned eye = 0; eye < 2; ++eye) {
         if (a.views[eye].imageIndex != b.views[eye].imageIndex ||
             std::memcmp(&a.views[eye].pose,&b.views[eye].pose,sizeof(XrPosef)) ||
@@ -159,7 +164,9 @@ void verifyPixels(const basalt::ReadbackImage images[2], const basalt::PriorProj
     check(halliday::publish(header,5,3,order.bgra,frame.head,index,
         [&](size_t eye,uint8_t* target) {basalt::copyReadbackImage(images[eye],order.bgra,target);return true;},metadata,
         [&](size_t slot,uint64_t sequence) {
-            return halliday::projection::publish(header,slot,sequence,frame.producerEpoch,frame.geometry);
+            return halliday::projection::publish(header,slot,sequence,frame.producerEpoch,frame.geometry) &&
+                halliday::source_timing::publish(header,slot,sequence,frame.producerEpoch,
+                                                frame.sourceDisplayTimeNs,frame.sourceClockKind);
         }), "real transport stereo/geometry publication");
     const unsigned slot = header->latest.load() - 1;
     check(std::memcmp(&header->frames[slot].pose,&frame.head,sizeof(frame.head)) == 0,
@@ -168,6 +175,10 @@ void verifyPixels(const basalt::ReadbackImage images[2], const basalt::PriorProj
     check(halliday::projection::read(header,slot,index,frame.producerEpoch,&geometry) &&
           std::memcmp(geometry.views,frame.geometry,sizeof(frame.geometry)) == 0,
           "full per-eye pose/FOV shares captured index and epoch");
+    halliday::frame_timing::Snapshot timing{};
+    check(halliday::source_timing::read(header,slot,index,frame.producerEpoch,&timing) &&
+          timing.nanoseconds == frame.sourceDisplayTimeNs && timing.clockKind == frame.sourceClockKind,
+          "published source display time shares exact prior pixels, frame index and epoch");
     for (unsigned eye = 0; eye < 2; ++eye) {
         const auto& image = images[eye]; const auto& view = frame.views[eye];
         check(image.flipX == (view.fov.angleLeft > view.fov.angleRight) &&
@@ -215,6 +226,7 @@ int main() { try {
     auto* hp = new(memory + halliday::haptics::kOffset) halliday::haptics::Extension{};
     hp->magic = halliday::haptics::kMagic; hp->version = halliday::haptics::kVersion;
     halliday::projection::initialize(header);
+    halliday::frame_timing::initialize(header);
     unsigned paired = 0; uint64_t transportIndex = 0;
     for (const auto left : {DXGI_FORMAT_R8G8B8A8_UNORM,DXGI_FORMAT_B8G8R8A8_UNORM_SRGB})
     for (const auto right : {DXGI_FORMAT_R8G8B8A8_UNORM_SRGB,DXGI_FORMAT_B8G8R8A8_UNORM})
@@ -247,7 +259,7 @@ int main() { try {
         check(capture(value,images,&old) == basalt::PriorStagingResult::Warmup && !activeMaps,"transition retires old stereo pair");
     };
     basalt::resetD3D11PriorReadback(); warm(seed);
-    for (unsigned transition = 0; transition < 10; ++transition) {
+    for (unsigned transition = 0; transition < 11; ++transition) {
         auto changed = seed; changed.head.stamp += transition + 1;
         switch (transition) {
             case 0: ++changed.spaceEpoch; break;
@@ -260,6 +272,7 @@ int main() { try {
             case 7: ++changed.projectionOrder; break;
             case 8: colors[0] = halliday::kColorSrgb; break;
             case 9: for (auto* s : sources[1]) s->desc.Format = DXGI_FORMAT_R8G8B8A8_UNORM; break;
+            case 10: changed.sourceClockKind = 2; break;
         }
         warm(changed); seed = changed;
     }

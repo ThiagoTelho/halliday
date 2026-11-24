@@ -1,0 +1,56 @@
+{
+  "scope": "Bounded synthetic exact-image timing and pixel correctness; no games, headset, codec, TCC or optical latency/FPS measurement",
+  "mapping": "HLFT v1 in unchanged v6 reserved header; optional exact frame/epoch/clock metadata",
+  "windows_runtime_sha256": "7a1cdc624cd2fe8ed08789f408ceb307a3fc22b5d01ba2f9699b986a2e0a5a1b",
+  "runtime_execution": "Direct explicit copied runtime negotiation plus per-process XR_RUNTIME_JSON and unique HALLIDAY_BRIDGE_PATH; no runtime registry registration",
+  "isolation": {
+    "uuid_owned_copied_test_prefix": true,
+    "source_test_prefix_unchanged": true,
+    "copied_bottle_config_unchanged": true,
+    "private_bridge_files_removed": true,
+    "own_prefix_server_shutdown_confirmed": true
+  },
+  "checks": {
+    "D3D11": {
+      "passed": true,
+      "source_dimensions": [
+        80,
+        72
+      ],
+      "submissions": 24,
+      "publications": 18,
+      "warmup_or_reset": 6,
+      "provider": "CrossOver D3DMetal apple_gptk",
+      "mapped_d3d11_text_fnv32": "dc86fe33",
+      "mapped_dxgi_text_fnv32": "b2b8fad8",
+      "verified": "Exact selected prior pixels, submitted xrEndFrame display time, frame index and producer epoch; mixed formats/crop/array/mirrors/recenter/focus/quad/empty transitions and cleanup"
+    },
+    "D3D12": {
+      "passed": true,
+      "source_dimensions": [
+        64,
+        64
+      ],
+      "fixture": "Three swapchain source frames plus paired resubmissions and existing small lifetime/quad checks",
+      "provider": "CrossOver D3DMetal apple_gptk",
+      "mapped_text_fnv64": "0cf6cf52afefbc67",
+      "verified": "Exact prior submitted display time with prior pixels/eye geometry, actual app queue rendering and normal teardown"
+    },
+    "Vulkan2": {
+      "passed": true,
+      "source_dimensions": [
+        64,
+        64
+      ],
+      "verified_prior_patterns": 48,
+      "warmup_reset_cases": 16,
+      "provider": "Windows Vulkan loader through MoltenVK",
+      "verified": "Exact selected prior timestamps/epoch/frame pixels; four formats and all flips, paired submit/fence counts, arrays/crops, session reset/reconnect and teardown"
+    }
+  },
+  "limits": [
+    "Correctness checks only; no causal game FPS, optical latency or physical comfort claim.",
+    "OpenXR time denotes submitted intended presentation, not engine simulation time.",
+    "Private copied fixtures and provider binaries are not included in this source contribution."
+  ]
+}

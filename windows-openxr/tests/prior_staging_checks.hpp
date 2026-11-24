@@ -34,7 +34,7 @@ inline void run(PFN_xrGetInstanceProcAddr gipa,XrInstance instance,XrSession ses
         require(enumerate(chains[eye],count,&count,reinterpret_cast<XrSwapchainImageBaseHeader*>(images[eye].data()))==XR_SUCCESS,
                 "automatic actual D3D11 source texture handles");
     }
-    struct Expected {XrCompositionLayerProjectionView views[2];unsigned number,width;};
+    struct Expected {XrCompositionLayerProjectionView views[2];unsigned number,width;int64_t displayTime;};
     std::vector<Expected> expected;
     std::vector<uint8_t> source(80*72*4);
     unsigned publications=0,warmups=0;
@@ -54,6 +54,7 @@ inline void run(PFN_xrGetInstanceProcAddr gipa,XrInstance instance,XrSession ses
         XrViewState vs{XR_TYPE_VIEW_STATE};XrView views[2]{{XR_TYPE_VIEW},{XR_TYPE_VIEW}};uint32_t viewCount=0;
         require(locate(session,&li,&vs,2,&viewCount,views)==XR_SUCCESS&&viewCount==2,"automatic historical rendered pose");
         Expected current{};current.number=number;current.width=number>=20?60:64;
+        current.displayTime=fs.predictedDisplayTime;
         for(unsigned eye=0;eye<2;++eye) {
             uint32_t index=0;require(acquire(chains[eye],nullptr,&index)==XR_SUCCESS,"automatic acquire");
             XrSwapchainImageWaitInfo wi{XR_TYPE_SWAPCHAIN_IMAGE_WAIT_INFO};wi.timeout=XR_INFINITE_DURATION;
@@ -93,11 +94,12 @@ inline void run(PFN_xrGetInstanceProcAddr gipa,XrInstance instance,XrSession ses
         require(header->clientFrames.load()==before+1,"one atomic complete pair per publication");++publications;
         const auto slot=header->latest.load();require(slot>0&&slot<=3,"automatic complete transport slot");
         const auto& frame=header->frames[slot-1];
-        if(number==15) {require(frame.width==8&&frame.height==8&&!(frame.textureType&(1u<<16)),"empty-frame synchronous retirement");continue;}
+        if(number==15) {require(frame.width==8&&frame.height==8&&!(frame.textureType&(1u<<16)),"empty-frame synchronous retirement");source_timing_checks::absent(header);continue;}
         const auto& prior=expected[number==12?number:number-1];
         require(frame.width==prior.width&&frame.height==64&&!frame.bgra&&frame.pose.stamp==100.0f+prior.number,
                 "exact selected current/prior head stamp/layout, including synchronous quad fallback");
         projection_checks::verify(header,prior.views);
+        source_timing_checks::verify(header,prior.displayTime);
         require(halliday::frameColorSpace(frame.textureType,0)==2&&halliday::frameColorSpace(frame.textureType,1)==1,
                 "mixed native RGBA/BGRA preserves independent gamma tags");
         for(unsigned eye=0;eye<2;++eye) {

@@ -12,10 +12,14 @@ instead of counting head motion twice. Left and right eyes retain separate
 geometry, motion fields and GPU scene-cut flags.
 
 The same alignment pass also compares the original canonical real images,
-before camera compensation, using two GPU flags. An unchanged eye retains its
+before camera compensation, using per-eye flags and 16x16-pixel change maps. An unchanged eye retains its
 exact current pixels even when the tracked camera moves. This prevents
-head-locked menus from acquiring false motion solely from compensation. A
-changing eye still follows its own flow; no CPU readback or wait is added.
+head-locked menus from acquiring false motion solely from compensation. A small
+animated indicator no longer enables motion across the rest of an unchanged
+eye: each candidate needs change at the target or its current source location.
+Changes only at an older correspondence cannot launch stationary colours into
+unrelated regions. A moving silhouette can still forecast beyond its current
+edge. All masks stay on the GPU; no CPU readback or wait is added.
 
 On a repeated source frame, forward vectors indexed in current-image blocks
 extrapolate colour by `alpha × previous→current displacement`, with alpha at
@@ -41,6 +45,9 @@ provider primes history but never synthesizes.
 motion fixtures, plus authentic AMD integration and bounded GPU-stage timings.
 `tools/test-game-spacewarp-static-metal.sh` checks the complete genuine AMD path
 on flat, textured and menu images, including 2016x2048 per eye and +/-0.05-degree
-camera jitter over unchanged head-locked pixels.
+camera jitter over unchanged head-locked pixels, both with and without a small
+animated indicator. Static background checks exclude a documented 96x96-pixel
+corner around the 8x8 indicator in each eye; they do not assert its changing
+pixels are stationary.
 Readback/waits exist only in that test executable. Its timings exclude the game,
 headset scanout, Halliday scene compositor and end-to-end latency.

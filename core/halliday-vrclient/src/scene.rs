@@ -54,10 +54,8 @@ pub fn start_heartbeat() {
 
 /// Between VR_Init and VR_Shutdown.
 pub fn set_initialized(on: bool) {
-    if let Some(h) = header() {
-        // SAFETY: a mapped header.
-        unsafe { (*h).client_initialized.store(on as u32, Ordering::SeqCst) };
-    }
+    // connect already admitted this producer; cleanup may release only its own lease.
+    if !on { crate::runtime::disconnect(); }
 }
 
 // --- The scene and overlays ---

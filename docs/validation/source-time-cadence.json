@@ -1,0 +1,130 @@
+{
+  "coverage" : [
+    "same image times despite delayed\/bunched readback",
+    "actual43FPS under60FPS budget",
+    "skipped submissions",
+    "epoch\/kind\/time\/frame invalidation",
+    "availability transition",
+    "cached metadata change",
+    "receipt stall",
+    "legacy absence retains explicit approximate fallback"
+  ],
+  "pass" : true,
+  "results" : [
+    {
+      "case" : "regular",
+      "clock_kind" : 1,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 22.222222222222221,
+      "source_hz" : 45
+    },
+    {
+      "case" : "delayed",
+      "clock_kind" : 1,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 33.333333333333336,
+      "source_hz" : 45
+    },
+    {
+      "case" : "bunched",
+      "clock_kind" : 1,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 9.9999999999999991e-05,
+      "source_hz" : 45
+    },
+    {
+      "case" : "regular",
+      "clock_kind" : 2,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 22.222222222222221,
+      "source_hz" : 45
+    },
+    {
+      "case" : "delayed",
+      "clock_kind" : 2,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 33.333333333333336,
+      "source_hz" : 45
+    },
+    {
+      "case" : "bunched",
+      "clock_kind" : 2,
+      "display_hz" : 90,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 9.9999999999999991e-05,
+      "source_hz" : 45
+    },
+    {
+      "case" : "regular",
+      "clock_kind" : 1,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 16.666666666666668,
+      "source_hz" : 60
+    },
+    {
+      "case" : "delayed",
+      "clock_kind" : 1,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 25,
+      "source_hz" : 60
+    },
+    {
+      "case" : "bunched",
+      "clock_kind" : 1,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 9.9999999999999991e-05,
+      "source_hz" : 60
+    },
+    {
+      "case" : "regular",
+      "clock_kind" : 2,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 16.666666666666668,
+      "source_hz" : 60
+    },
+    {
+      "case" : "delayed",
+      "clock_kind" : 2,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 25,
+      "source_hz" : 60
+    },
+    {
+      "case" : "bunched",
+      "clock_kind" : 2,
+      "display_hz" : 120,
+      "phase" : 0.5,
+      "receipt_gap_ms" : 9.9999999999999991e-05,
+      "source_hz" : 60
+    },
+    {
+      "case" : "43fps",
+      "expected_phase" : 0.35833333261666661,
+      "phase" : 0.35833331942558289,
+      "receipt_gap_ms" : 23.255814000000004
+    },
+    {
+      "case" : "43fps",
+      "expected_phase" : 0.35833333261666661,
+      "phase" : 0.35833331942558289,
+      "receipt_gap_ms" : 30
+    },
+    {
+      "case" : "43fps",
+      "expected_phase" : 0.35833333261666661,
+      "phase" : 0.35833331942558289,
+      "receipt_gap_ms" : 0.10000000000000001
+    }
+  ],
+  "scope" : "CPU analytical trajectories; no GPU\/game\/headset measurement"
+}

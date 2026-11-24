@@ -13,6 +13,7 @@
 #include "panel_readback.hpp"
 #include "motion_bridge.hpp"
 #include "projection_geometry.hpp"
+#include "source_timing_bridge.hpp"
 #include "frame_timing.hpp"
 #include "d3d11_prior_staging.hpp"
 #include "d3d12_prior_staging.hpp"
@@ -647,7 +648,7 @@ bool controlSendHaptic(XrSession session, ControlHand hand, uint64_t duration, f
     return sent;
 }
 
-XrResult controlFrameReady(int64_t, uint64_t stamp, const ControlFrameView* views, uint32_t count,
+XrResult controlFrameReady(int64_t displayTime, uint64_t stamp, const ControlFrameView* views, uint32_t count,
     const ControlFrameQuad* quads,uint32_t quadCount,uint32_t projectionOrder,uint32_t projectionFlags,
     uint32_t frameSpaceEpoch) {
     if ((count!=0&&count!=2)||(count&&!views)||quadCount>halliday::panels::kMaximum||(!quads&&quadCount))return XR_ERROR_LAYER_INVALID;
@@ -738,12 +739,16 @@ XrResult controlFrameReady(int64_t, uint64_t stamp, const ControlFrameView* view
     timing::Span prepareTiming(timing::Phase::Prepare);
     bool prepared = false;
     PriorProjectionFrame captured{};
+    int64_t sourceDisplayTime = count ? displayTime : 0;
+    uint32_t sourceClockKind = count ? halliday::frame_timing::kClockXrDisplayTimeNs : 0;
     if (gPriorCapture && priorProjectionEligible(count,quadCount,projectionFlags,fullGeometry)) {
         PriorProjectionFrame submitted{};
         for (unsigned eye = 0; eye < 2; ++eye) {
             submitted.views[eye] = views[eye]; submitted.geometry[eye] = projectionViews[eye];
         }
         submitted.head = pose; submitted.producerEpoch = gHapticEpoch;
+        submitted.sourceDisplayTimeNs = sourceDisplayTime;
+        submitted.sourceClockKind = sourceClockKind;
         submitted.spaceEpoch = renderSpaceEpoch;
         submitted.focusGeneration = halliday::focus::generation(halliday::focus::extension(gHeader));
         submitted.projectionOrder = projectionOrder; submitted.projectionFlags = projectionFlags;
@@ -755,6 +760,8 @@ XrResult controlFrameReady(int64_t, uint64_t stamp, const ControlFrameView* view
             // Pixels, head pose, eye geometry, image orientation and semantics
             // all come from one older capture. Never tag prior pixels current.
             pose = captured.head; views = captured.views;
+            sourceDisplayTime = captured.sourceDisplayTimeNs;
+            sourceClockKind = captured.sourceClockKind;
             projectionOrder = captured.projectionOrder; projectionFlags = captured.projectionFlags;
             for (unsigned eye = 0; eye < 2; ++eye) projectionViews[eye] = captured.geometry[eye];
         }
@@ -819,6 +826,10 @@ XrResult controlFrameReady(int64_t, uint64_t stamp, const ControlFrameView* view
                 // A retired render packet is dropped, never retagged current.
                 if (!coordinatesCurrent()) {retiredCoordinates=true;dropped=true;return false;}
                 gHeader->frames[slot].seeThrough=(projectionFlags&1u)?1u:0u;
+                // Readback may return the preceding capture. Its submitted
+                // display time must stay with those exact pixels and cameras.
+                // Old hosts or unavailable times retain ordinary colour only.
+                halliday::source_timing::publish(gHeader,slot,index,gHapticEpoch,sourceDisplayTime,sourceClockKind);
                 if(fullGeometry&&!halliday::projection::publish(gHeader,slot,index,gHapticEpoch,projectionViews))return false;
                 if(!halliday::panels::publishPictures(gHeader,panelPixels,records)){dropped=true;return false;}
                return halliday::panels::publishBatch(gHeader,slot,index,gHapticEpoch,projectionOrder,projectionFlags,records);

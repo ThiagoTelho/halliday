@@ -314,6 +314,7 @@ int wmain(int argc, wchar_t** argv) {
 
     XrTime lastDisplayTime = 0;
     XrCompositionLayerProjectionView lastProjected[2]{{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW},{XR_TYPE_COMPOSITION_LAYER_PROJECTION_VIEW}};
+    int64_t priorProjectionDisplayTime=0;
     for (unsigned pass = 0; pass < 3; ++pass) {
         fixture.header->stateSeq.fetch_add(1);
         fixture.header->state.head.position[1] = 1.6f + .1f * pass;
@@ -400,6 +401,7 @@ int wmain(int argc, wchar_t** argv) {
             end.displayTime=frame.predictedDisplayTime;lastDisplayTime=frame.predictedDisplayTime;
         }
         const auto before = fixture.header->clientFrames.load();
+        const int64_t submittedDisplayTime=end.displayTime;
         const auto latest = fixture.header->latest.load();
         require(load<PFN_xrEndFrame>("xrEndFrame")(session,&end) == XR_SUCCESS,
             "submit D3D12 projection with changing pose/FOV");
@@ -412,6 +414,7 @@ int wmain(int argc, wchar_t** argv) {
             XrCompositionLayerProjectionView priorWorld[2]{lastProjected[0],lastProjected[1]};
             for(auto& view:priorWorld)view.pose.position.y+=1.6f;
             projection_checks::verify(fixture.header,priorWorld);
+            source_timing_checks::verify(fixture.header,priorProjectionDisplayTime);
             const auto oldSlot=fixture.header->latest.load();const auto& old=fixture.header->frames[oldSlot-1];
             require(old.width==64&&old.height==64&&old.pose.stamp==41.f+pass&&old.bgra==0&&
                 std::abs(old.pose.position[1]-(1.6f+.1f*(pass-1)))<.0001f,
@@ -429,9 +432,11 @@ int wmain(int argc, wchar_t** argv) {
             load<PFN_xrBeginFrame>("xrBeginFrame")(session,nullptr) == XR_SUCCESS,
             "begin next D3D12 capture of the same rendered image");
         end.displayTime=frame.predictedDisplayTime;lastDisplayTime=frame.predictedDisplayTime;
+        priorProjectionDisplayTime=end.displayTime;
         require(load<PFN_xrEndFrame>("xrEndFrame")(session,&end) == XR_SUCCESS &&
             fixture.header->clientFrames.load() == before+(pass?2u:1u),
             "publish exactly the preceding D3D12 image and complete projection packet");
+        source_timing_checks::verify(fixture.header,submittedDisplayTime);
         XrCompositionLayerProjectionView world[2]{projected[0],projected[1]};
         for(auto& view:world)view.pose.position.y+=1.6f;
         projection_checks::verify(fixture.header,world);

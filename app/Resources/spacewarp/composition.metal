@@ -34,6 +34,11 @@ kernel void spacewarp_canonical(texture2d<float, access::read> source [[texture(
 
 constexpr sampler linear_pixel(coord::pixel, address::clamp_to_edge, filter::linear);
 
+uint source_change_index(uint2 local, uint eye, uint eyeWidth, uint height) {
+    uint columns = (eyeWidth + 15u) / 16u, rows = (height + 15u) / 16u;
+    return 2u + eye * columns * rows + (local.y / 16u) * columns + local.x / 16u;
+}
+
 float4 eye_sample(texture2d<float, access::sample> image, float2 p, uint eye, uint eyeWidth) {
     float2 lo(float(eye * eyeWidth) + 0.5, 0.5);
     float2 hi(float((eye + 1) * eyeWidth) - 0.5, float(image.get_height()) - 0.5);
@@ -52,9 +57,13 @@ kernel void spacewarp_align(texture2d<float, access::sample> previous [[texture(
     uint eye = p.x / u.dimensions.z;
     // Compare real images before camera compensation. In an opaque head-locked
     // UI, camera jitter is not evidence that its unchanged pixels should move.
-    if (any(previous.read(p).rgb != current.read(p).rgb) &&
-        atomic_load_explicit(sourceChange + eye, memory_order_relaxed) == 0)
-        atomic_fetch_or_explicit(sourceChange + eye, 1u, memory_order_relaxed);
+    if (any(previous.read(p).rgb != current.read(p).rgb)) {
+        uint tile = source_change_index(uint2(p.x % u.dimensions.z, p.y), eye, u.dimensions.z, u.dimensions.y);
+        if (atomic_load_explicit(sourceChange + tile, memory_order_relaxed) == 0)
+            atomic_fetch_or_explicit(sourceChange + tile, 1u, memory_order_relaxed);
+        if (atomic_load_explicit(sourceChange + eye, memory_order_relaxed) == 0)
+            atomic_fetch_or_explicit(sourceChange + eye, 1u, memory_order_relaxed);
+    }
     float2 uv = (float2(p.x % u.dimensions.z, p.y) + 0.5) / float2(u.dimensions.zy);
     float4 ct = eye == 0 ? u.currentLeft : u.currentRight;
     float4 pt = eye == 0 ? u.previousLeft : u.previousRight;
@@ -88,6 +97,13 @@ float error_rgb(float3 a, float3 b) { return max(max(abs(a.x-b.x), abs(a.y-b.y))
 bool inside_eye(float2 p, constant SynthesisConstants &u) {
     return all(p >= 0.5) && p.x <= float(u.dimensions.z)-0.5 && p.y <= float(u.dimensions.y)-0.5;
 }
+bool real_source_changed(float2 p, uint eye, constant SynthesisConstants &u,
+                         device atomic_uint *sourceChange) {
+    if (!inside_eye(p,u)) return false;
+    uint2 pixel = uint2(clamp(floor(p), float2(0), float2(u.dimensions.z-1u,u.dimensions.y-1u)));
+    uint index = source_change_index(pixel, eye, u.dimensions.z, u.dimensions.y);
+    return atomic_load_explicit(sourceChange + index, memory_order_relaxed) != 0;
+}
 
 // Motion belongs to CURRENT blocks. Pull candidates from nearby current blocks
 // so a moving foreground can reach beyond its current silhouette. Photometric
@@ -117,11 +133,23 @@ kernel void spacewarp_extrapolate(texture2d<float, access::sample> current [[tex
         if (!duplicate) candidates[count++] = v;
     }
     if (count == 1 && length(candidates[0]) < 0.25) { target.write(float4(original,1),p); return; }
+    // Match temporal support before trusting camera-compensated block flow.
+    // A forecast may reach outside a moving silhouette, so check its CURRENT
+    // source location too; a target-only mask would clip it. A change only at
+    // the older correspondence must not launch stationary colours elsewhere.
+    bool changedTarget = real_source_changed(at,eye,u,sourceChange);
+    bool changing = changedTarget;
+    for (uint i=0; i<count && !changing; ++i) {
+        float2 s = at - u.scaleAlpha.z * candidates[i];
+        changing = real_source_changed(s,eye,u,sourceChange);
+    }
+    if (!changing) { target.write(float4(original,1),p); return; }
     float3 best = original; float bestScore = -1; float2 largest(0);
     for (uint i=0; i<count; ++i) {
         float2 v = candidates[i]; if (length(v)>length(largest)) largest=v;
         float2 s = at - u.scaleAlpha.z*v;
         if (!inside_eye(s,u) || !inside_eye(s-v,u)) continue;
+        if (!changedTarget && !real_source_changed(s,eye,u,sourceChange)) continue;
         float2 actual = source_flow(flow,flow_cell(s,u),eye,u);
         if (distance(actual,v)>max(1.5,0.15*length(v))) continue;
         float4 prior = eye_sample(alignedPrevious,s-v,eye,u.dimensions.z);
@@ -131,7 +159,7 @@ kernel void spacewarp_extrapolate(texture2d<float, access::sample> current [[tex
         float score = min(length(v),32.0) * 0.01 + (1-error)*0.1;
         if (score>bestScore) { bestScore=score; best=colour; }
     }
-    if (bestScore<0 && length(largest)>0.25) {
+    if (bestScore<0 && changedTarget && length(largest)>0.25) {
         // A trailing silhouette has no exact inverse sample. Seek a nearby
         // stationary colour away from its motion; otherwise retain current.
         float2 away=-normalize(largest);

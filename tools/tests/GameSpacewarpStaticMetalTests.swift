@@ -25,7 +25,10 @@ import simd
         let descriptor = GameSpacewarp.Descriptor(orientation: [0, 0, 0, 1], position: .zero,
             tangentsLeft: tangents, tangentsRight: tangents, flipped: false, colourSpaces: .zero)
         var results: [[String: Any]] = []
-        for (eyeWidth, height, pattern, jitter) in [(512,512,0,false), (512,512,1,false), (512,512,2,false), (2016,2048,1,false), (512,512,1,true), (2016,2048,1,true)] {
+        for (eyeWidth, height, pattern, jitter, partial) in [
+            (512,512,0,false,false), (512,512,1,false,false), (512,512,2,false,false),
+            (2016,2048,1,false,false), (512,512,1,true,false), (2016,2048,1,true,false),
+            (512,512,1,true,true), (512,512,2,true,true), (2016,2048,1,true,true)] {
             let width = eyeWidth * 2
             let d = MTLTextureDescriptor.texture2DDescriptor(pixelFormat: .rgba8Unorm, width: width, height: height, mipmapped: false)
             d.storageMode = .shared; d.usage = .shaderRead
@@ -48,6 +51,18 @@ import simd
             var maximumChanged = 0, maximumError = 0, maximumExactDifference = 0
             var samples: [[Int]] = [], gpu: [Double] = []
             for sequence in 1...10 {
+                if partial {
+                    // A tiny animated indicator must not make the rest of an
+                    // otherwise static opaque menu acquire invented motion.
+                    for eye in 0..<2 { for y in 16..<24 { for x in 16..<24 {
+                        let at = (y * width + eye * eyeWidth + x) * 4
+                        expected[at] = sequence % 2 == 0 ? 80 : 180
+                        expected[at+1] = sequence % 2 == 0 ? 180 : 80
+                        expected[at+2] = 90
+                    }}}
+                    expected.withUnsafeBytes { source.replace(region: MTLRegionMake2D(0,0,width,height), mipmapLevel:0,
+                        withBytes:$0.baseAddress!, bytesPerRow:width*4) }
+                }
                 let cb = queue.makeCommandBuffer()!
                 let yaw: Float = jitter ? (sequence % 2 == 0 ? 0.05 : -0.05) * .pi / 180 : 0
                 let camera = jitter ? GameSpacewarp.Descriptor(orientation: simd_quatf(angle: yaw,axis:[0,1,0]).vector, position: .zero,
@@ -69,6 +84,7 @@ import simd
                 let actual = copy.contents().assumingMemoryBound(to: UInt8.self)
                 var changed = 0, exact = 0, error = 0
                 for y in 0..<height { for x in 0..<width {
+                    if partial && x % eyeWidth < 96 && y < 96 { continue }
                     var e = 0
                     for c in 0..<3 { e = max(e,abs(Int(actual[y*row+x*4+c])-Int(expected[(y*width+x)*4+c]))) }
                     if e > 0 { exact += 1 }
@@ -83,13 +99,14 @@ import simd
             let result: [String:Any] = ["eye_width":eyeWidth,"height":height,"pattern":pattern,"frames":10,"head_locked_menu_camera_yaw_jitter_deg":jitter ? 0.05 : 0,
                 "changed_pixels_over_one_level_max":maximumChanged,"changed_pixels_any_max":maximumExactDifference,
                 "max_rgb_error":maximumError,"pixel_count":width*height,"sample_artifacts":samples,"gpu_ms":gpu,
-                "scope":jitter ? "Unchanged head-locked menu pixels with tracked camera yaw oscillating by +/-0.05 degrees; genuine AMD plus production synthesis" : "Unchanged real source pixels and camera; genuine production AMD Optical Flow plus production synthesis, not fixture vectors"]
+                "animated_indicator":partial,"background_exclusion_top_left_per_eye":partial ? [96,96] : [0,0],
+                "scope":partial ? "Head-locked menu/background with an animated8x8 indicator; exact background outside96x96 region in each eye, genuine AMD and production synthesis" : jitter ? "Unchanged head-locked menu pixels with tracked camera yaw oscillating by +/-0.05 degrees; genuine AMD plus production synthesis" : "Unchanged real source pixels and camera; genuine production AMD Optical Flow plus production synthesis, not fixture vectors"]
             results.append(result)
-            print("STATIC \(eyeWidth)x\(height) pattern\(pattern) jitter\(jitter): changed>1=\(maximumChanged), maxRGB=\(maximumError)")
+            print("STATIC \(eyeWidth)x\(height) pattern\(pattern) jitter\(jitter) indicator\(partial): changed>1=\(maximumChanged), maxRGB=\(maximumError)")
         }
         let destination = URL(fileURLWithPath: CommandLine.arguments[2])
         try JSONSerialization.data(withJSONObject: results, options: [.prettyPrinted,.sortedKeys]).write(to: destination)
         require(results.allSatisfy { ($0["max_rgb_error"] as? Int) == 0 },
-                "Unchanged source pixels must remain bit exact, including a head-locked menu under tracking jitter")
+                "Static source regions must remain bit exact, including head-locked menus with tracking jitter and a small animated indicator")
     }
 }

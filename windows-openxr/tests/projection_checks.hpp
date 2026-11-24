@@ -12,6 +12,7 @@
 #include <new>
 #include "haptic_bridge.hpp"
 #include "panel_bridge.hpp"
+#include "source_timing_checks.hpp"
 #ifdef XR_USE_GRAPHICS_API_VULKAN
 #include "vulkan_counting_loader.hpp"
 #endif
@@ -24,6 +25,7 @@ inline void initialize(halliday::Header* header) {
     words[0]=0x47504c48;words[1]=1;words[2]=112;words[3]=3;
     auto* panels=new(reinterpret_cast<uint8_t*>(header)+halliday::panels::kOffset)halliday::panels::Extension{};
     panels->magic=halliday::panels::kMagic;panels->version=halliday::panels::kVersion;
+    source_timing_checks::initialize(header);
 }
 inline void verify(halliday::Header* header,const XrCompositionLayerProjectionView source[2]) {
     const uint32_t slot=header->latest.load();require(slot>0&&slot<=3,"HLPG has a complete source frame");

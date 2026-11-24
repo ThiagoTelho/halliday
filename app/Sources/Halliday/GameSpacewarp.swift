@@ -159,7 +159,7 @@ final class GameSpacewarp: @unchecked Sendable {
         // A head-locked menu can have identical real pixels while the tracked
         // camera moves. Alignment alone must not invent animation in it.
         guard let clear = cb.makeBlitCommandEncoder() else { return true }
-        clear.fill(buffer: bank.sourceChange, range: 0..<8, value: 0)
+        clear.fill(buffer: bank.sourceChange, range: 0..<bank.sourceChange.length, value: 0)
         clear.endEncoding()
         guard encode(alignmentPipeline, textures: [previous, current, bank.aligned], constants: &align,
                      sourceChange: bank.sourceChange, into: cb),
@@ -226,8 +226,13 @@ final class GameSpacewarp: @unchecked Sendable {
             guard let t = device.makeTexture(descriptor: d) else { throw Failure.allocation }
             t.label = name; return t
         }
-        guard let sourceChange = device.makeBuffer(length: 8, options: .storageModePrivate) else { throw Failure.allocation }
-        sourceChange.label = "Spacewarp real source changes per eye"
+        // The two eye flags are followed by independent 16x16-pixel source
+        // change maps. A small animated indicator must not enable spurious
+        // motion in an otherwise unchanged head-locked menu/background.
+        let columns = (width / 2 + 15) / 16, rows = (height + 15) / 16
+        let changeBytes = (2 + 2 * columns * rows) * MemoryLayout<UInt32>.stride
+        guard let sourceChange = device.makeBuffer(length: changeBytes, options: .storageModePrivate) else { throw Failure.allocation }
+        sourceChange.label = "Spacewarp real source changes per eye and tile"
         return try Bank(histories: [texture("Spacewarp real A"), texture("Spacewarp real B")],
                         aligned: texture("Spacewarp head-aligned previous"), output: texture("Spacewarp predicted"),
                         sourceChange: sourceChange)

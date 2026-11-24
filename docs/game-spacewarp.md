@@ -31,12 +31,20 @@ depth buffer, motion-vector integration or graphics-API-specific mod is needed.
   images never enter real-image history. Latest-head reprojection still runs for
   every physical refresh. There is no CPU readback/wait in production encoding.
 - Source-identical eyes retain exact current pixels before camera compensation
-  can manufacture false motion in a head-locked menu. Scene cuts and unsupported
+  can manufacture false motion in a head-locked menu. Per-eye16×16 source-change
+  maps also protect unchanged background when a small UI indicator animates.
+  Candidates need temporal change at the target or current source location;
+  an older-only correspondence cannot invent motion elsewhere. Scene cuts and unsupported
   regions conservatively retain current colour. Histories reset on source/geometry,
   cadence, clock, pose, session and effect-state discontinuities.
 - Once a bounded forecast has been displayed, a missed source retains that exact
   phase instead of reverting to older real pixels. It never starts or advances a
   first forecast from stale motion. See [cadence rationale](spacewarp-cadence.md).
+- Optional [per-image producer timing](source-image-timing.md) scales motion by
+  the actual selected pair's same-clock time difference, independently of
+  delayed/bunched host imports. A 43 FPS producer under a 60 FPS budget retains its
+  actual interval. Legacy absence keeps the explicit approximate arrival fallback;
+  invalid advertised timing retains real pixels while prediction is re-primed.
 
 This is image-only prediction, **not AMD FSR Frame Generation or application
 spacewarp with depth/motion vectors**. It does not increase game simulation FPS.
@@ -47,6 +55,7 @@ comfortable gameplay or resolve every previous headset report of judder/artifact
 ## Validation
 
 CPU: `tools/test-game-spacewarp-cadence.sh`,
+`tools/test-game-spacewarp-source-time.sh`,
 `tools/test-game-spacewarp-settings.sh` and the offline shader hash/notice check
 `tools/test-amd-optical-flow-provenance.py` (`make spacewarp-check`).
 
@@ -64,6 +73,13 @@ also remained bit exact. The [CPU replay](validation/spacewarp-cadence.json)
 records one backward marker step before the cadence guard and none after, at
 both 45→90 and 60→120 Hz. These are correctness comparisons; no game-performance,
 optical-latency or headset comfort improvement is claimed from them.
+
+The [partial-static regression](validation/spacewarp-partial-static.json) also
+adds a changing 8×8 indicator to otherwise stationary pictures. At 2016×2048 per eye,
+background pixels differing by more than one 8-bit level fell from 155,277 to 0;
+textured 512×512 fell from 419,549 to 0. All nine full/partial-static cases were bit
+exact after the local mask. These synthetic GPU results do not establish physical
+smoothness, game FPS or end-to-end latency.
 
 AMD's pinned revision, source/output hashes and reproduction script are in
 [Optical Flow provenance](../app/Resources/amd-optical-flow/SOURCE.md).

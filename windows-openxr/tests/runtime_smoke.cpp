@@ -341,11 +341,13 @@ int wmain(int argc,wchar_t** argv) {
     XrFrameEndInfo end{XR_TYPE_FRAME_END_INFO}; end.displayTime = frame.predictedDisplayTime;
     end.environmentBlendMode = XR_ENVIRONMENT_BLEND_MODE_OPAQUE; end.layerCount = 1; end.layers = layers;
     bool havePriorProjection = false;
+    int64_t priorProjectionDisplayTime = 0;
     XrCompositionLayerProjectionView priorProjectionViews[2]{};
     auto submitProjectionPair = [&] {
         const auto before = fixture.header->clientFrames.load();
         const auto latest = fixture.header->latest.load();
         end.displayTime = frame.predictedDisplayTime;
+        const int64_t submittedDisplayTime = end.displayTime;
         require(load<PFN_xrEndFrame>("xrEndFrame")(session,&end) == XR_SUCCESS,
             "submit D3D11 projection with changing pose/FOV");
         if (!havePriorProjection) {
@@ -357,6 +359,7 @@ int wmain(int argc,wchar_t** argv) {
             XrCompositionLayerProjectionView oldWorld[2]{priorProjectionViews[0],priorProjectionViews[1]};
             for (auto& view:oldWorld) view.pose.position.y+=1.6f;
             projection_checks::verify(fixture.header,oldWorld);
+            source_timing_checks::verify(fixture.header,priorProjectionDisplayTime);
             const auto oldSlot=fixture.header->latest.load();const auto& old=fixture.header->frames[oldSlot-1];
             require(old.width==64&&old.height==64&&old.pose.stamp==42&&old.bgra==1,
                 "older D3D11 pixels retain their own drawn pose and layout while FOV changes");
@@ -372,9 +375,12 @@ int wmain(int argc,wchar_t** argv) {
             load<PFN_xrBeginFrame>("xrBeginFrame")(session,nullptr) == XR_SUCCESS,
             "begin next D3D11 capture of the same rendered image");
         end.displayTime = frame.predictedDisplayTime;
+        const int64_t nextCaptureDisplayTime = end.displayTime;
         require(load<PFN_xrEndFrame>("xrEndFrame")(session,&end) == XR_SUCCESS &&
             fixture.header->clientFrames.load() == before+(havePriorProjection?2u:1u),
             "publish exactly the preceding D3D11 image and complete projection packet");
+        source_timing_checks::verify(fixture.header,submittedDisplayTime);
+        priorProjectionDisplayTime = nextCaptureDisplayTime;
         std::copy(std::begin(projectionViews),std::end(projectionViews),std::begin(priorProjectionViews));
         havePriorProjection=true;
     };

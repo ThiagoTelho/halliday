@@ -1134,6 +1134,7 @@ pub struct HallidayBridgeConfig {
 
 pub type HallidayBridgeProjectionView = halliday_bridge::projection::View;
 pub type HallidayBridgeProjectionGeometry = halliday_bridge::projection::Snapshot;
+pub type HallidayBridgeFrameTiming = halliday_bridge::frame_timing::Snapshot;
 
 // --- Game controller output ---
 
@@ -1736,6 +1737,36 @@ pub unsafe extern "C" fn halliday_bridge_projection_geometry(
         }
         Ok(None) => 0,
         Err(()) => -1,
+    }
+}
+
+/// Optional exact-image producer timing: 1 valid, 0 legacy absent, -1 invalid timing only.
+/// # Safety
+/// The caller owns the frame read lease and an open bridge, or passes null.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_frame_timing(
+    bridge: *const HallidayGameBridge, slot: u32, frame_index: u64,
+    out: *mut HallidayBridgeFrameTiming,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else { return -1; };
+    *out = HallidayBridgeFrameTiming::default();
+    let Some(bridge) = (unsafe { bridge.as_ref() }) else { return -1; };
+    match bridge.0.frame_timing(slot as usize, frame_index) {
+        Ok(Some(value)) => { *out = value; 1 }, Ok(None) => 0, Err(()) => -1,
+    }
+}
+/// # Safety
+/// Open bridge and writable output, or null. Number/index identify the exact captured window frame.
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_present_frame_timing(
+    bridge: *const HallidayGameBridge, number: u32, frame_index: u64,
+    out: *mut HallidayBridgeFrameTiming,
+) -> i32 {
+    let Some(out) = (unsafe { out.as_mut() }) else { return -1; };
+    *out = HallidayBridgeFrameTiming::default();
+    let Some(bridge) = (unsafe { bridge.as_ref() }) else { return -1; };
+    match bridge.0.present_frame_timing(number, frame_index) {
+        Ok(Some(value)) => { *out = value; 1 }, Ok(None) => 0, Err(()) => -1,
     }
 }
 
