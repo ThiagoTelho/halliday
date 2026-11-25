@@ -8,3 +8,4 @@ xcrun swiftc -swift-version 6 -target "$(uname -m)-apple-macos14.0" -module-cach
   "$repo_dir/app/Sources/Halliday/GameControllerTouch.swift" \
   "$repo_dir/tools/tests/SenseLEDFeedbackAndTouchTests.swift" -o "$repo_dir/build/tests/sense-led-feedback-and-touch-tests"
 "$repo_dir/build/tests/sense-led-feedback-and-touch-tests"
+python3 "$repo_dir/tools/tests/test-sense-led-feedback-and-touch-wiring.py"

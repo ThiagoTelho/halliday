@@ -8,6 +8,7 @@ final class Settings {
     private let defaults: UserDefaults
     /// Called after any setting changes.
     var onChange: (() -> Void)?
+    /// Crop changes only renegotiate the next game camera; they must not reanchor the VR UI.
     var onGameCropChange: (() -> Void)?
 
     /// How the space behaves around the user.
@@ -81,6 +82,14 @@ final class Settings {
         didSet { defaults.set(volume, forKey: "volume"); onChange?() }
     }
 
+    /// Relay other apps' system audio into the headset while a VR game is active.
+    /// The system's default output and microphone are never changed.
+
+    /// Keep the prior exposure-clock path available as an immediate rollback.
+    var senseLEDFeedback: Bool {
+        didSet { defaults.set(senseLEDFeedback, forKey: "senseLEDFeedback"); onChange?() }
+    }
+
     /// Zero retains the Mac's current mode until the user chooses 90 or 120 Hz.
     /// Persist only after a physical mode change has actually been verified.
     var headsetRefreshHz: Int {
@@ -101,11 +110,11 @@ final class Settings {
         didSet { defaults.set(vrPageEye, forKey: "vrPageEye"); onChange?() }
     }
 
+
     /// FSR 1 processes game frames before the headset's lens correction.
     var gameFSREnabled: Bool {
         didSet { defaults.set(gameFSREnabled, forKey: "gameFSREnabled"); onChange?() }
     }
-
     var gameCropEnabled: Bool {
         didSet { defaults.set(gameCropEnabled, forKey: "gameCropEnabled"); notifyGameCropChange() }
     }
@@ -151,7 +160,21 @@ final class Settings {
         set { gameHalfFrameRateMode = newValue ? .on : .off }
     }
 
+    /// Initial cadence, before Auto has observed an active producer. Framegen being armed
+    /// must not override Auto or a deliberate Off selection.
     var effectiveGameHalfFrameRate: Bool { gameHalfFrameRateMode == .on }
+
+    enum NativeOpenXRBackend: String, CaseIterable, Identifiable, Sendable {
+        case halliday = "halliday"
+        var id: String { rawValue }
+        var title: String { "Halliday" }
+    }
+
+    /// Native games use Halliday's source-built runtime.
+    var nativeOpenXRBackend: NativeOpenXRBackend {
+        didSet { defaults.set(nativeOpenXRBackend.rawValue, forKey: "nativeOpenXRBackend"); onChange?() }
+    }
+
 
     /// Percentage of the full game image rendered by the game, in five-percent steps.
     static let gameRenderPercentRange = 50...100
@@ -194,7 +217,7 @@ final class Settings {
            let mode = GameHalfFrameRateMode(rawValue: saved) { return mode }
         // Old versions ORed both switches. Retain their effective cadence when no new
         // choice exists; once Off is explicitly saved, Framegen cannot override it.
-        return defaults.bool(forKey: "gameHalfFrameRate") || defaults.bool(forKey: "gameSpacewarpEnabled") ? .on : .off
+        return defaults.bool(forKey: "gameHalfFrameRate") ? .on : .off
     }
 
     /// The Windows panel's layout is remembered for each set of apps open together.
@@ -204,12 +227,14 @@ final class Settings {
 
     init(defaults: UserDefaults) {
         self.defaults = defaults
+        senseLEDFeedback = defaults.object(forKey: "senseLEDFeedback") as? Bool ?? true
         gameFSREnabled = defaults.bool(forKey: "gameFSREnabled")
         gameCropEnabled = defaults.bool(forKey: "gameCropEnabled")
         gameCropHorizontal = Self.validGameCrop((defaults.object(forKey: "gameCropHorizontal") as? NSNumber)?.floatValue ?? 0.85, fallback: 0.85)
         gameCropVertical = Self.validGameCrop((defaults.object(forKey: "gameCropVertical") as? NSNumber)?.floatValue ?? 0.90, fallback: 0.90)
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
         gameHalfFrameRateMode = Self.storedHalfFrameRateMode(defaults)
+        nativeOpenXRBackend = defaults.string(forKey: "nativeOpenXRBackend").flatMap(NativeOpenXRBackend.init(rawValue:)) ?? .halliday
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)
         let sharpness = defaults.object(forKey: "gameSharpness")

@@ -26,6 +26,7 @@ final class SettingsPanel: VRPanel {
     private var glass: CGRect { CGRect(x: Self.margin, y: Self.margin, width: Self.width, height: Self.height) }
     private var tracks: [String: CGRect] = [:]
     private var showingGameImage = false
+    private var showingTracking = false
     private var showingFOV = false
 
     init(renderer: Renderer) {
@@ -41,11 +42,13 @@ final class SettingsPanel: VRPanel {
     private func activate(_ id: String) {
         switch id {
         case "close": onClose?()
-        case "page:general": showingGameImage = false; showingFOV = false
-        case "page:gameImage": showingGameImage = true; showingFOV = false
-        case "page:fov": showingFOV = true; showingGameImage = false
-        case "game:crop": settings.gameCropEnabled.toggle()
+        case "page:general": showingGameImage = false; showingTracking = false; showingFOV = false
+        case "page:gameImage": showingGameImage = true; showingTracking = false; showingFOV = false
+        case "page:tracking": showingGameImage = false; showingTracking = true; showingFOV = false
+        case "page:fov": showingGameImage = false; showingTracking = false; showingFOV = true
+        case "tracking:led": settings.senseLEDFeedback.toggle()
         case "game:fsr": settings.gameFSREnabled.toggle()
+        case "game:crop": settings.gameCropEnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
         case "game:half:off": settings.gameHalfFrameRateMode = .off
         case "game:half:on": settings.gameHalfFrameRateMode = .on
@@ -97,13 +100,13 @@ final class SettingsPanel: VRPanel {
         case "distance": settings.panelDistance = (value(Settings.panelDistanceRange) * 10).rounded() / 10
         case "dimming": settings.dimming = (value(Settings.dimmingRange) * 20).rounded() / 20
         case "speed": settings.pointerSpeed = (value(Settings.pointerSpeedRange) * 10).rounded() / 10
-        case "game:cropHorizontal", "game:cropVertical":
-            guard settings.gameCropEnabled else { return }
-            let fraction = (0.5 + t * 0.5) * 100
-            if id == "game:cropHorizontal" { settings.gameCropHorizontal = fraction.rounded() / 100 }
-            else { settings.gameCropVertical = fraction.rounded() / 100 }
         case "game:scale": settings.gameRenderPercent = Int((50 + t * 50) / 5 + 0.5) * 5
         case "game:sharpness": settings.gameSharpness = (t * 20).rounded() / 20
+        case "game:cropHorizontal", "game:cropVertical":
+            guard settings.gameCropEnabled else { return }
+            let fraction = ((0.5 + t * 0.5) * 100).rounded() / 100
+            if id == "game:cropHorizontal" { settings.gameCropHorizontal = fraction }
+            else { settings.gameCropVertical = fraction }
         case "sound":
             let before = settings.soundVolume
             settings.soundVolume = (t * 10).rounded() / 10
@@ -122,20 +125,28 @@ final class SettingsPanel: VRPanel {
         let x = g.minX + 28, w = g.width - 56
         // The header (board 20): the title and whose settings these are.
         NightGlass.drawText("Settings", at: CGPoint(x: x, y: g.minY + 18), style: .title)
-        NightGlass.drawText("Halliday, on this Mac", at: CGPoint(x: x, y: g.minY + 50), style: .caption, color: NightGlass.secondary)
+        NightGlass.drawText("\(RuntimePaths.displayName), on this Mac", at: CGPoint(x: x, y: g.minY + 50), style: .caption, color: NightGlass.secondary)
         let close = CGRect(x: g.maxX - 60, y: g.minY + 18, width: 40, height: 40)
         iconButton(ctx, "close", "xmark", close, symbolSize: 14, quiet: true)
         var y = g.minY + 86
         tracks.removeAll(keepingCapacity: true)
-        y = segmented(ctx, [("page:general", "General", !showingGameImage && !showingFOV),
-                            ("page:gameImage", "Game image", showingGameImage), ("page:fov", "FOV", showingFOV)], x: x, y: y, width: w)
+        y = segmented(ctx, [("page:general", "General", !showingGameImage && !showingTracking && !showingFOV),
+                            ("page:gameImage", "Game image", showingGameImage),
+                            ("page:tracking", "Tracking", showingTracking),
+                            ("page:fov", "FOV", showingFOV)], x: x, y: y, width: w)
         y += 4
-
+        animates = showingTracking
         if showingFOV {
             drawFOV(ctx, x: x, y: y, width: w)
             drawVersion(x: x)
             return
         }
+        if showingTracking {
+            drawTracking(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
+
         if showingGameImage {
             drawGameImage(ctx, x: x, y: y, width: w)
             drawVersion(x: x)
@@ -211,14 +222,22 @@ final class SettingsPanel: VRPanel {
 
         let refresh = refreshState?() ?? (rates: [], current: 0, busy: false)
         _ = row(ctx, "Refresh rate", "display", (0xB79BFF, 0x6A47D6), ids: ["display:90", "display:120"], x: rx, y: y, width: rw) { r in
-            let left = CGRect(x: r.maxX - 14 - 184, y: r.midY - 20, width: 86, height: 40)
-            self.button(ctx, "display:90", "90 Hz", left, kind: refresh.current == 90 ? .main : .plain,
+            let left = CGRect(x: r.maxX - 14 - 224, y: r.midY - 20, width: 106, height: 40)
+            self.button(ctx, "display:90", "90 Hz", left, symbol: refresh.current == 90 ? "checkmark" : nil,
                         enabled: !refresh.busy && refresh.rates.contains(90), selected: refresh.current == 90)
-            self.button(ctx, "display:120", "120 Hz", left.offsetBy(dx: 94, dy: 0), kind: refresh.current == 120 ? .main : .plain,
+            self.button(ctx, "display:120", "120 Hz", left.offsetBy(dx: 118, dy: 0), symbol: refresh.current == 120 ? "checkmark" : nil,
                         enabled: !refresh.busy && refresh.rates.contains(120), selected: refresh.current == 120)
         }
 
         drawVersion(x: x)
+    }
+
+    private func drawTracking(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        let y = section(ctx, "PS VR2 tracking", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        _ = row(ctx, "LED sync feedback", "lightbulb", (0xFFBF77, 0xBA7430), ids: ["tracking:led"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "tracking:led", self.settings.senseLEDFeedback, CGRect(x: r.maxX - 74, y: r.midY - 17, width: 60, height: 34))
+        }
     }
 
     private func drawFOV(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
@@ -257,9 +276,7 @@ final class SettingsPanel: VRPanel {
                             at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
         NightGlass.drawText("Lower is faster; higher keeps more detail.", at: CGPoint(x: x, y: y + 30), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Restart the game to apply render scale.", at: CGPoint(x: x, y: y + 56), style: .caption,
-                            color: NightGlass.secondary, width: width)
-        y += 100
+        y += 60
         y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:half:off", "game:half:on", "game:half:auto"], x: rx, y: y, width: rw) { r in
             _ = self.segmented(ctx, GameHalfFrameRateMode.allCases.map {
                 ("game:half:" + $0.rawValue, $0.title, self.settings.gameHalfFrameRateMode == $0)
@@ -277,14 +294,13 @@ final class SettingsPanel: VRPanel {
                       CGFloat(settings.gameSharpness), x: rx, y: y, width: rw)
         NightGlass.drawText("Sharpening works with FSR on or off.", at: CGPoint(x: x, y: y + 8), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("Both switches and sharpness apply immediately.", at: CGPoint(x: x, y: y + 34), style: .caption,
+        NightGlass.drawText("Restart the game to apply crop or render scale.", at: CGPoint(x: x, y: y + 34), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("100%, both off: the game image is shown unchanged.", at: CGPoint(x: x, y: y + 60), style: .caption,
-                            color: NightGlass.secondary, width: width)
+        y += 70
     }
 
     private func drawVersion(x: CGFloat) {
-        let version = "Halliday · core \(String(cString: halliday_core_version()))"
+        let version = "\(RuntimePaths.displayName) · core \(String(cString: halliday_core_version()))"
         NightGlass.drawText(version, at: CGPoint(x: x, y: glass.maxY - 30), style: .caption, color: NightGlass.tertiary)
     }
 

@@ -23,6 +23,10 @@ final class Updates: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStandard
     @Published private(set) var waiting: String?
     @Published private(set) var automatic = false
     private var controller: SPUStandardUpdaterController?
+    var available: Bool {
+        Bundle.main.object(forInfoDictionaryKey: "HallidayDevelopmentBuild") as? Bool != true
+            && Bundle.main.object(forInfoDictionaryKey: "SUFeedURL") as? String != nil
+    }
 
     /// True while the headset is connected, where Sparkle's window would not be seen (AppDelegate).
     var onHeadset: (() -> Bool)?
@@ -34,7 +38,7 @@ final class Updates: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStandard
     /// Starts Sparkle, except in test runs (nothing is checked then; it only checks by itself when
     /// automatic checks are on, and Info.plist's `SUEnableAutomaticChecks` keeps them off at first).
     func start(testRun: Bool) {
-        guard controller == nil, !testRun else { return }
+        guard controller == nil, !testRun, available else { return }
         controller = SPUStandardUpdaterController(startingUpdater: true, updaterDelegate: self, userDriverDelegate: self)
         automatic = controller?.updater.automaticallyChecksForUpdates ?? false
     }
@@ -45,6 +49,7 @@ final class Updates: NSObject, ObservableObject, SPUUpdaterDelegate, SPUStandard
 
     /// Whether Halliday checks GitHub for a newer release once a day by itself.
     func setAutomatic(_ on: Bool) {
+        guard available else { automatic = false; return }
         controller?.updater.automaticallyChecksForUpdates = on
         automatic = on
         log("[updates] automatic checks \(on ? "on" : "off")")

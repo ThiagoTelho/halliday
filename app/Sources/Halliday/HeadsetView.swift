@@ -440,8 +440,12 @@ final class HeadsetView: NSView {
         return NSCursor(image: image, hotSpot: .zero)
     }()
 
+    /// Controller interaction never hides the desktop cursor.
+    var hidesDesktopCursor = false {
+        didSet { if oldValue != hidesDesktopCursor { window?.invalidateCursorRects(for: self) } }
+    }
     override func resetCursorRects() {
-        addCursorRect(bounds, cursor: Self.invisibleCursor)
+        if hidesDesktopCursor { addCursorRect(bounds, cursor: Self.invisibleCursor) }
     }
 
     override func updateTrackingAreas() {

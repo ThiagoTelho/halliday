@@ -108,15 +108,15 @@ func runGameImageRenderSnapshot(path: String, arguments: [String]) {
         guard let target = device.makeTexture(descriptor: targetDescriptor) else {
             throw CheckFailure.failed("Could not allocate the offscreen output")
         }
-        func renderBytes() -> [UInt8] {
-            renderer.render(head: head, calibration: mouse.calibration, into: target, present: nil)
+        func renderBytes(using selected: Renderer? = nil) -> [UInt8] {
+            (selected ?? renderer).render(head: head, calibration: mouse.calibration, into: target, present: nil)
             var bytes = [UInt8](repeating: 0, count: outputWidth * outputHeight * 4)
             target.getBytes(&bytes, bytesPerRow: outputWidth * 4,
                 from: MTLRegionMake2D(0, 0, outputWidth, outputHeight), mipmapLevel: 0)
             return bytes
         }
-        func sourceProjectionRestored() -> Bool {
-            guard let restored = renderer.projection else { return false }
+        func sourceProjectionRestored(using selected: Renderer? = nil) -> Bool {
+            guard let restored = (selected ?? renderer).projection else { return false }
             return restored.texture === source && restored.srgbTexture === sourceSRGB
                 && restored.colourSpaces == original.colourSpaces && restored.uvRect == original.uvRect
                 && restored.renderOrientation.vector == original.renderOrientation.vector
@@ -135,6 +135,56 @@ func runGameImageRenderSnapshot(path: String, arguments: [String]) {
         let changed = renderBytes()
         try require(first != changed, "A new image sequence did not update the rendered game image")
         try require(sourceProjectionRestored(), "The new game frame changed the source projection metadata")
+
+        var surroundingsChecks: [String: Any]?
+        if arguments.contains("--game-image-unseen-surroundings") {
+            // A fresh renderer commits the fixture before its first frame; an already
+            // rendered place would correctly spend several frames fading first.
+            let surroundingsRenderer = try Renderer(device: device, eyeSize: outputHeight)
+            surroundingsRenderer.distortionEnabled = false
+            surroundingsRenderer.projection = original
+            let bakesBefore = surroundingsRenderer.environmentBakePasses
+            let geometryBefore = surroundingsRenderer.environmentGeometryPasses
+            // Real geometry, not a mocked visibility predicate. Packed eight-float vertices
+            // match PlaceVertex in the GPU shader; a red triangle would alter a visible room.
+            let vertices: [Float] = [-1, 0, -2, 0, 0, 1, 0, 0,
+                                      1, 0, -2, 0, 0, 1, 1, 0,
+                                      0, 2, -2, 0, 0, 1, 0.5, 1]
+            let indices: [UInt32] = [0, 1, 2]
+            guard let vb = device.makeBuffer(bytes: vertices, length: vertices.count * MemoryLayout<Float>.stride),
+                  let ib = device.makeBuffer(bytes: indices, length: indices.count * MemoryLayout<UInt32>.stride) else {
+                throw CheckFailure.failed("Could not allocate the surroundings fixture")
+            }
+            let scene = Scene3D(name: "Unseen surroundings oracle", parts: [Scene3D.Part(
+                vertices: vb, vertexOffset: 0, indices: ib, indexOffset: 0, indexCount: 3, indexType: .uint32,
+                transform: matrix_identity_float4x4, baseColor: SIMD4(1, 0, 0, 1), emission: SIMD3(1, 0, 0), texture: nil)], triangles: 1)
+            surroundingsRenderer.setEnvironment(1, texture: nil, scene: scene) // Dusk and a real mesh.
+            let hiddenFirst = renderBytes(using: surroundingsRenderer)
+            let hiddenSecond = renderBytes(using: surroundingsRenderer)
+            try require(hiddenFirst == changed && hiddenSecond == changed,
+                        "An unseen Dusk/mesh environment changed immersive pixels")
+            try require(surroundingsRenderer.environmentBakePasses == bakesBefore && surroundingsRenderer.environmentGeometryPasses == geometryBefore,
+                        "Immersive game encoded unseen environment work")
+            try require(sourceProjectionRestored(using: surroundingsRenderer), "Hidden-place test changed the game projection")
+
+            surroundingsRenderer.projection = nil
+            surroundingsRenderer.videoSphere = VideoSphere(texture: source, projection: 0, stereo: 1,
+                fisheyeFovDeg: 180, orientation: head.orientation)
+            _ = renderBytes(using: surroundingsRenderer)
+            _ = renderBytes(using: surroundingsRenderer)
+            try require(surroundingsRenderer.environmentBakePasses == bakesBefore && surroundingsRenderer.environmentGeometryPasses == geometryBefore,
+                        "Surrounding video encoded unseen environment work")
+            surroundingsRenderer.videoSphere = nil
+            _ = renderBytes(using: surroundingsRenderer)
+            _ = renderBytes(using: surroundingsRenderer)
+            try require(surroundingsRenderer.environmentBakePasses > bakesBefore && surroundingsRenderer.environmentGeometryPasses > geometryBefore,
+                        "Returning home did not resume real environment work")
+            surroundingsChecks = ["hidden_projection_pixels_exact": true, "hidden_bakes": 0,
+                "hidden_geometry_passes": 0, "video_hidden_work_zero": true,
+                "home_bake_resumed": true, "home_geometry_resumed": true,
+                "bakes_after_return": surroundingsRenderer.environmentBakePasses - bakesBefore,
+                "geometry_after_return": surroundingsRenderer.environmentGeometryPasses - geometryBefore]
+        }
 
         let outputURL = URL(fileURLWithPath: path)
         let baseURL = outputURL.deletingPathExtension()
@@ -159,7 +209,7 @@ func runGameImageRenderSnapshot(path: String, arguments: [String]) {
         try writePNG(changed, to: changedURL)
         let settings = Settings.shared
         let changedBytes = zip(first, changed).reduce(0) { $0 + ($1.0 == $1.1 ? 0 : 1) }
-        let result: [String: Any] = [
+        var result: [String: Any] = [
             "scope": "Three synthetic frames through the actual Renderer; no game, runtime, headset or video encoder",
             "device": device.name,
             "config": ["fsr": settings.gameFSREnabled, "rcas": settings.gameSharpeningEnabled,
@@ -169,11 +219,12 @@ func runGameImageRenderSnapshot(path: String, arguments: [String]) {
                            "fsr_target_per_eye": [GameImagePlan.targetWidth, GameImagePlan.targetHeight],
                            "compositor_per_eye": [outputWidth / 2, outputHeight], "output": [outputWidth, outputHeight]],
             "checks": ["cached_replay_exact": true, "new_sequence_updates_image": true,
-                       "source_projection_restored": true, "rendered_frame_count": 3,
+                       "source_projection_restored": true, "rendered_frame_count": (surroundingsChecks == nil ? 3 : 9),
                        "changed_bytes_new_frame": changedBytes],
             "fingerprints_fnv1a64": ["first": fingerprint(first), "cached": fingerprint(replay), "new_frame": fingerprint(changed)],
             "files": ["first": outputURL.path, "new_frame": changedURL.path]
         ]
+        if let surroundingsChecks { result["surroundings_checks"] = surroundingsChecks }
         try JSONSerialization.data(withJSONObject: result, options: [.prettyPrinted, .sortedKeys]).write(to: jsonURL)
         print("PASS: game-image compositor snapshot; cached replay exact, new frame updated, source projection restored")
         print("Wrote \(outputURL.path), \(changedURL.path), \(jsonURL.path)")

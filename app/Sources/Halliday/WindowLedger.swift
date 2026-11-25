@@ -32,7 +32,7 @@ final class WindowLedger {
 
     static var defaultURL: URL {
         FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Halliday/moved-windows.json")
+            .appendingPathComponent("\(RuntimePaths.folderName)/moved-windows.json")
     }
 
     func record(_ entry: MovedWindow) {

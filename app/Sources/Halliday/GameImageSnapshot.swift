@@ -1,5 +1,5 @@
 // Bounded, offscreen snapshots of the actual Mac and headset settings. This path never starts
-// AppDelegate, a game or a headset session, and only navigates between the two settings tabs.
+// AppDelegate, a game or a headset session, and only navigates between settings tabs.
 // Supply ordinary UserDefaults command-line overrides to preview settings without saving them.
 
 import AppKit
@@ -26,18 +26,33 @@ func runGameImageUISnapshot(prefix: String) {
     let gameImage = SettingsPanel(renderer: renderer)
     gameImage.onActivate?("page:gameImage")
     drawGameImageSettingsPanel(gameImage, to: "\(prefix)-headset-game-image.png")
+    let fov = SettingsPanel(renderer: renderer)
+    fov.onActivate?("page:fov")
+    drawGameImageSettingsPanel(fov, to: "\(prefix)-headset-fov.png")
+    let tracking = SettingsPanel(renderer: renderer)
+    tracking.onActivate?("page:tracking")
+    drawGameImageSettingsPanel(tracking, to: "\(prefix)-headset-tracking.png")
+    guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
+    else { fatal("Headset refresh selectors are missing") }
 
     let expected = Set(["game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:sharpening", "game:sharpness"])
     guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
-    guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
-    else { fatal("Headset refresh selectors are missing") }
-    for panel in [general, gameImage] {
+    let settings = Settings.shared
+    guard ["game:half:off", "game:half:on", "game:half:auto"].allSatisfy({ id in
+        gameImage.controls.contains(where: { $0.id == id && $0.enabled })
+    })
+    else { fatal("Half-frame-rate switch states are inconsistent") }
+    guard tracking.controls.contains(where: { $0.id == "tracking:led" })
+    else { fatal("LED synchronization control is missing") }
+    guard Set(["game:crop", "game:cropHorizontal", "game:cropVertical"])
+        .isSubset(of: Set(fov.controls.map(\.id)))
+    else { fatal("FOV crop controls are missing") }
+    for panel in [general, gameImage, fov, tracking] {
         for control in panel.controls where !panel.surface.contains(control.rect) {
             fatal("Settings control \(control.id) extends outside the panel: \(control.rect)")
         }
     }
-    let settings = Settings.shared
-    print("PASS: Mac settings and both headset tabs; controls within panel; render \(settings.gameRenderPercent)%, FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
+    print("PASS: Mac settings and all four headset tabs; crop/image/tracking controls within panel; render \(settings.gameRenderPercent)%, half rate \(settings.effectiveGameHalfFrameRate), FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
 }
 
 /// Matches VRPanel's flipped CoreGraphics drawing at its native pixels-per-dmm. Avoids GPU

@@ -9,15 +9,16 @@ extension AppDelegate {
         let main = NSMenu()
 
         let appMenu = NSMenu()
-        appMenu.addItem(withTitle: "About Halliday", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
-        appMenu.addItem(item("Check for Updates…", #selector(menuCheckForUpdates), "", [], target: self))
+        let name = RuntimePaths.displayName
+        appMenu.addItem(withTitle: "About \(name)", action: #selector(NSApplication.orderFrontStandardAboutPanel(_:)), keyEquivalent: "")
+        if Updates.shared.available { appMenu.addItem(item("Check for Updates…", #selector(menuCheckForUpdates), "", [], target: self)) }
         appMenu.addItem(.separator())
         appMenu.addItem(item("Settings…", #selector(menuSettings), ",", .command, target: self))
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Hide Halliday", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
+        appMenu.addItem(withTitle: "Hide \(name)", action: #selector(NSApplication.hide(_:)), keyEquivalent: "h")
         appMenu.addItem(.separator())
-        appMenu.addItem(withTitle: "Quit Halliday", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
-        add(appMenu, title: "Halliday", to: main)
+        appMenu.addItem(withTitle: "Quit \(name)", action: #selector(NSApplication.terminate(_:)), keyEquivalent: "q")
+        add(appMenu, title: name, to: main)
 
         let file = NSMenu(title: "File")
         file.addItem(item("New Browser Window", #selector(menuNewWindow), "n", .command, target: self))

@@ -232,3 +232,32 @@ sense-check:
 	tools/test-game-controller-motion.sh
 	tools/test-sense-aim-defaults.sh
 	python3 tools/tests/test_paired_hand_tracking_wiring.py
+
+# Optional CrossOver modules and reversible runtime registration.
+VR_JOBS ?= 2
+.PHONY: windows-openxr windows-openxr-native-check windows-openxr-router independent-native-openxr vr-modules vr-package crossover-preview
+windows-openxr:
+	python3 windows-openxr/build.py windows --jobs $(VR_JOBS)
+	tools/build-windows-openxr-registry.sh
+
+windows-openxr-check:
+	python3 windows-openxr/build.py native --jobs $(VR_JOBS)
+
+windows-openxr-router:
+	python3 windows-openxr/router/build.py
+	python3 windows-openxr/router/build_openvr.py
+
+independent-native-openxr:
+	tools/build-independent-native-openxr.sh
+
+
+# Optional source-built desktop game modules. Ordinary make app does not need these
+# Windows/Rust targets or any game, headset, installed runtime or private cache.
+vr-modules: windows-openxr windows-openxr-router independent-native-openxr
+
+vr-package: app vr-modules
+	HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh
+
+# Explicit local development identity, isolated from the ordinary app and its updater.
+crossover-preview: app vr-modules
+	HALLIDAY_PACKAGE_DEVELOPMENT=1 HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh

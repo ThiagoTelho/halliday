@@ -37,4 +37,10 @@ enum CompanionSnapshot {
             SenseSchematic().frame(width: 300, height: 340)
         }, to: "\(prefix)-controllers.png", size: CGSize(width: 700, height: 380))
     }
+
+    /// Inspect the native runtime picker without starting the app, a host or a game.
+    static func nativeOpenXR(to path: String) {
+        render(nativeOpenXRSnapshotView(), to: path,
+               size: CGSize(width: 1060, height: 1100))
+    }
 }

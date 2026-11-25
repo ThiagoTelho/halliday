@@ -613,7 +613,7 @@ final class VideoPlayer {
     /// for the next time the same file is opened. Nil if ffmpeg fails.
     private nonisolated static func repack(_ source: URL, ffmpeg: String) -> URL? {
         let fm = FileManager.default
-        let folder = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Halliday/Repacked")
+        let folder = fm.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("\(RuntimePaths.folderName)/Repacked")
         try? fm.createDirectory(at: folder, withIntermediateDirectories: true)
         let attributes = try? fm.attributesOfItem(atPath: source.path)
         let stamp = "\((attributes?[.size] as? Int) ?? 0)-\(Int((attributes?[.modificationDate] as? Date)?.timeIntervalSince1970 ?? 0))"

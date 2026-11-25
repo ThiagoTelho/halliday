@@ -11,7 +11,7 @@ echo and two distinct post-echo optical exposures. It retains the existing camer
 period, pulse duration and calibrated exposure-centre offset. Missing or occluded
 hands are not treated as evidence of bad synchronization. Stale clock data stops
 new timing commands; reconnect and explicit mode changes reset the helper.
-The `senseLEDFeedback` preference defaults to true; the fixed synchronization path is
+`Settings.senseLEDFeedback` defaults to true; the fixed synchronization path is
 retained as an explicit fallback.
 
 Actual Sense contact bits are forwarded independently of pressed buttons and

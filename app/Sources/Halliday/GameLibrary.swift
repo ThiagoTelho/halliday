@@ -13,7 +13,7 @@
 
 import Foundation
 
-/// One VR game in GameHub.
+/// One VR game in GameHub, an existing CrossOver bottle, or Halliday's Quest library.
 struct GameEntry: Equatable, Sendable {
     enum Status: Equatable, Sendable {
         /// Set up, runtime current.
@@ -56,7 +56,7 @@ struct GameEntry: Equatable, Sendable {
     let name: String
     /// The game's executables (file names), to tell which game the runtime connected from.
     let executables: [String]
-    /// Its Wine prefix (GameHub's virtual container), once it has one.
+    /// Its Wine prefix (a GameHub container or a shared CrossOver bottle), once it has one.
     let container: URL?
     var status: Status
     /// Its last launch in Halliday: when, and for how long.
@@ -64,6 +64,16 @@ struct GameEntry: Equatable, Sendable {
     var lastMinutes: Int?
     /// A Quest app installed in Halliday (its package), not a GameHub game: `QuestApps` runs it.
     var quest: String? = nil
+    /// Steam in an existing CrossOver bottle. The app id alone is not unique across bottles.
+    var crossOver: CrossOverGame? = nil
+
+    var id: String { crossOver?.id ?? appID }
+    var isCrossOver: Bool { crossOver != nil }
+    var isManualCrossOver: Bool { crossOver?.executable != nil }
+    var sourceLabel: String {
+        if let crossOver { return "CrossOver · \(crossOver.bottleName)" }
+        return quest == nil ? "GameHub" : "Quest"
+    }
 }
 
 /// What happened the last time a game started, kept per executable.
@@ -83,8 +93,12 @@ final class GameLibrary {
     private(set) var games: [GameEntry] = []
     /// GameHub is installed (its data folder exists).
     private(set) var hasGameHub = false
+    private(set) var hasCrossOver = false
+    private(set) var crossOverInstallations: [CrossOverInstallation] = []
     private(set) var loaded = false
     private var loading = false
+    private var refreshPending = false
+    private var expectedGameID: String?
     /// Called after every refresh (on the main actor).
     var onChange: (() -> Void)?
     /// Called with a message when games were set up on their own (games added later).
@@ -95,7 +109,45 @@ final class GameLibrary {
 
     // --- What the user chose, and what Halliday remembers ---
 
-    private let defaults = UserDefaults.standard
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) { self.defaults = defaults }
+    /// A launcher is selected independently of the bottle; stable and Preview may share bottles.
+    var selectedCrossOverPath: String {
+        get { defaults.string(forKey: "gamesCrossOverApplication") ?? "" }
+        set { defaults.set(newValue, forKey: "gamesCrossOverApplication"); onChange?() }
+    }
+    var selectedCrossOverInstallation: CrossOverInstallation? {
+        if !selectedCrossOverPath.isEmpty {
+            // Do not silently fall back to another engine if the chosen app was moved or removed.
+            return crossOverInstallations.first { $0.applicationURL.path == selectedCrossOverPath }
+        }
+        return crossOverInstallations.first
+    }
+    private var crossOverImports: [[String: String]] {
+        get { defaults.array(forKey: "gamesCrossOverExecutables") as? [[String: String]] ?? [] }
+        set { defaults.set(newValue, forKey: "gamesCrossOverExecutables") }
+    }
+
+    /// Adds a launcher entry only. This never changes the game or its bottle's VR runtime.
+    @discardableResult
+    func addCrossOverExecutable(_ exe: URL, bottle: URL) -> Bool {
+        guard let game = CrossOverLibrary.manualGame(executable: exe, bottle: bottle), let executable = game.executable else { return false }
+        let record = ["bottle": game.bottle.path, "executable": executable.path]
+        var imports = crossOverImports
+        if !imports.contains(record) { imports.append(record); crossOverImports = imports }
+        refresh()
+        return true
+    }
+
+    /// Removes a manually imported launcher entry; it does not undo shared bottle settings.
+    @discardableResult
+    func removeCrossOverExecutable(_ game: GameEntry) -> Bool {
+        guard let imported = game.crossOver, let exe = imported.executable else { return false }
+        crossOverImports = crossOverImports.filter { $0["bottle"] != imported.bottle.path || $0["executable"] != exe.path }
+        refresh()
+        return true
+    }
     /// The user said yes on the first-time screen (or set up a game by hand).
     var consented: Bool {
         get { defaults.bool(forKey: "gamesConsented") }
@@ -116,7 +168,7 @@ final class GameLibrary {
         get { Set(defaults.stringArray(forKey: "gamesSeenContainers") ?? []) }
         set { defaults.set(Array(newValue).sorted(), forKey: "gamesSeenContainers") }
     }
-    /// Per Steam app id: its executables if it is a VR game, [] if it isn't.
+    /// Per provider and installed location: its executables if it is a VR game, [] otherwise.
     private var vrScan: [String: [String]] {
         get { defaults.dictionary(forKey: "gamesVRScan") as? [String: [String]] ?? [:] }
         set { defaults.set(newValue, forKey: "gamesVRScan") }
@@ -133,15 +185,26 @@ final class GameLibrary {
     /// Records a launch of the game whose executable is `exe`.
     func recordLaunch(exe: String, minutes: Int?, problem: String?, at: Date = Date()) {
         var all = launches
-        all[exe.lowercased()] = GameLaunch(at: at, minutes: minutes, problem: problem)
+        let game = game(forExecutable: exe)
+        // The runtime reports a basename, so an ambiguous external launch cannot be attributed
+        // safely. It remains a legacy executable entry rather than updating every bottle.
+        all[game?.id ?? exe.lowercased()] = GameLaunch(at: at, minutes: minutes, problem: problem)
+        if game?.id == expectedGameID { expectedGameID = nil }
         launches = all
         refresh()
     }
 
+    /// Keeps launch history and runtime-to-game matching specific to the selected bottle.
+    func expectLaunch(_ game: GameEntry?) { expectedGameID = game?.id }
+    /// A managed launch can be loading Steam or a game before VR connects.
+    var hasPendingLaunch: Bool { expectedGameID != nil }
+
     /// The game a running executable belongs to.
     func game(forExecutable exe: String) -> GameEntry? {
         let e = exe.lowercased()
-        return games.first { $0.executables.contains { $0.lowercased() == e } }
+        let matches = games.filter { $0.executables.contains { $0.lowercased() == e } }
+        if let expected = matches.first(where: { $0.id == expectedGameID }) { return expected }
+        return matches.count == 1 ? matches.first : nil
     }
 
     /// A game's name for the user: its library name, or its executable without ".exe".
@@ -170,17 +233,22 @@ final class GameLibrary {
             onChange?()
             return
         }
-        guard !loading else { return }
+        guard !loading else { refreshPending = true; return }
         loading = true
-        let scan = vrScan, setUp = setUpContainers, history = launches
+        let scan = vrScan, setUp = setUpContainers, history = launches, imports = crossOverImports
+        let requiresWindowsOpenXR = defaults.bool(forKey: "gamesWindowsOpenXRPreview")
         Task.detached(priority: .utility) {
-            let result = Self.read(scan: scan, setUp: setUp, history: history)
+            let result = Self.read(scan: scan, setUp: setUp, history: history, imports: imports, requiresWindowsOpenXR: requiresWindowsOpenXR)
             await MainActor.run {
                 self.loading = false
                 self.loaded = true
                 self.hasGameHub = result.hasGameHub
+                self.hasCrossOver = result.hasCrossOver
+                self.crossOverInstallations = result.installations
                 if result.scan != scan { self.vrScan = result.scan }
                 self.apply(result.games)
+                // Imports, removals or history may change while a directory scan is in flight.
+                if self.refreshPending { self.refreshPending = false; self.refresh() }
             }
         }
     }
@@ -188,13 +256,15 @@ final class GameLibrary {
     private func apply(_ list: [GameEntry]) {
         games = list
         // Games added later: set up as their container appears, if the user asked for that.
-        let containers = Set(list.compactMap { $0.container?.lastPathComponent })
-        let new = containers.subtracting(seenContainers)
+        // Existing GameHub consent never authorizes changing a newly discovered CrossOver bottle.
+        let hubGames = list.filter { !$0.isCrossOver && $0.quest == nil }
+        let containers = Set(hubGames.compactMap { $0.container.map(Self.containerID) })
+        let new = containers.filter { !seenContainers.contains($0) && !seenContainers.contains(URL(fileURLWithPath: $0).lastPathComponent) }
         if !new.isEmpty {
             let first = seenContainers.isEmpty
             seenContainers = seenContainers.union(new)
             if !first, consented, setsUpNewGames {
-                for g in list where g.status == .notSetUp && new.contains(g.container?.lastPathComponent ?? "") {
+                for g in hubGames where g.status == .notSetUp && new.contains(g.container.map(Self.containerID) ?? "") {
                     if setUp(g) { onNotice?("\(g.name) is ready to play in Halliday") }
                 }
             }
@@ -206,14 +276,15 @@ final class GameLibrary {
         var games: [GameEntry]
         var scan: [String: [String]]
         var hasGameHub: Bool
+        var hasCrossOver: Bool
+        var installations: [CrossOverInstallation]
     }
 
-    nonisolated private static func read(scan: [String: [String]], setUp: Set<String>, history: [String: GameLaunch]) -> ReadResult {
+    nonisolated private static func read(scan: [String: [String]], setUp: Set<String>, history: [String: GameLaunch], imports: [[String: String]], requiresWindowsOpenXR: Bool) -> ReadResult {
         let fm = FileManager.default
         let root = gameHub
-        // Without GameHub there are still the Quest apps installed in Halliday itself.
-        guard fm.fileExists(atPath: root.path) else { return ReadResult(games: questGames(history: history), scan: scan, hasGameHub: false) }
-        var scan = scan
+        let hasGameHub = fm.fileExists(atPath: root.path)
+        var updatedScan: [String: [String]] = [:]
         // The Steam libraries GameHub uses.
         var libraries: [URL] = []
         if let data = try? Data(contentsOf: root.appendingPathComponent("steam-client/steam-library-registry.v1.json")),
@@ -242,29 +313,40 @@ final class GameLibrary {
                       let dir = value("installdir", in: text) else { continue }
                 let folder = steamapps.appendingPathComponent("common").appendingPathComponent(dir)
                 let exes: [String]
-                if let known = scan[id] {
+                let cacheKey = "gamehub:\(id):\(CrossOverLibrary.canonical(folder).path)"
+                if let known = scan[cacheKey] {
                     exes = known
                 } else {
                     exes = vrExecutables(in: folder)
-                    // Remembered once the game is fully installed (Steam's StateFlags 4), not while
-                    // it downloads.
-                    if value("StateFlags", in: text) == "4" { scan[id] = exes }
                 }
+                if value("StateFlags", in: text) == "4" { updatedScan[cacheKey] = exes }
                 guard !exes.isEmpty else { continue }
                 let container = containers[id]
                 var entry = GameEntry(appID: id, name: name, executables: exes, container: container,
-                                      status: status(container: container, setUp: setUp))
+                                      status: status(container: container, setUp: setUp, allowsLegacyKey: true))
                 // Its latest launch, from any of its executables.
-                if let last = exes.compactMap({ history[$0.lowercased()] }).max(by: { $0.at < $1.at }) {
-                    if let minutes = last.minutes {
-                        entry.lastPlayed = last.at
-                        entry.lastMinutes = minutes
-                    } else if let problem = last.problem, entry.status == .ready {
-                        entry.status = .stopped(problem)
-                    }
-                }
+                applyHistory(&entry, history: history, legacy: true)
                 games.append(entry)
             }
+        }
+        let crossOver = CrossOverLibrary.discover()
+        for game in crossOver.games {
+            let exes = scan[game.cacheKey] ?? vrExecutables(in: game.folder)
+            if game.fullyInstalled { updatedScan[game.cacheKey] = exes }
+            guard !exes.isEmpty else { continue }
+            var entry = GameEntry(appID: game.appID, name: game.name, executables: exes, container: game.bottle,
+                                  status: status(container: game.bottle, setUp: setUp, requiresOpenXR: requiresWindowsOpenXR), crossOver: game)
+            applyHistory(&entry, history: history, legacy: false)
+            games.append(entry)
+        }
+        for record in imports {
+            guard let path = record["executable"], let bottle = record["bottle"],
+                  let game = CrossOverLibrary.manualGame(executable: URL(fileURLWithPath: path), bottle: URL(fileURLWithPath: bottle)),
+                  let exe = game.executable, !games.contains(where: { $0.id == game.id }) else { continue }
+            var entry = GameEntry(appID: game.appID, name: game.name, executables: [exe.lastPathComponent], container: game.bottle,
+                                  status: status(container: game.bottle, setUp: setUp, requiresOpenXR: requiresWindowsOpenXR), crossOver: game)
+            applyHistory(&entry, history: history, legacy: false)
+            games.append(entry)
         }
         games += questGames(history: history)
         games.sort { a, b in
@@ -272,7 +354,16 @@ final class GameLibrary {
             if a.lastPlayed != b.lastPlayed { return (a.lastPlayed ?? .distantPast) > (b.lastPlayed ?? .distantPast) }
             return a.name.localizedCaseInsensitiveCompare(b.name) == .orderedAscending
         }
-        return ReadResult(games: games, scan: scan, hasGameHub: true)
+        return ReadResult(games: games, scan: updatedScan, hasGameHub: hasGameHub,
+                          hasCrossOver: !crossOver.installations.isEmpty || !crossOver.bottles.isEmpty || !imports.isEmpty,
+                          installations: crossOver.installations)
+    }
+
+    nonisolated private static func applyHistory(_ entry: inout GameEntry, history: [String: GameLaunch], legacy: Bool) {
+        let last = history[entry.id] ?? (legacy ? entry.executables.compactMap { history[$0.lowercased()] }.max(by: { $0.at < $1.at }) : nil)
+        guard let last else { return }
+        if let minutes = last.minutes { entry.lastPlayed = last.at; entry.lastMinutes = minutes }
+        else if let problem = last.problem, entry.status == .ready { entry.status = .stopped(problem) }
     }
 
     /// The Quest apps installed in Halliday, as games: ready when there is a way to start them.
@@ -283,7 +374,7 @@ final class GameLibrary {
                 : .stopped("Halliday has no way to start this kind of app yet (\(app.engine) engine).")
             var entry = GameEntry(appID: "quest:\(app.package)", name: app.name, executables: [app.name], container: nil, status: status)
             entry.quest = app.package
-            if let last = history[app.name.lowercased()] {
+            if let last = history[entry.id] ?? history[app.name.lowercased()] {
                 if let minutes = last.minutes {
                     entry.lastPlayed = last.at
                     entry.lastMinutes = minutes
@@ -324,26 +415,33 @@ final class GameLibrary {
     }
 
     /// A container's state from its `openvrpaths.vrpath` files (one per Windows user).
-    nonisolated private static func status(container: URL?, setUp: Set<String>) -> GameEntry.Status {
+    nonisolated static func containerID(_ url: URL) -> String { CrossOverLibrary.canonical(url).path }
+
+    nonisolated static func status(container: URL?, setUp: Set<String>, allowsLegacyKey: Bool = false, requiresOpenXR: Bool = false) -> GameEntry.Status {
         guard let container else { return .firstLaunch }
         let fm = FileManager.default
         let users = container.appendingPathComponent("drive_c/users")
-        let names = ((try? fm.contentsOfDirectory(atPath: users.path)) ?? []).filter { $0 != "Public" && !$0.hasPrefix(".") }
-        let ours = GameBridge.windowsPath(GameBridge.folder)
+        // Keep this identical to the installer's profile selection: shared profiles and files
+        // have no registration, and must not make a successfully configured bottle look changed.
+        let names = ((try? fm.contentsOfDirectory(atPath: users.path)) ?? [])
+            .filter { !$0.hasPrefix(".") && !["public", "all users"].contains($0.lowercased()) }
+            .filter { (try? users.appendingPathComponent($0).resourceValues(forKeys: [.isDirectoryKey]).isDirectory) == true }
+        let ours = [GameBridge.folder, OpenVRRegistration.automaticRuntimeRoot(prefix: container, baseRuntime: GameBridge.folder)]
+            .map { GameBridge.windowsPath($0) }
         var anyOurs = false, allOurs = !names.isEmpty, otherHalliday = false
         for name in names {
             let file = users.appendingPathComponent(name).appendingPathComponent("AppData/Local/openvr/openvrpaths.vrpath")
             guard let data = try? Data(contentsOf: file),
                   let json = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
                   let runtime = (json["runtime"] as? [String])?.first else { allOurs = false; continue }
-            if runtime == ours { anyOurs = true } else {
+            if ours.contains(runtime) { anyOurs = true } else {
                 allOurs = false
                 if runtime.contains("Halliday") { otherHalliday = true }
             }
         }
-        if allOurs { return .ready }
+        if allOurs { return requiresOpenXR && !WineOpenXRRegistration.hasSetupReceipt(prefix: container) ? .notSetUp : .ready }
         if otherHalliday { return .update }
-        if anyOurs || setUp.contains(container.lastPathComponent) { return .changed }
+        if anyOurs || setUp.contains(containerID(container)) || (allowsLegacyKey && setUp.contains(container.lastPathComponent)) { return .changed }
         return .notSetUp
     }
 
@@ -351,12 +449,12 @@ final class GameLibrary {
 
     /// Points the game's container at Halliday (Set up, Repair, Update). False on failure.
     @discardableResult
-    func setUp(_ game: GameEntry) -> Bool {
+    func setUp(_ game: GameEntry, runtime: URL? = nil) -> Bool {
         guard let container = game.container, GameBridge.installRuntime() else { return false }
         do {
-            _ = try GameBridge.install(prefix: container)
-            consented = true
-            setUpContainers = setUpContainers.union([container.lastPathComponent])
+            _ = try GameBridge.install(prefix: container, runtime: runtime)
+            if !game.isCrossOver { consented = true }
+            setUpContainers = setUpContainers.union([Self.containerID(container)])
             log("[games] set up \(game.name) (container \(container.lastPathComponent))")
             refresh()
             return true
@@ -372,7 +470,7 @@ final class GameLibrary {
         guard let container = game.container else { return false }
         do {
             try GameBridge.uninstall(prefix: container)
-            setUpContainers = setUpContainers.subtracting([container.lastPathComponent])
+            setUpContainers = setUpContainers.subtracting([Self.containerID(container)] + (game.isCrossOver ? [] : [container.lastPathComponent]))
             log("[games] undid the set-up of \(game.name)")
             refresh()
             return true
@@ -382,15 +480,15 @@ final class GameLibrary {
         }
     }
 
-    /// Every game that has a container and isn't set up (the first-time screen's "Set up all").
+    /// The original GameHub onboarding action. Shared CrossOver bottles are set up individually.
     func setUpAll() -> Int {
         if Self.sample { return 0 }
         consented = true
-        return games.filter { $0.container != nil && $0.status != .ready }.reduce(0) { $0 + (setUp($1) ? 1 : 0) }
+        return games.filter { !$0.isCrossOver && $0.container != nil && $0.status != .ready }.reduce(0) { $0 + (setUp($1) ? 1 : 0) }
     }
 
     /// GameHub's link that starts a Steam game (the one its desktop shortcuts use).
-    static func playURL(_ game: GameEntry) -> URL? { sample ? nil : URL(string: "gamehub://launch/steam/\(game.appID)") }
+    static func playURL(_ game: GameEntry) -> URL? { sample || game.isCrossOver || game.quest != nil ? nil : URL(string: "gamehub://launch/steam/\(game.appID)") }
 
     // --- What the runtime said while Halliday wasn't running ---
 
