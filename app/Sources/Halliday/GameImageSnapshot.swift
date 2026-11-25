@@ -32,16 +32,18 @@ func runGameImageUISnapshot(prefix: String) {
     let tracking = SettingsPanel(renderer: renderer)
     tracking.onActivate?("page:tracking")
     drawGameImageSettingsPanel(tracking, to: "\(prefix)-headset-tracking.png")
+    guard general.controls.contains(where: { $0.id == "game:systemAudio" })
+    else { fatal("Game audio control is missing") }
     guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
     else { fatal("Headset refresh selectors are missing") }
 
-    let expected = Set(["game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:sharpening", "game:sharpness"])
+    let expected = Set(["game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:spacewarp", "game:sharpening", "game:sharpness"])
     guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
     let settings = Settings.shared
-    guard ["game:half:off", "game:half:on", "game:half:auto"].allSatisfy({ id in
+    guard ["game:half:off", "game:half:on", "game:half:auto", "game:spacewarp"].allSatisfy({ id in
         gameImage.controls.contains(where: { $0.id == id && $0.enabled })
     })
-    else { fatal("Half-frame-rate switch states are inconsistent") }
+    else { fatal("Spacewarp and half-frame-rate switch states are inconsistent") }
     guard tracking.controls.contains(where: { $0.id == "tracking:led" })
     else { fatal("LED synchronization control is missing") }
     guard Set(["game:crop", "game:cropHorizontal", "game:cropVertical"])
@@ -52,7 +54,7 @@ func runGameImageUISnapshot(prefix: String) {
             fatal("Settings control \(control.id) extends outside the panel: \(control.rect)")
         }
     }
-    print("PASS: Mac settings and all four headset tabs; crop/image/tracking controls within panel; render \(settings.gameRenderPercent)%, half rate \(settings.effectiveGameHalfFrameRate), FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
+    print("PASS: Mac settings and all four headset tabs; crop/image/audio/tracking controls within panel; render \(settings.gameRenderPercent)%, half rate \(settings.effectiveGameHalfFrameRate), Spacewarp \(settings.gameSpacewarpEnabled), FSR \(settings.gameFSREnabled), RCAS \(settings.gameSharpeningEnabled), strength \(settings.gameSharpness)")
 }
 
 /// Matches VRPanel's flipped CoreGraphics drawing at its native pixels-per-dmm. Avoids GPU

@@ -4,6 +4,8 @@
 //   halliday --replay FILE      start with a replayed recording as the pose source
 //   halliday --snapshot FILE.png [--yaw DEG] [--pitch DEG] [--no-lens]
 //                               render one frame offscreen to a PNG (no window, no permissions)
+//   halliday --game-spacewarp-render-snapshot FILE.png
+//                               verify synthetic Spacewarp through the compositor, then exit
 //   halliday --game-image-ui-snapshot PREFIX
 //                               save Mac and headset image settings offscreen, then exit
 //   halliday --game-image-render-snapshot FILE.png
@@ -42,6 +44,10 @@ if let i = arguments.firstIndex(of: "--native-openxr-ui-snapshot"), i + 1 < argu
         NSApp.setActivationPolicy(.prohibited)
         CompanionSnapshot.nativeOpenXR(to: arguments[i + 1])
     }
+    exit(0)
+}
+if let i = arguments.firstIndex(of: "--game-spacewarp-render-snapshot"), i + 1 < arguments.count {
+    MainActor.assumeIsolated { runGameSpacewarpRenderSnapshot(path: arguments[i + 1], arguments: arguments) }
     exit(0)
 }
 if let i = arguments.firstIndex(of: "--game-image-ui-snapshot"), i + 1 < arguments.count {

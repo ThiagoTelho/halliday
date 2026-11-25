@@ -1,24 +1,8 @@
-// Late latching: the lens pass re-aims each eye's picture with the head's orientation taken once
-// the scene has been drawn, not when the frame started (ROADMAP W11 1.7).
-//
-// Things fixed in space shook with every small movement of the headset. The log says why: a frame reached the eyes 20 to 37 ms after
-// it started, and with the panel's own delay the pose was predicted 35 to 45 ms ahead. No
-// prediction follows a tremor that far (on the worn recording, the orientation's error is 0.03°
-// predicted 12 ms ahead, 0.10° at 29 ms and 0.17° at 40 ms, p95 0.58°: a centimeter at a meter).
-// The scene itself is drawn 6 ms after the frame starts at best, and finished 12 to 15 ms after.
-//
-// So a frame on the headset is drawn in two parts (`Renderer.renderLatched`). The main thread
-// draws the scene with the pose predicted at the frame's start, into one of two eye textures, and
-// never waits for a drawable (it waited up to 9 ms a frame for one, and frames were lost). When
-// the GPU has drawn the scene, a thread of its own takes a drawable, asks the tracker again for
-// the same moment (the frame's time on the panel), now with that much more of the 2000 Hz gyro,
-// and encodes the lens pass with the turn between the two orientations (`latch`). The lens pass
-// turns every vertex's sampling direction by it (`distort_vs`): what the eye texture shows was
-// seen from the rendered orientation, and is shown from the late one. Rotation only, as Oculus's
-// timewarp: the position changes far less in that time than a turn shows (0.3 mm against 0.2°
-// at a meter).
-//
-// `--no-late-latch` draws frames as before, in one piece, to compare.
+// Rotation-only late reprojection of the newest successful completed stereo scene.
+// The physical display clock offers outputs independently of scene rendering.
+// A fresh coherent pose is sampled after drawable acquisition; untrusted legacy
+// sources retain the conservative large-turn guard. Presentation targets use
+// host time and actual presented feedback, not a claimed photon timestamp.
 
 import Foundation
 import Metal
@@ -40,8 +24,8 @@ struct LensWarp {
 
 final class LateLatch: @unchecked Sendable {
     static let enabled = !CommandLine.arguments.contains("--no-late-latch")
-    /// A late turn larger than this is not a frame's worth of head motion (a recenter came in
-    /// between): the frame is shown as drawn.
+    /// Legacy callers without a coherent tracking discontinuity generation
+    /// retain the original conservative large-turn guard.
     private static let maxTurn: Float = 5 * .pi / 180
 
     /// The eyes' tangents, as `SceneUniforms.tanLRUD`.
@@ -57,13 +41,21 @@ final class LateLatch: @unchecked Sendable {
     /// The panel lights its rows over part of a refresh, top to bottom (the headset adapter's
     /// `scanFraction`: 2040 of 2200 rows' worth of time on the PS VR2). `--no-scanout` leaves the rows as one moment, `--scanout-scale F`
     /// tries another length (negative: bottom to top).
-    nonisolated(unsafe) static var displayHz: Float = 120
+    private static let displayRateLock = NSLock()
+    nonisolated(unsafe) private static var storedDisplayHz: Float = 120
+    static var displayHz: Float {
+        get { displayRateLock.lock(); defer { displayRateLock.unlock() }; return storedDisplayHz }
+        set { guard newValue.isFinite && newValue > 0 else { return }; displayRateLock.lock(); storedDisplayHz = newValue; displayRateLock.unlock() }
+    }
     private static let scanScale: Float = {
         let a = CommandLine.arguments
         if a.contains("--no-scanout") { return 0 }
         return a.firstIndex(of: "--scanout-scale").flatMap { $0 + 1 < a.count ? Float(a[$0 + 1]) : nil } ?? 1
     }()
-    static var scanDuration: Float { scanScale * Headsets.current.scanFraction / max(displayHz, 30) }
+    static func scanDuration(forDisplayHz hz: Float) -> Float {
+        scanScale * Headsets.current.scanFraction / max(hz, 30)
+    }
+    static var scanDuration: Float { scanDuration(forDisplayHz: displayHz) }
     private static func warp(_ rotation: simd_float3x3) -> LensWarp {
         LensWarp(rotation: rotation, tanLeft: eyeTangents.0, tanRight: eyeTangents.1)
     }
@@ -75,21 +67,32 @@ final class LateLatch: @unchecked Sendable {
     /// The scene was drawn with `rendered` for `targetNs` (host ns): the late orientation for the
     /// same moment, as the lens pass's turn. Any thread.
     func latch(rendered: simd_quatf, startedNs: Int64, targetNs: Int64, sceneEnd: Double, drawableWait: Double,
-               pose: (Int64) -> (orientation: simd_quatf, turning: SIMD3<Float>)?) -> LensWarp {
+               pose: (Int64) -> LateHeadPose?,
+               scanDuration: Float? = nil, trackingGeneration: UInt64 = 0) -> LensWarp {
         let now = CACurrentMediaTime()
         let latchedNs = Int64(now * 1e9)
-        guard let (late, turning) = pose(targetNs) else {
-            lock.lock(); missing += 1; lock.unlock()
+        guard let sample = pose(targetNs) else {
+                lock.lock(); missing += 1; lock.unlock()
             return Self.noTurn
         }
-        let turn = (rendered.inverse * late).normalized
+        // Valid orientation and valid angular motion are separate contracts.
+        guard let late = sample.normalizedOrientation,
+              rendered.vector.x.isFinite, rendered.vector.y.isFinite,
+              rendered.vector.z.isFinite, rendered.vector.w.isFinite,
+              simd_length_squared(rendered.vector).isFinite,
+              simd_length_squared(rendered.vector) > 1e-8 else { return Self.noTurn }
+        let turn = (rendered.normalized.inverse * late).normalized
         let angle = 2 * acos(min(1, abs(turn.real)))
-        let taken = angle < Self.maxTurn
+        let trusted = trackingGeneration != 0 && trackingGeneration == sample.trackingGeneration
+        let taken = trusted || angle < Self.maxTurn
         record(early: Double(targetNs - startedNs) / 1e6, late: Double(targetNs - latchedNs) / 1e6,
                handler: sceneEnd > 0 ? (now - sceneEnd) * 1000 : 0, waited: drawableWait * 1000, angle: taken ? angle : nil)
         var warp = taken ? Self.warp(simd_float3x3(turn)) : Self.noTurn
-        // Not while the head whips round (or the gyro says something absurd): 12 rad/s is 690°/s.
-        if simd_length(turning) < 12 { warp.scan = SIMD4(turning, Self.scanDuration) }
+        // Unknown/stale gyro suppresses rolling-scan prediction only. The late
+        // orientation above remains usable even when angular motion is unknown.
+        if let turning = sample.scanAngularVelocity {
+            warp.scan = SIMD4(turning, scanDuration ?? Self.scanDuration)
+        }
         return warp
     }
 

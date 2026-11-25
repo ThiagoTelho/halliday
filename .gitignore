@@ -1,6 +1,7 @@
 # Rust
 /core/target/
 /core/halliday-vrclient/target/
+/windows-openxr/build/
 
 # Swift
 /app/.build/
@@ -27,7 +28,3 @@ __pycache__/
 /docs/first-hardware-session.md
 /docs/upstream-issues.md
 /docs/research/
-
-# Source-built OpenXR artifacts and optional compiler cache
-/windows-openxr/build/
-/.tools/

@@ -47,13 +47,14 @@ final class SettingsPanel: VRPanel {
         case "page:tracking": showingGameImage = false; showingTracking = true; showingFOV = false
         case "page:fov": showingGameImage = false; showingTracking = false; showingFOV = true
         case "tracking:led": settings.senseLEDFeedback.toggle()
-        case "game:systemAudio": settings.gameSystemAudio.toggle()
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:crop": settings.gameCropEnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
         case "game:half:off": settings.gameHalfFrameRateMode = .off
         case "game:half:on": settings.gameHalfFrameRateMode = .on
         case "game:half:auto": settings.gameHalfFrameRateMode = .auto
+        case "game:spacewarp": settings.setGameSpacewarp(!settings.gameSpacewarpEnabled)
+        case "game:systemAudio": settings.gameSystemAudio.toggle()
         case "display:90": onRefreshRate?(90)
         case "display:120": onRefreshRate?(120)
         case "mode:seated": settings.mode = .seated
@@ -291,6 +292,14 @@ final class SettingsPanel: VRPanel {
         NightGlass.drawText("Auto follows game performance and checks for recovery.", at: CGPoint(x: x, y: y + 26), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 54
+        y = row(ctx, "Spacewarp 2×", "square.stack.3d.up", (0x7FD3FF, 0x2A7FBF), ids: ["game:spacewarp"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:spacewarp", self.settings.gameSpacewarpEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("At 120 Hz: 60 game frames + 60 generated frames per second.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Auto generates only at half rate; Off shows real frames.", at: CGPoint(x: x, y: y + 26), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 54
         y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in
             self.toggle(ctx, "game:sharpening", self.settings.gameSharpeningEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
         }
@@ -300,7 +309,8 @@ final class SettingsPanel: VRPanel {
                             color: NightGlass.secondary, width: width)
         NightGlass.drawText("Restart the game to apply crop or render scale.", at: CGPoint(x: x, y: y + 34), style: .caption,
                             color: NightGlass.secondary, width: width)
-        y += 70
+        NightGlass.drawText("100%, crop and image effects off: original game image.", at: CGPoint(x: x, y: y + 60), style: .caption,
+                            color: NightGlass.secondary, width: width)
     }
 
     private func drawVersion(x: CGFloat) {

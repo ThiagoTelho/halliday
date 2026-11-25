@@ -1,0 +1,84 @@
+{
+  "scope": "Fresh consolidated framegen/compositor source; no game, display/headset session, HID or installation",
+  "passed": true,
+  "checks": [
+    {
+      "test": "host-typecheck",
+      "exit_code": 0,
+      "seconds": 34.21
+    },
+    {
+      "test": "cadence",
+      "exit_code": 0,
+      "seconds": 1.98
+    },
+    {
+      "test": "source-time",
+      "exit_code": 0,
+      "seconds": 0.79
+    },
+    {
+      "test": "settings",
+      "exit_code": 0,
+      "seconds": 0.87
+    },
+    {
+      "test": "source-order",
+      "exit_code": 0,
+      "seconds": 0.03
+    },
+    {
+      "test": "compositor",
+      "exit_code": 0,
+      "seconds": 3.61
+    },
+    {
+      "test": "provenance",
+      "exit_code": 0,
+      "seconds": 0.03
+    },
+    {
+      "test": "flow-metal",
+      "exit_code": 0,
+      "seconds": 5.52
+    },
+    {
+      "test": "prediction-metal",
+      "exit_code": 0,
+      "seconds": 9.91
+    },
+    {
+      "test": "static-metal",
+      "exit_code": 0,
+      "seconds": 4.27
+    },
+    {
+      "test": "composition-metal",
+      "exit_code": 0,
+      "seconds": 2.27
+    },
+    {
+      "test": "projection-metal",
+      "exit_code": 0,
+      "seconds": 3.94
+    }
+  ],
+  "source_sha256": {
+    "app/Sources/Halliday/Renderer.swift": "40090caa45c2415453183829ac981cd53bc22402bfa5c1a2e8ab2f2f76b8a342",
+    "app/Sources/Halliday/HeadsetView.swift": "c4bf9b8ed3fd651dae2c2402265adc454d8b3c511cb24af318cd610a1439cb4c",
+    "app/Sources/Halliday/IndependentLensPresenter.swift": "002aadd77f7ae5c1d3b776d79cd790fa589a0c0ad6938e9950cc58f51b4a61a3",
+    "app/Sources/Halliday/CompositorSceneMailbox.swift": "5d0d33e7e43d0e3969686b26a275e4b81b3796f78c740707c5ab1357713d4153",
+    "app/Sources/Halliday/GameOpticalFlow.swift": "057e6c5907198fc79ed6c572d5a46e046365fba00d881e3b781caa4821fc7584",
+    "app/Sources/Halliday/GameSpacewarp.swift": "484dc52542420301ae5d00054c7bb53673da9befdc87852d788927a190d00016",
+    "app/Sources/Halliday/GameSpacewarpCadence.swift": "765678888be72f80e112783142d60032dbe37f0a051f4e0342e2f2afed498a38",
+    "app/Sources/Halliday/GameSourceImageTime.swift": "28ff17c447a2a05cb5cba5985aba24d9ed9baf9c0fe2ff028df8a2be02f11641",
+    "app/Sources/Halliday/Shaders.swift": "496342db82d11bf94d92c8fcaed4c6a000d8f249827bc22fe57a80f84de2190c",
+    "app/Resources/spacewarp/composition.metal": "5a0468ea5a90ab3dda3f9656e7acb56972a1fd65c5726e0f34eca05f89f27996",
+    "app/Resources/spacewarp/discontinuity.metal": "b4692798b841c9ec6d28ff131a8e3b615bb23c09bc778effd1f8215423897f2b"
+  },
+  "limits": [
+    "CPU correctness and bounded offscreen Metal pixels only",
+    "No photon latency or measured game-FPS improvement",
+    "Residual microjudder not claimed resolved"
+  ]
+}

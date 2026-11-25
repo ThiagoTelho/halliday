@@ -94,14 +94,16 @@ import Foundation
         precondition(arguments.gameRenderPercent == 80 && arguments.gameSharpness == 0.6 && arguments.gameHalfFrameRate && arguments.headsetRefreshHz == 90)
         precondition(NSDictionary(dictionary: persistedBeforeArguments).isEqual(to: defaults.persistentDomain(forName: suite)!))
         defaults.setVolatileDomain([:], forName: UserDefaults.argumentDomain)
-        // New choices persist independently of a legacy prediction preference.
+        // New choices persist independently of whether prediction is armed.
         let modes = Settings(defaults: defaults)
         modes.gameHalfFrameRateMode = .auto
-        precondition(!modes.effectiveGameHalfFrameRate)
+        modes.setGameSpacewarp(true)
+        precondition(modes.gameHalfFrameRateMode == .auto && !modes.effectiveGameHalfFrameRate)
         precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .auto)
         modes.gameHalfFrameRateMode = .off
-        defaults.set(true, forKey: "gameSpacewarpEnabled")
-        precondition(Settings(defaults: defaults).gameHalfFrameRateMode == .off)
+        precondition(modes.gameSpacewarpEnabled && !modes.effectiveGameHalfFrameRate)
+        modes.setGameSpacewarp(false)
+        precondition(modes.gameHalfFrameRateMode == .off)
         // Migration preserves old effective cadence without writing new keys.
         defaults.removeObject(forKey: "gameHalfFrameRateMode")
         defaults.set(false, forKey: "gameSpacewarpEnabled")

@@ -178,6 +178,10 @@ final class CompanionModel: ObservableObject {
         })
     }
 
+    func setGameSpacewarp(_ enabled: Bool) {
+        Settings.shared.setGameSpacewarp(enabled)
+        tick &+= 1
+    }
 
     func install(_ url: URL) {
         // A link dropped from a browser: an extension on GitHub.
@@ -582,8 +586,6 @@ private struct SoundPane: View {
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         CompanionCard(title: "Game image") {
-            Text("Shows game FPS, display FPS, pose-to-display time and a frame-time history below your view. Applies live.")
-                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("FSR 1", isOn: model.setting(\.gameFSREnabled)).toggleStyle(.switch)
             Text("Reconstructs a lower-resolution game image before showing it in the headset.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
@@ -601,12 +603,16 @@ private struct SoundPane: View {
                 .accessibilityIdentifier("game.halfFrameRate")
             Text("Half: 60 game FPS at 120 Hz, or 45 at 90 Hz. Auto switches when the game cannot sustain full rate and checks for recovery. Applies live with Halliday; tracking and display stay at full rate.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle("Spacewarp 2×", isOn: Binding(get: { s.gameSpacewarpEnabled }, set: { model.setGameSpacewarp($0) }))
+                .toggleStyle(.switch).accessibilityIdentifier("game.spacewarp")
+            Text("Adds intermediate frames while half rate is active: 60 + 60 at 120 Hz, or 45 + 45 at 90 Hz. Auto uses it only when needed; Off shows real frames. Enabling Spacewarp from Off selects Half.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("RCAS sharpening", isOn: model.setting(\.gameSharpeningEnabled)).toggleStyle(.switch)
             LevelRow(title: "Sharpness", value: "\(Int((s.gameSharpness * 100).rounded()))%",
                      level: model.setting(\.gameSharpness), range: Settings.gameSharpnessRange, step: 0.05)
             Text("Sharpening works with FSR on or off. FSR and sharpening changes apply immediately.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("At 100% with FSR, Spacewarp and sharpening off, the game image is shown unchanged.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         CompanionCard(title: "Sound") {

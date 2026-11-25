@@ -4,7 +4,9 @@
 BUILD      := build
 APP        := $(BUILD)/Halliday.app
 CORE_LIB   := core/target/release/libhalliday_core.a
-SWIFT_SRCS := $(wildcard app/Sources/Halliday/*.swift)
+# A synced checkout can contain Finder conflict copies ("Name 2.swift"). Only
+# versioned sources are part of a build; an accidental copy cannot define a type twice.
+SWIFT_SRCS := $(shell if git ls-files --error-unmatch app/Sources/Halliday/main.swift >/dev/null 2>&1; then git ls-files 'app/Sources/Halliday/*.swift'; else find app/Sources/Halliday -name '*.swift' ! -name '* [0-9]*.swift' -print; fi)
 SWIFTFLAGS ?= -O
 TARGET     := arm64-apple-macos14.0
 # Sign with the local "Halliday Dev" identity when it exists (tools/create-signing-identity.sh), so
@@ -65,11 +67,13 @@ $(BUILD)/halliday: $(SWIFT_SRCS) $(CORE_LIB) $(SPARKLE) core/halliday-core/inclu
 		-framework AppKit -framework Metal -framework QuartzCore -framework ScreenCaptureKit -framework CoreMedia -framework CoreVideo -framework ApplicationServices -framework WebKit -framework AVFoundation -framework CoreGraphics -framework IOKit -framework CoreFoundation -framework Security \
 		$(SWIFT_SRCS) -o $@
 
-$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns app/Halliday-dev.entitlements docs/extensions.md $(wildcard extensions/example/*) $(wildcard app/Resources/fsr1/*)
+$(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licenses.sh app/Info.plist app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns app/Halliday-dev.entitlements docs/extensions.md $(wildcard extensions/example/*) $(wildcard app/Resources/fsr1/*) $(wildcard app/Resources/amd-optical-flow/*) $(wildcard app/Resources/spacewarp/*)
 	mkdir -p $(APP)/Contents/MacOS $(APP)/Contents/Resources
 	cp app/Info.plist $(APP)/Contents/Info.plist
 	cp app/Resources/webxr-bridge.js app/Resources/video-finder.js app/Resources/AppIcon.icns $(APP)/Contents/Resources/
 	rm -rf $(APP)/Contents/Resources/fsr1 && cp -R app/Resources/fsr1 $(APP)/Contents/Resources/fsr1
+	rm -rf $(APP)/Contents/Resources/amd-optical-flow $(APP)/Contents/Resources/spacewarp
+	cp -R app/Resources/amd-optical-flow app/Resources/spacewarp $(APP)/Contents/Resources/
 	@# The extensions guide and example, for the companion (docs/extensions.md).
 	cp docs/extensions.md $(APP)/Contents/Resources/extensions.md
 	rm -rf $(APP)/Contents/Resources/extension-example && cp -R extensions/example $(APP)/Contents/Resources/extension-example
@@ -80,13 +84,12 @@ $(APP): $(BUILD)/halliday $(VRCLIENT) LICENSE THIRD-PARTY.md tools/collect-licen
 	tools/collect-licenses.sh $(APP)/Contents/Resources/Licenses
 	@# Sparkle, without its XPC services (only sandboxed apps need them), each part signed inside out.
 	rm -rf $(APP)/Contents/Frameworks && mkdir -p $(APP)/Contents/Frameworks
-	ditto $(SPARKLE) $(APP)/Contents/Frameworks/Sparkle.framework
+	ditto --norsrc --noextattr $(SPARKLE) $(APP)/Contents/Frameworks/Sparkle.framework
 	rm -rf $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/XPCServices $(APP)/Contents/Frameworks/Sparkle.framework/XPCServices
-	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Autoupdate
-	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework/Versions/B/Updater.app
-	codesign --force --options runtime --sign "$(SIGN_ID)" $(APP)/Contents/Frameworks/Sparkle.framework
+	xattr -cr $(APP)/Contents/Frameworks/Sparkle.framework
 	cp $(BUILD)/halliday $(APP)/Contents/MacOS/halliday
-	codesign --force --options runtime --entitlements app/Halliday-dev.entitlements --sign "$(SIGN_ID)" $(APP)
+	xattr -cr $(APP)
+	codesign --force --sign "$(SIGN_ID)" --entitlements app/Halliday-dev.entitlements "$(APP)"
 
 app: $(APP)
 
@@ -199,43 +202,15 @@ openxr-metal-check: openxr
 test:
 	$(REMAP) cargo test --manifest-path core/Cargo.toml
 
-lint:
-	tools/check-privacy.sh
-	cargo fmt --all --manifest-path core/Cargo.toml --check
-	$(REMAP) cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
-	cargo fmt --all --manifest-path core/halliday-vrclient/Cargo.toml --check
-	cd core/halliday-vrclient && cargo clippy --release --workspace -- -D warnings
-	if [ -d reference/openvr ]; then tools/gen-openvr-tables.py --check; fi
+# CrossOver integration and the separate Windows OpenXR preview. All fixture tests are
+# hardware-independent; Wine smoke tests use disposable bottles and are invoked separately.
+.PHONY: crossover-check windows-openxr windows-openxr-check windows-openxr-router independent-native-openxr vr-modules vr-package crossover-preview
+crossover-check:
+	tools/test-crossover-library.sh
+	tools/check-openvr-registration.sh
+	tools/check-windows-openxr-registration.sh
+	tools/test-crossover-launcher.sh
 
-fmt:
-	cargo fmt --all --manifest-path core/Cargo.toml
-	cargo fmt --all --manifest-path core/halliday-vrclient/Cargo.toml
-
-clean:
-	cargo clean --manifest-path core/Cargo.toml
-	cargo clean --manifest-path core/halliday-vrclient/Cargo.toml
-	rm -rf $(BUILD)
-
-# Device-free Sense validation; no HID manager, camera, application or game is opened.
-.PHONY: sense-check
-sense-check:
-	cargo test --manifest-path core/Cargo.toml -p halliday-core --lib --test monocular_acquisition --test paired_hand_tracking --test controller_orientation_history
-	cargo build --manifest-path core/Cargo.toml -p halliday-core
-	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-calibration.sh
-	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-pose-timeline.sh
-	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-led-programming.sh
-	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-hand-tracking-worker.sh
-	tools/test-sense-led-feedback-and-touch.sh
-	tools/test-sense-haptics.sh
-	tools/test-camera-tracking-profiles.sh
-	tools/test-game-controller-alignment.sh
-	tools/test-game-controller-motion.sh
-	tools/test-sense-aim-defaults.sh
-	python3 tools/tests/test_paired_hand_tracking_wiring.py
-
-# Optional CrossOver modules and reversible runtime registration.
-VR_JOBS ?= 2
-.PHONY: windows-openxr windows-openxr-native-check windows-openxr-router independent-native-openxr vr-modules vr-package crossover-preview
 windows-openxr:
 	python3 windows-openxr/build.py windows --jobs $(VR_JOBS)
 	tools/build-windows-openxr-registry.sh
@@ -262,8 +237,57 @@ vr-package: app vr-modules
 crossover-preview: app vr-modules
 	HALLIDAY_PACKAGE_DEVELOPMENT=1 HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh
 
-# Synthetic PCM and settings only: no capture, output device, TCC or app launch.
+lint:
+	tools/check-privacy.sh
+	cargo fmt --all --manifest-path core/Cargo.toml --check
+	$(REMAP) cargo clippy --manifest-path core/Cargo.toml --all-targets -- -D warnings
+	cargo fmt --all --manifest-path core/halliday-vrclient/Cargo.toml --check
+	cd core/halliday-vrclient && cargo clippy --release --workspace -- -D warnings
+	if [ -d reference/openvr ]; then tools/gen-openvr-tables.py --check; fi
+
+fmt:
+	cargo fmt --all --manifest-path core/Cargo.toml
+	cargo fmt --all --manifest-path core/halliday-vrclient/Cargo.toml
+
+clean:
+	cargo clean --manifest-path core/Cargo.toml
+	cargo clean --manifest-path core/halliday-vrclient/Cargo.toml
+	rm -rf $(BUILD)
+
+VR_JOBS ?= 2
+.PHONY: windows-bridge-check windows-haptic-feed-check
+windows-bridge-check:
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-bridge
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib game_bridge
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib bridge_haptics
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib game_haptics
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib tracking::head
+	cargo test --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --lib ffi::tests
+	bash tools/test-game-bridge-lease.sh
+	bash tools/test-game-producer-state.sh
+	bash tools/test-game-producer-watchdog.sh
+
+# CPU-only end-to-end fixture: C++ producer -> Rust bridge -> Swift callbacks.
+windows-haptic-feed-check:
+	cargo build --manifest-path core/Cargo.toml --jobs $(VR_JOBS) -p halliday-core --no-default-features --release
+	bash tools/test-independent-haptic-feed.sh
+
+# Synthetic PCM and settings only: no capture, output device, TCC, or app launch.
 .PHONY: system-game-audio-check
 system-game-audio-check:
 	bash tools/test-system-game-audio.sh
 	bash tools/test-system-game-audio-settings.sh
+
+# CPU-only feature checks. GPU fixtures are explicit separate tools.
+.PHONY: spacewarp-check
+spacewarp-check:
+	bash tools/test-game-spacewarp-cadence.sh
+	bash tools/test-game-spacewarp-source-time.sh
+	python3 tools/tests/test_spacewarp_real_first_order.py
+	bash tools/test-game-spacewarp-settings.sh
+	python3 tools/test-amd-optical-flow-provenance.py
+
+# Pure ownership/clock-policy checks; no app, GPU, display or headset is started.
+.PHONY: compositor-check
+compositor-check:
+	bash tools/test-independent-compositor.sh

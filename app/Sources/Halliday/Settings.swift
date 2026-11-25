@@ -113,7 +113,6 @@ final class Settings {
         didSet { defaults.set(vrPageEye, forKey: "vrPageEye"); onChange?() }
     }
 
-
     /// FSR 1 processes game frames before the headset's lens correction.
     var gameFSREnabled: Bool {
         didSet { defaults.set(gameFSREnabled, forKey: "gameFSREnabled"); onChange?() }
@@ -163,6 +162,10 @@ final class Settings {
         set { gameHalfFrameRateMode = newValue ? .on : .off }
     }
 
+    /// Optional in-between game frames, used only while the producer is at half rate.
+    var gameSpacewarpEnabled: Bool {
+        didSet { defaults.set(gameSpacewarpEnabled, forKey: "gameSpacewarpEnabled"); onChange?() }
+    }
     /// Initial cadence, before Auto has observed an active producer. Framegen being armed
     /// must not override Auto or a deliberate Off selection.
     var effectiveGameHalfFrameRate: Bool { gameHalfFrameRateMode == .on }
@@ -178,6 +181,11 @@ final class Settings {
         didSet { defaults.set(nativeOpenXRBackend.rawValue, forKey: "nativeOpenXRBackend"); onChange?() }
     }
 
+    /// Turning the effect off leaves the chosen cadence in place for live switching.
+    func setGameSpacewarp(_ enabled: Bool) {
+        if enabled, gameHalfFrameRateMode == .off { gameHalfFrameRateMode = .on }
+        if gameSpacewarpEnabled != enabled { gameSpacewarpEnabled = enabled }
+    }
 
     /// Percentage of the full game image rendered by the game, in five-percent steps.
     static let gameRenderPercentRange = 50...100
@@ -220,7 +228,7 @@ final class Settings {
            let mode = GameHalfFrameRateMode(rawValue: saved) { return mode }
         // Old versions ORed both switches. Retain their effective cadence when no new
         // choice exists; once Off is explicitly saved, Framegen cannot override it.
-        return defaults.bool(forKey: "gameHalfFrameRate") ? .on : .off
+        return defaults.bool(forKey: "gameHalfFrameRate") || defaults.bool(forKey: "gameSpacewarpEnabled") ? .on : .off
     }
 
     /// The Windows panel's layout is remembered for each set of apps open together.
@@ -237,6 +245,7 @@ final class Settings {
         gameCropVertical = Self.validGameCrop((defaults.object(forKey: "gameCropVertical") as? NSNumber)?.floatValue ?? 0.90, fallback: 0.90)
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
         gameHalfFrameRateMode = Self.storedHalfFrameRateMode(defaults)
+        gameSpacewarpEnabled = defaults.bool(forKey: "gameSpacewarpEnabled")
         nativeOpenXRBackend = defaults.string(forKey: "nativeOpenXRBackend").flatMap(NativeOpenXRBackend.init(rawValue:)) ?? .halliday
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)

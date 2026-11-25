@@ -36,7 +36,7 @@ enum Optics {
         check(reload.gameCropEnabled && reload.gameCropHorizontal == 0.63 && reload.gameCropVertical == 0.97, "independent values persist")
         let requested = gameImageSettingsGeometry(reload)
         check(requested.isCropped, "real settings geometry helper applies crop")
-        check(s.gameRenderPercent == 75 && d.string(forKey: "gameHalfFrameRateMode") == "auto" && d.integer(forKey: "headsetRefreshHz") == 120, "crop does not lower render scale/change cadence or refresh")
+        check(s.gameRenderPercent == 75 && s.gameHalfFrameRateMode == .auto && s.headsetRefreshHz == 120, "crop does not lower render scale/change cadence or refresh")
         var crop = 0, general = 0
         s.onChange = { general += 1 }; s.onGameCropChange = { crop += 1 }
         s.gameCropEnabled = false; s.gameCropHorizontal = 0.72; s.gameCropVertical = 0.93

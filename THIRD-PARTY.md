@@ -7,6 +7,23 @@ Nothing from Sony is included or distributed: no driver binaries, firmware or SD
 
 The app carries the licence of everything it includes in `Halliday.app/Contents/Resources/Licenses/`.
 
+## Windows OpenXR preview
+
+The optional Windows runtime adapts the MIT-licensed BasaltVR frontend at commit
+`c104bc0b489384745157bc42e357f08d17e41638` (https://github.com/frenchbaguetteman/BasaltVR).
+Its Halliday transport and graphics adaptations are in `windows-openxr/`. The copied files
+retain their notices; the complete license is `windows-openxr/LICENSE-BasaltVR`.
+Khronos OpenXR headers retain their MIT notices and `LICENSE-Khronos-MIT`. The statically
+linked LLVM-MinGW runtime notices are included in `LICENSE-LLVM-MinGW`. These texts also
+ship with the separate CrossOver preview bundle.
+
+The Windows Vulkan backend also uses Khronos Vulkan-Headers (Copyright 2015–2026
+The Khronos Group Inc.), offered under Apache-2.0 OR MIT. This distribution uses
+the MIT option and includes the upstream text in
+`windows-openxr/LICENSE-Khronos-Vulkan-MIT` and the Preview's license folder.
+The Vulkan frontend/readback adaptation uses Halliday's own native implementation;
+no VRmin project source was copied.
+
 ## AMD FidelityFX Super Resolution 1
 
 https://github.com/GPUOpen-Effects/FidelityFX-FSR
@@ -16,6 +33,16 @@ RCAS sharpener (v1.20210629), translated to Metal with separate bounds for each
 eye. The source and full AMD notice ship in `Contents/Resources/fsr1/`.
 The additional colour-preparation pass is local Halliday integration code.
 
+## AMD FidelityFX Optical Flow
+
+https://github.com/GPUOpen-LibrariesAndSDKs/FidelityFX-SDK
+
+Optional Spacewarp uses AMD's MIT-licensed Optical Flow 1.1.2 from FidelityFX SDK
+v1.1.4, translated from the original HLSL programs through SPIR-V to Metal 3.2.
+The complete notice and pinned shader provenance ship in
+`Contents/Resources/amd-optical-flow/`. The stereo adapter, forward-prediction
+shader, cadence and compositor integration are local Halliday code. No GPL
+FrameGen/OFXR composition code is included.
 
 ## Monado
 
@@ -226,3 +253,9 @@ https://github.com/llvm/llvm-project/tree/main/compiler-rt
 The x86-64 stack probe `__chkstk` in `core/halliday-vrclient/src/lib.rs` follows compiler-rt's
 `chkstk.S`. Licensed under the Apache License 2.0 with LLVM Exceptions
 (https://llvm.org/LICENSE.txt).
+
+## nlohmann/json
+
+https://github.com/nlohmann/json (3.11.3, MIT, copyright Niels Lohmann).
+The automatic Windows VR routers use its JSON parser. Its notice is retained in
+`windows-openxr/router/LICENSE-nlohmann-json` and the Preview bundle's Licenses.

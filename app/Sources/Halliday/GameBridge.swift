@@ -48,7 +48,6 @@ final class GameBridge {
     private var bridge: OpaquePointer? { bridgeLease?.pointer }
     private var producerState = GameProducerState()
     private var producerWatchdog = GameProducerWatchdog()
-
     private var buffer: MTLBuffer?
     private var texture: MTLTexture?
     private var reading = false
@@ -1420,14 +1419,13 @@ final class GameBridge {
                                  imageTiming: GameSourceImageTime? = nil) -> ProjectionLayer {
         notePoseAge(p)
         Self.nextImageSequence &+= 1
-        let imageTime = CACurrentMediaTime()
         var projection = ProjectionLayer(texture: texture,
                                uvRect: flipped ? SIMD4(0, 1, 1, -1) : SIMD4(0, 0, 1, 1),
                                renderOrientation: originTurn * simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
                                tangents: (viewGeometry.leftTangents, viewGeometry.rightTangents),
                                gameImage: true, imageSequence: Self.nextImageSequence,
-                               imageTime: imageTime, imageTiming: imageTiming, gameHalfRate: halfFrameRate,
+                               imageTime: CACurrentMediaTime(), imageTiming: imageTiming, gameHalfRate: halfFrameRate,
                                sourceFrameInterval: frameCadence.gameInterval, gameCadenceEpoch: cadenceEpoch)
         projection.gameImageTarget = viewGeometry.imageTarget
         if let eyeViews, !eyeViews.matchesLegacy(position: projection.renderPosition, orientation: projection.renderOrientation,

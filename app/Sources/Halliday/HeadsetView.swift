@@ -10,7 +10,7 @@ import simd
 @MainActor
 final class HeadsetView: NSView {
     let renderer: Renderer
-    var source: PoseSource
+    var source: PoseSource { didSet { renderer.retirePresentation() } }
     /// Called once per frame with the head pose about to be rendered (pointer, status, stats).
     var onFrame: ((HeadPose) -> Void)?
 
@@ -49,6 +49,8 @@ final class HeadsetView: NSView {
 
     override func viewDidMoveToWindow() {
         super.viewDidMoveToWindow()
+        renderer.displayPulseDriver.stopClock()
+        renderer.retirePresentation()
         link?.invalidate()
         timer?.cancel()
         if let cvLink { CVDisplayLinkStop(cvLink); self.cvLink = nil; pacer?.stop(); pacer = nil }
@@ -57,9 +59,22 @@ final class HeadsetView: NSView {
             // `--test-headset HZ`: macOS holds a display link at 60 Hz on a virtual display, so a
             // timer paces the frames at the headset's rate (the display shows what it can).
             let period = 1 / hz
-            let t = DispatchSource.makeTimerSource(flags: .strict, queue: .main)
+            let pulses = renderer.displayPulseDriver, pulseClock = pulses.startClock()
+            let pending = Pending()
+            let t = DispatchSource.makeTimerSource(flags: .strict,
+                queue: DispatchQueue(label: "halliday.test-display", qos: .userInteractive))
             t.schedule(deadline: .now(), repeating: period, leeway: .nanoseconds(0))
-            t.setEventHandler { [weak self] in self?.frame(target: CACurrentMediaTime() + period) }
+            t.setEventHandler { [weak self] in
+                let now = CACurrentMediaTime(), target = now + period
+                pulses.pulse(clock: pulseClock, startedNs: Int64(now * 1e9),
+                    baseTargetNs: Int64(target * 1e9), linkTargetNs: Int64(target * 1e9))
+                if pending.offer(target, aim: nil) {
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, pulses.isCurrentClock(pulseClock) else { return }
+                        self.frame(target: pending.take().target)
+                    }
+                }
+            }
             t.resume()
             timer = t
             // The virtual display refreshes at 60 Hz whatever its mode: presenting without waiting
@@ -92,7 +107,9 @@ final class HeadsetView: NSView {
     private func updateDrawableSize() {
         let scale = window?.backingScaleFactor ?? 2
         metalLayer.contentsScale = scale
-        metalLayer.drawableSize = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        let size = CGSize(width: bounds.width * scale, height: bounds.height * scale)
+        if metalLayer.drawableSize != size { renderer.retirePresentation() }
+        metalLayer.drawableSize = size
     }
 
     /// When the frame being drawn reaches the eyes (host seconds, `CACurrentMediaTime`'s clock).
@@ -288,12 +305,27 @@ final class HeadsetView: NSView {
         let pacer = Pacer(period: period.timeScale > 0 && period.timeValue > 0 ? Double(period.timeValue) / Double(period.timeScale) : 1.0 / 120)
         self.pacer = pacer
         renderer.refreshPeriod = pacer.period
+        let pulses = renderer.displayPulseDriver
+        let pulseClock = pulses.startClock()
+        renderer.displayPulseFeedback = CompositorPulseFeedback(
+            presented: { pulse, shown in
+                if shown > 0 {
+                    pacer.shown(aim: pulse.pacedAimNs.map { Double($0) * 1e-9 },
+                        linkTarget: Double(pulse.linkTargetNs) * 1e-9,
+                        start: Double(pulse.startedNs) * 1e-9, at: shown)
+                } else { pacer.miss() }
+            }, drawn: { pulse, end in pacer.drawn(start: Double(pulse.startedNs) * 1e-9, at: end) })
         let ticksPerSecond = Double(timebase.denom) / Double(timebase.numer) * 1e9
         CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, output, _, _ in
             // Until the pacer has seen frames shown, the link starts them: its output time is about
             // when a frame started now is shown (host time, CACurrentMediaTime's clock).
             guard !pacer.isStopped, !pacer.paces else { return kCVReturnSuccess }
             let target = Double(output.pointee.hostTime) * toSeconds
+            // Head rotation presentation is clocked HERE, before any main-thread
+            // coalescing, source rendering or input backpressure.
+            pulses.pulse(clock: pulseClock, startedNs: Int64(CACurrentMediaTime() * 1e9),
+                baseTargetNs: Int64((target + pacer.delayAfterLink) * 1e9),
+                linkTargetNs: Int64(target * 1e9))
             if pending.offer(target, aim: nil) {
                 DispatchQueue.main.async { [weak self] in
                     guard let self, self.pacer === pacer, !pacer.isStopped else { return }
@@ -311,6 +343,9 @@ final class HeadsetView: NSView {
                 let wait = next.start - CACurrentMediaTime()
                 if wait > 0 { mach_wait_until(mach_absolute_time() + UInt64(wait * ticksPerSecond)) }
                 guard !pacer.isStopped else { break }
+                pulses.pulse(clock: pulseClock, startedNs: Int64(CACurrentMediaTime() * 1e9),
+                    baseTargetNs: Int64(next.aim * 1e9), linkTargetNs: Int64(next.aim * 1e9),
+                    pacedAimNs: Int64(next.aim * 1e9))
                 if pacer.offer() {
                     DispatchQueue.main.async { [weak self] in
                         guard let self, self.pacer === pacer, !pacer.isStopped else { return }
@@ -347,11 +382,13 @@ final class HeadsetView: NSView {
         // The headset's orientation is asked for again once the scene is drawn (LateLatch.swift).
         if let tracked = source as? TrackedSource {
             let headset = tracked.headset
-            renderer.latePose = { headset.predict(atHostNs: $0).map { ($0.orientation, $0.angularVelocity) } }
+            renderer.latePose = { headset.predict(atHostNs: $0).map { LateHeadPose(orientation: $0.orientation, bodyAngularVelocity: $0.angularVelocity, motionFlags: $0.motionFlags, trackingGeneration: $0.trackingGeneration) } }
         } else {
             renderer.latePose = nil
         }
         let latched = renderer.canLatch
+        renderer.displayPulseOffsetNs = scanoutLookaheadNs + lookaheadTrimNs
+        renderer.preparePresentation(latched: latched)
         // Drawn in one piece, the frame waits for a drawable here; latched, the lens thread does.
         let drawable = latched ? nil : metalLayer.nextDrawable()
         if !latched, drawable == nil { return }
@@ -401,6 +438,7 @@ final class HeadsetView: NSView {
     }
 
     func stop() {
+        renderer.retirePresentation()
         link?.invalidate()
         link = nil
         timer?.cancel()
@@ -440,10 +478,12 @@ final class HeadsetView: NSView {
         return NSCursor(image: image, hotSpot: .zero)
     }()
 
-    /// Controller interaction never hides the desktop cursor.
+    /// Only an explicit desktop mouse capture hides the desktop cursor. A
+    /// controller ray, including a game dashboard, never changes its image.
     var hidesDesktopCursor = false {
         didSet { if oldValue != hidesDesktopCursor { window?.invalidateCursorRects(for: self) } }
     }
+
     override func resetCursorRects() {
         if hidesDesktopCursor { addCursorRect(bounds, cursor: Self.invisibleCursor) }
     }
