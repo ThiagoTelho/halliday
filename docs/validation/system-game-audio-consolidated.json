@@ -1,0 +1,35 @@
+{
+  "passed": true,
+  "scope": "Source-only full Swift6/macOS14 host typecheck plus synthetic SCK/PCM and settings tests; no capture, output device, app/game or headset execution",
+  "source_sha256": {
+    "Makefile": "8eaa31732b6088aacf2010cbb2fedd1534424596816a5ce539e4686825ef2285",
+    "PRIVACY.md": "69d60505d36277db53b1ad55b5a75e2dcee82b84a332f05004e126e84d54bb7a",
+    "app/Info.plist": "860ba96a880cd180526e9bae7a00d389d15f57b2e9352a5b9f822635d54736c4",
+    "app/Sources/Halliday/AppDelegate.swift": "f2fa217f8ef3e5e5204464a04ef96ce7421dfe8177e1f513b0f7ae426e5bb5db",
+    "app/Sources/Halliday/CompanionWindow.swift": "dbe1192fc1f79af8da5a8a085f47585c99e32989ae28b845f9963c31479dae29",
+    "app/Sources/Halliday/Settings.swift": "351b0b7042110e512a86e736de16b457c52a01ed883e79da98313cf3458faa2d",
+    "app/Sources/Halliday/SettingsPanel.swift": "d7c82254db57aea28585332eee92181eee12632588c6b27893d7e76bd4ab8e1e",
+    "app/Sources/Halliday/SystemAudioBuffer.swift": "bb8fa4ef979bcc6fc64af525958abe6f1fea6f757f5eee8a47620ba3dc9aa51f",
+    "app/Sources/Halliday/SystemGameAudio.swift": "7ed883554365f0e9eaf796012b0a06801402da53da12409b4d012dba80e453a8",
+    "docs/system-game-audio.md": "5b9a91c887bed0d89c2b56787e5dec2f2f84aa5c136dbcd36024fb94374ef660",
+    "tools/test-system-game-audio-settings.sh": "9e78a2d233b08b6e5f9eb7ec4ff951377c5ebf015db89e6baa9a3fc7f2e88934",
+    "tools/test-system-game-audio.sh": "c31421fd083d1e84600390dbb2a169ea0de2f2dcddb62899312247e81177f191",
+    "tools/tests/SystemGameAudioSettingsTests.swift": "eaebdeb699d9e6969846020684c653f193e266bac77047b6419eb82f6c4caaa8",
+    "tools/tests/SystemGameAudioTests.swift": "3a2a69d0ef8133014c69ee74a8529e6a61fecc47b151f8f98f60c19bfa265116"
+  },
+  "checks": {
+    "full_swift6_typecheck": true,
+    "actual_production_render_callback_off_main": true,
+    "borrowed_planar_and_interleaved_sample_copy": true,
+    "strict_packed_float32_format_and_timestamp_guards": true,
+    "bounded_fifo_stale_starvation_overflow_wrap_stop": true,
+    "displayport_output_eligibility": true,
+    "inactive_facade_performs_no_capture_or_device_enumeration": true,
+    "settings_persistence_and_unrelated_preferences": true
+  },
+  "limits": [
+    "Audio was confirmed in the integrated headset build; physical acceptance was not rerun for the extracted source.",
+    "No measured acoustic latency, AV sync or dropout claim."
+  ],
+  "excluded": "Experimental CoreAudio process tap and procedural controller PCM haptics are absent."
+}

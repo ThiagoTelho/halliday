@@ -261,3 +261,9 @@ vr-package: app vr-modules
 # Explicit local development identity, isolated from the ordinary app and its updater.
 crossover-preview: app vr-modules
 	HALLIDAY_PACKAGE_DEVELOPMENT=1 HALLIDAY_PACKAGE_WINDOWS=yes HALLIDAY_PACKAGE_ROUTER=yes HALLIDAY_PACKAGE_NATIVE=yes tools/package-crossover-preview.sh
+
+# Synthetic PCM and settings only: no capture, output device, TCC or app launch.
+.PHONY: system-game-audio-check
+system-game-audio-check:
+	bash tools/test-system-game-audio.sh
+	bash tools/test-system-game-audio-settings.sh

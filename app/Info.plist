@@ -30,6 +30,8 @@
 	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
 	<key>NSDownloadsFolderUsageDescription</key>
 	<string>Halliday's Videos and Files show what this folder holds, so you can open it in VR. Nothing is copied or sent anywhere.</string>
+	<key>NSAudioCaptureUsageDescription</key>
+	<string>Halliday sends game and system audio to the PS VR2 headphones while you play.</string>
 	<!-- Updates (Sparkle, Updates.swift): opt-in. Off until the person turns them on; nothing about the
 	     Mac is sent with a check; an update must carry this key's signature and the Developer ID's. -->
 	<key>SUFeedURL</key>

@@ -47,6 +47,7 @@ final class SettingsPanel: VRPanel {
         case "page:tracking": showingGameImage = false; showingTracking = true; showingFOV = false
         case "page:fov": showingGameImage = false; showingTracking = false; showingFOV = true
         case "tracking:led": settings.senseLEDFeedback.toggle()
+        case "game:systemAudio": settings.gameSystemAudio.toggle()
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:crop": settings.gameCropEnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
@@ -220,6 +221,9 @@ final class SettingsPanel: VRPanel {
             self.toggle(ctx, "motion:reduce", self.settings.reduceMotion, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
         }
 
+        y = row(ctx, "Game audio in PS VR2", "headphones", (0x7FD3FF, 0x2A7FBF), ids: ["game:systemAudio"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:systemAudio", self.settings.gameSystemAudio, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
         let refresh = refreshState?() ?? (rates: [], current: 0, busy: false)
         _ = row(ctx, "Refresh rate", "display", (0xB79BFF, 0x6A47D6), ids: ["display:90", "display:120"], x: rx, y: y, width: rw) { r in
             let left = CGRect(x: r.maxX - 14 - 224, y: r.midY - 20, width: 106, height: 40)

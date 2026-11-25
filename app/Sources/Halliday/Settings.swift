@@ -84,6 +84,9 @@ final class Settings {
 
     /// Relay other apps' system audio into the headset while a VR game is active.
     /// The system's default output and microphone are never changed.
+    var gameSystemAudio: Bool {
+        didSet { defaults.set(gameSystemAudio, forKey: "gameSystemAudio"); onChange?() }
+    }
 
     /// Keep the prior exposure-clock path available as an immediate rollback.
     var senseLEDFeedback: Bool {
@@ -244,6 +247,7 @@ final class Settings {
         reduceMotion = defaults.bool(forKey: "reduceMotion")
         brightness = min(max(defaults.object(forKey: "brightness") as? Float ?? 1, Self.brightnessRange.lowerBound), 1)
         volume = min(max(defaults.object(forKey: "volume") as? Float ?? 0.5, 0), 1)
+        gameSystemAudio = defaults.object(forKey: "gameSystemAudio") as? Bool ?? true
         let savedRefresh = defaults.integer(forKey: "headsetRefreshHz")
         headsetRefreshHz = [90, 120].contains(savedRefresh) ? savedRefresh : 0
         soundVolume = min(max(defaults.object(forKey: "soundVolume") as? Float ?? 0.5, 0), 1)
