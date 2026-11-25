@@ -23,11 +23,13 @@ use openxr_sys::pfn;
 
 #[cfg(target_os = "macos")]
 mod session;
+#[cfg(target_os = "macos")]
+mod vulkan;
 
 /// The session's functions: `session.rs` where Halliday runs, none elsewhere.
 #[cfg(target_os = "macos")]
 fn session_function(name: &[u8]) -> Option<pfn::VoidFunction> {
-    session::lookup(name)
+    session::lookup(name).or_else(|| vulkan::lookup(name))
 }
 #[cfg(not(target_os = "macos"))]
 fn session_function(_name: &[u8]) -> Option<pfn::VoidFunction> {
@@ -47,7 +49,11 @@ const EYE_HEIGHT: u32 = 2040;
 
 /// The extensions the runtime has, with their versions: Metal swapchains, where there is Metal.
 #[cfg(target_os = "macos")]
-const EXTENSIONS: &[(&str, u32)] = &[("XR_KHR_metal_enable", 1)];
+const EXTENSIONS: &[(&str, u32)] = &[
+    ("XR_KHR_metal_enable", 1),
+    ("XR_KHR_vulkan_enable2", 2),
+    ("XR_KHR_vulkan_enable", 8),
+];
 #[cfg(not(target_os = "macos"))]
 const EXTENSIONS: &[(&str, u32)] = &[];
 
@@ -61,8 +67,18 @@ fn eye_size() -> (u32, u32) {
 }
 
 /// Live instances (handles are never reused).
-static INSTANCES: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+struct Instance {
+    handle: u64,
+    extensions: Vec<&'static str>,
+    destroying: bool,
+}
+static INSTANCES: Mutex<Vec<Instance>> = Mutex::new(Vec::new());
 static NEXT_HANDLE: AtomicU64 = AtomicU64::new(1);
+
+// Integration tests temporarily own process-wide instance/session tables. Pure math/path
+// tests remain parallel; every fixture that creates/destroys an instance shares this lease.
+#[cfg(test)]
+static TEST_RUNTIME_LOCK: Mutex<()> = Mutex::new(());
 
 /// The loader's entry point into the runtime.
 ///
@@ -83,7 +99,10 @@ pub unsafe extern "system" fn xrNegotiateLoaderRuntimeInterface(
         || info.struct_version != xr::LOADER_INFO_STRUCT_VERSION as u32
         || info.struct_size != size_of::<xr::NegotiateLoaderInfo>()
         || request.struct_type != xr::NegotiateRuntimeRequest::TYPE
+        || request.struct_version != xr::RUNTIME_INFO_STRUCT_VERSION as u32
         || request.struct_size != size_of::<xr::NegotiateRuntimeRequest>()
+        || info.min_interface_version > info.max_interface_version
+        || info.min_api_version > info.max_api_version
     {
         return xr::Result::ERROR_INITIALIZATION_FAILED;
     }
@@ -134,13 +153,27 @@ unsafe extern "system" fn get_instance_proc_addr(
         b"xrEnumerateInstanceExtensionProperties"
             | b"xrEnumerateApiLayerProperties"
             | b"xrCreateInstance"
-            | b"xrGetInstanceProcAddr"
     );
     if instance == xr::Instance::NULL && !global {
         return xr::Result::ERROR_HANDLE_INVALID;
     }
     if instance != xr::Instance::NULL && !is_live(instance) {
         return xr::Result::ERROR_HANDLE_INVALID;
+    }
+    let extension = match name {
+        b"xrGetMetalGraphicsRequirementsKHR" => Some("XR_KHR_metal_enable"),
+        b"xrGetVulkanGraphicsRequirementsKHR"
+        | b"xrGetVulkanGraphicsDeviceKHR"
+        | b"xrGetVulkanInstanceExtensionsKHR"
+        | b"xrGetVulkanDeviceExtensionsKHR" => Some("XR_KHR_vulkan_enable"),
+        b"xrGetVulkanGraphicsRequirements2KHR"
+        | b"xrCreateVulkanInstanceKHR"
+        | b"xrGetVulkanGraphicsDevice2KHR"
+        | b"xrCreateVulkanDeviceKHR" => Some("XR_KHR_vulkan_enable2"),
+        _ => None,
+    };
+    if extension.is_some_and(|extension| !extension_enabled(instance, extension)) {
+        return xr::Result::ERROR_FUNCTION_UNSUPPORTED;
     }
     *out = match name {
         b"xrGetInstanceProcAddr" => fp!(get_instance_proc_addr, pfn::GetInstanceProcAddr),
@@ -184,7 +217,15 @@ unsafe extern "system" fn get_instance_proc_addr(
                 not_here,
             )
         })),
-        b"xrGetMetalGraphicsRequirementsKHR" => session_function(name),
+        b"xrGetMetalGraphicsRequirementsKHR"
+        | b"xrGetVulkanGraphicsRequirementsKHR"
+        | b"xrGetVulkanGraphicsDeviceKHR"
+        | b"xrGetVulkanInstanceExtensionsKHR"
+        | b"xrGetVulkanDeviceExtensionsKHR"
+        | b"xrGetVulkanGraphicsRequirements2KHR"
+        | b"xrCreateVulkanInstanceKHR"
+        | b"xrGetVulkanGraphicsDevice2KHR"
+        | b"xrCreateVulkanDeviceKHR" => session_function(name),
         _ => None,
     };
     if out.is_some() {
@@ -259,7 +300,7 @@ unsafe extern "system" fn poll_event(
     #[cfg(target_os = "macos")]
     {
         // SAFETY: checked for null; the application's event buffer.
-        unsafe { session::poll(buffer) }
+        unsafe { session::poll(instance.into_raw(), buffer) }
     }
     #[cfg(not(target_os = "macos"))]
     xr::Result::EVENT_UNAVAILABLE
@@ -268,7 +309,23 @@ unsafe extern "system" fn poll_event(
 fn is_live(instance: xr::Instance) -> bool {
     INSTANCES
         .lock()
-        .map(|v| v.contains(&instance.into_raw()))
+        .map(|v| {
+            v.iter()
+                .any(|i| i.handle == instance.into_raw() && !i.destroying)
+        })
+        .unwrap_or(false)
+}
+
+fn extension_enabled(instance: xr::Instance, extension: &str) -> bool {
+    INSTANCES
+        .lock()
+        .map(|v| {
+            v.iter().any(|i| {
+                i.handle == instance.into_raw()
+                    && !i.destroying
+                    && i.extensions.contains(&extension)
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -358,24 +415,67 @@ unsafe extern "system" fn create_instance(
     else {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     };
+    *instance = xr::Instance::NULL;
     if info.ty != xr::InstanceCreateInfo::TYPE {
         return xr::Result::ERROR_VALIDATION_FAILURE;
     }
+    if info.enabled_extension_count != 0 && info.enabled_extension_names.is_null() {
+        return xr::Result::ERROR_VALIDATION_FAILURE;
+    }
+    let api = info.application_info.api_version;
+    if api.major() != 1 || api.minor() > 1 {
+        return xr::Result::ERROR_API_VERSION_UNSUPPORTED;
+    }
+    let mut extensions = Vec::new();
+    #[cfg(target_os = "macos")]
+    let mut vulkan_enabled = false;
+    #[cfg(target_os = "macos")]
+    let mut legacy_vulkan_enabled = false;
+    #[cfg(target_os = "macos")]
+    let mut metal_enabled = false;
     for i in 0..info.enabled_extension_count as usize {
         // SAFETY: the application's array of `enabled_extension_count` C strings.
-        let asked = unsafe { CStr::from_ptr(*info.enabled_extension_names.add(i)) };
-        if !EXTENSIONS
-            .iter()
-            .any(|(name, _)| asked.to_bytes() == name.as_bytes())
-        {
-            return xr::Result::ERROR_EXTENSION_NOT_PRESENT;
+        let name = unsafe { *info.enabled_extension_names.add(i) };
+        if name.is_null() {
+            return xr::Result::ERROR_VALIDATION_FAILURE;
         }
+        let asked = unsafe { CStr::from_ptr(name) };
+        #[cfg(target_os = "macos")]
+        if asked.to_bytes() == b"XR_KHR_vulkan_enable" {
+            legacy_vulkan_enabled = true;
+        }
+        #[cfg(target_os = "macos")]
+        if asked.to_bytes() == b"XR_KHR_vulkan_enable2" {
+            vulkan_enabled = true;
+        }
+        #[cfg(target_os = "macos")]
+        if asked.to_bytes() == b"XR_KHR_metal_enable" {
+            metal_enabled = true;
+        }
+        let Some(&(extension, _)) = EXTENSIONS
+            .iter()
+            .find(|(name, _)| asked.to_bytes() == name.as_bytes())
+        else {
+            return xr::Result::ERROR_EXTENSION_NOT_PRESENT;
+        };
+        extensions.push(extension);
     }
     let handle = NEXT_HANDLE.fetch_add(1, Ordering::Relaxed);
     let Ok(mut live) = INSTANCES.lock() else {
         return xr::Result::ERROR_RUNTIME_FAILURE;
     };
-    live.push(handle);
+    // Session/input storage is process-wide. Refuse a second instance rather
+    // than allowing its cleanup to destroy another application's live state.
+    if !live.is_empty() {
+        return xr::Result::ERROR_LIMIT_REACHED;
+    }
+    live.push(Instance {
+        handle,
+        extensions,
+        destroying: false,
+    });
+    #[cfg(target_os = "macos")]
+    vulkan::register(handle, vulkan_enabled, legacy_vulkan_enabled, metal_enabled);
     *instance = xr::Instance::from_raw(handle);
     xr::Result::SUCCESS
 }
@@ -384,14 +484,25 @@ unsafe extern "system" fn destroy_instance(instance: xr::Instance) -> xr::Result
     let Ok(mut live) = INSTANCES.lock() else {
         return xr::Result::ERROR_RUNTIME_FAILURE;
     };
-    let before = live.len();
-    live.retain(|&h| h != instance.into_raw());
-    if live.len() == before {
+    let Some(entry) = live
+        .iter_mut()
+        .find(|i| i.handle == instance.into_raw() && !i.destroying)
+    else {
         return xr::Result::ERROR_HANDLE_INVALID;
-    }
+    };
+    // Keep the slot occupied until teardown completes, without holding this
+    // mutex across Runtime cleanup (which can join the heartbeat worker).
+    entry.destroying = true;
     drop(live);
     #[cfg(target_os = "macos")]
-    session::instance_destroyed(instance.into_raw());
+    {
+        session::instance_destroyed(instance.into_raw());
+        vulkan::unregister(instance.into_raw());
+    }
+    let Ok(mut live) = INSTANCES.lock() else {
+        return xr::Result::ERROR_RUNTIME_FAILURE;
+    };
+    live.retain(|i| i.handle != instance.into_raw());
     xr::Result::SUCCESS
 }
 
@@ -478,7 +589,7 @@ unsafe extern "system" fn get_system_properties(
     out.graphics_properties = xr::SystemGraphicsProperties {
         max_swapchain_image_width: 4096,
         max_swapchain_image_height: 4096,
-        max_layer_count: 16,
+        max_layer_count: (halliday_bridge::OVERLAYS + 1) as u32,
     };
     out.tracking_properties = xr::SystemTrackingProperties {
         orientation_tracking: xr::TRUE,
@@ -642,6 +753,7 @@ mod tests {
 
     #[test]
     fn an_application_finds_the_headset() {
+        let _runtime = TEST_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gipa = negotiate();
         let create: pfn::CreateInstance = lookup(gipa, xr::Instance::NULL, c"xrCreateInstance");
         let mut info: xr::InstanceCreateInfo = unsafe { std::mem::zeroed() };
@@ -699,7 +811,12 @@ mod tests {
 
         // A session needs a graphics binding (Metal); without one it says so.
         let create_session: pfn::CreateSession = lookup(gipa, instance, c"xrCreateSession");
-        let session_info: xr::SessionCreateInfo = unsafe { std::mem::zeroed() };
+        let session_info = xr::SessionCreateInfo {
+            ty: xr::SessionCreateInfo::TYPE,
+            next: ptr::null(),
+            create_flags: xr::SessionCreateFlags::EMPTY,
+            system_id: system,
+        };
         let mut session = xr::Session::NULL;
         assert_eq!(
             unsafe { create_session(instance, &session_info, &mut session) },
@@ -732,10 +849,12 @@ mod tests {
 
     #[test]
     fn handheld_systems_are_refused() {
+        let _runtime = TEST_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let gipa = negotiate();
         let create: pfn::CreateInstance = lookup(gipa, xr::Instance::NULL, c"xrCreateInstance");
         let mut info: xr::InstanceCreateInfo = unsafe { std::mem::zeroed() };
         info.ty = xr::InstanceCreateInfo::TYPE;
+        info.application_info.api_version = xr::Version::new(1, 0, 0);
         let mut instance = xr::Instance::NULL;
         assert_eq!(unsafe { create(&info, &mut instance) }, xr::Result::SUCCESS);
         let get_system: pfn::GetSystem = lookup(gipa, instance, c"xrGetSystem");
@@ -748,6 +867,122 @@ mod tests {
         assert_eq!(
             unsafe { get_system(instance, &get_info, &mut system) },
             xr::Result::ERROR_FORM_FACTOR_UNSUPPORTED
+        );
+        assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+    }
+
+    #[test]
+    fn unsupported_api_versions_do_not_create_an_instance() {
+        let _runtime = TEST_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let mut info: xr::InstanceCreateInfo = unsafe { std::mem::zeroed() };
+        info.ty = xr::InstanceCreateInfo::TYPE;
+        for version in [
+            xr::Version::new(0, 0, 0),
+            xr::Version::new(1, 2, 0),
+            xr::Version::new(2, 0, 0),
+        ] {
+            info.application_info.api_version = version;
+            let mut instance = xr::Instance::from_raw(u64::MAX);
+            assert_eq!(
+                unsafe { create_instance(&info, &mut instance) },
+                xr::Result::ERROR_API_VERSION_UNSUPPORTED
+            );
+            assert_eq!(instance, xr::Instance::NULL);
+        }
+        // Patch numbers do not add API commands and are not a reason to reject an app.
+        for version in [xr::Version::new(1, 0, 999), xr::Version::new(1, 1, 999)] {
+            info.application_info.api_version = version;
+            let mut instance = xr::Instance::NULL;
+            assert_eq!(
+                unsafe { create_instance(&info, &mut instance) },
+                xr::Result::SUCCESS
+            );
+            assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+        }
+    }
+
+    #[cfg(target_os = "macos")]
+    #[test]
+    fn graphics_dispatch_is_scoped_to_each_instances_enabled_extensions() {
+        let _runtime = TEST_RUNTIME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let gipa = negotiate();
+        let extensions = [
+            c"XR_KHR_metal_enable",
+            c"XR_KHR_vulkan_enable",
+            c"XR_KHR_vulkan_enable2",
+        ];
+        let commands: [&[&CStr]; 3] = [
+            &[c"xrGetMetalGraphicsRequirementsKHR"],
+            &[
+                c"xrGetVulkanGraphicsRequirementsKHR",
+                c"xrGetVulkanGraphicsDeviceKHR",
+                c"xrGetVulkanInstanceExtensionsKHR",
+                c"xrGetVulkanDeviceExtensionsKHR",
+            ],
+            &[
+                c"xrGetVulkanGraphicsRequirements2KHR",
+                c"xrCreateVulkanInstanceKHR",
+                c"xrGetVulkanGraphicsDevice2KHR",
+                c"xrCreateVulkanDeviceKHR",
+            ],
+        ];
+        let mut info: xr::InstanceCreateInfo = unsafe { std::mem::zeroed() };
+        info.ty = xr::InstanceCreateInfo::TYPE;
+        info.application_info.api_version = xr::Version::new(1, 0, 0);
+        for (instance_kind, extension) in extensions.iter().enumerate() {
+            let name = extension.as_ptr();
+            info.enabled_extension_count = 1;
+            info.enabled_extension_names = &name;
+            let mut instance = xr::Instance::NULL;
+            assert_eq!(
+                unsafe { create_instance(&info, &mut instance) },
+                xr::Result::SUCCESS
+            );
+            let mut duplicate = xr::Instance::NULL;
+            assert_eq!(
+                unsafe { create_instance(&info, &mut duplicate) },
+                xr::Result::ERROR_LIMIT_REACHED
+            );
+            assert_eq!(duplicate, xr::Instance::NULL);
+            for (command_kind, commands) in commands.iter().enumerate() {
+                for command in *commands {
+                    let mut function = None;
+                    let expected = if command_kind == instance_kind {
+                        xr::Result::SUCCESS
+                    } else {
+                        xr::Result::ERROR_FUNCTION_UNSUPPORTED
+                    };
+                    assert_eq!(
+                        unsafe { gipa(instance, command.as_ptr(), &mut function) },
+                        expected,
+                        "{command:?}"
+                    );
+                    assert_eq!(function.is_some(), command_kind == instance_kind);
+                }
+            }
+            assert_eq!(unsafe { destroy_instance(instance) }, xr::Result::SUCCESS);
+            let mut function = None;
+            assert_eq!(
+                unsafe {
+                    gipa(
+                        instance,
+                        c"xrGetVulkanGraphicsRequirements2KHR".as_ptr(),
+                        &mut function,
+                    )
+                },
+                xr::Result::ERROR_HANDLE_INVALID
+            );
+        }
+        let mut function = None;
+        assert_eq!(
+            unsafe {
+                gipa(
+                    xr::Instance::NULL,
+                    c"xrGetInstanceProcAddr".as_ptr(),
+                    &mut function,
+                )
+            },
+            xr::Result::ERROR_HANDLE_INVALID
         );
     }
 }

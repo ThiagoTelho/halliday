@@ -610,7 +610,14 @@ fn region(bounds: [f32; 4], width: u32, height: u32) -> (u32, u32, u32, u32, boo
 /// # Safety
 /// On the game's render thread: owning the Direct3D 11 immediate context, or with the game's
 /// OpenGL context current.
-pub unsafe fn present(h: *mut Header, kind: i32, index: u64, pose: bridge::Pose) -> bool {
+pub unsafe fn present(
+    h: *mut Header,
+    kind: i32,
+    index: u64,
+    pose: bridge::Pose,
+    source_time_ns: i64,
+    lease: bridge::producer_lease::Lease,
+) -> bool {
     let start = crate::runtime::now_ticks();
     let ok = STATE.with(|s| {
         if s.phase == present::FAILED || s.phase == present::OFF {
@@ -624,9 +631,9 @@ pub unsafe fn present(h: *mut Header, kind: i32, index: u64, pose: bridge::Pose)
         // SAFETY: as the caller's.
         let result = unsafe {
             if kind == ovr::TEXTURE_DIRECTX {
-                d3d_present(h, s, index, pose)
+                d3d_present(h, s, index, pose, source_time_ns, lease)
             } else {
-                gl_present(h, s, index, pose)
+                gl_present(h, s, index, pose, source_time_ns, lease)
             }
         };
         if let Err(why) = result {
@@ -663,7 +670,30 @@ pub unsafe fn present(h: *mut Header, kind: i32, index: u64, pose: bridge::Pose)
 }
 
 /// Records the frame's pose and size under its number, before it is presented.
-unsafe fn record(h: *mut Header, info: PresentInfo) {
+unsafe fn record(
+    h: *mut Header,
+    mut info: PresentInfo,
+    source_time_ns: i64,
+    lease: bridge::producer_lease::Lease,
+) {
+    if !unsafe { bridge::producer_lease::active(h, lease) } {
+        return;
+    }
+    let times = unsafe { bridge::frame_timing::extension(h) };
+    let index = bridge::frame_timing::present_index(info.number);
+    times.clear(index);
+    if times.write(
+        index,
+        lease.epoch,
+        info.frame_index,
+        bridge::frame_timing::Time {
+            nanoseconds: source_time_ns,
+            clock_kind: bridge::frame_timing::SUBMIT_MONOTONIC_NS,
+        },
+    ) && unsafe { bridge::producer_lease::active(h, lease) }
+    {
+        info.texture_type |= bridge::FRAME_SOURCE_TIMING;
+    }
     // SAFETY: a mapped header; the game side writes the ring from its render thread only.
     unsafe { bridge::write_present_frame(h, &info) };
 }
@@ -673,6 +703,8 @@ unsafe fn d3d_present(
     s: &mut State,
     index: u64,
     pose: bridge::Pose,
+    source_time_ns: i64,
+    lease: bridge::producer_lease::Lease,
 ) -> Result<(), &'static str> {
     // SAFETY (whole function): COM calls with their signatures on the game's objects and ours.
     unsafe {
@@ -905,6 +937,8 @@ unsafe fn d3d_present(
                 texture_type: ovr::TEXTURE_DIRECTX as u32,
                 pose,
             },
+            source_time_ns,
+            lease,
         );
         for e in 0..2 {
             let r = regions[e];
@@ -1046,6 +1080,8 @@ unsafe fn gl_present(
     s: &mut State,
     index: u64,
     pose: bridge::Pose,
+    source_time_ns: i64,
+    lease: bridge::producer_lease::Lease,
 ) -> Result<(), &'static str> {
     // SAFETY (whole function): GL and WGL calls with their signatures; the game's context is put
     // back current before returning.
@@ -1123,6 +1159,8 @@ unsafe fn gl_present(
                 texture_type: ovr::TEXTURE_OPENGL as u32,
                 pose,
             },
+            source_time_ns,
+            lease,
         );
         let mut job = GlJob {
             textures,

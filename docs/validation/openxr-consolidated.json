@@ -1,0 +1,25 @@
+{
+  "scope": "Consolidated generic Windows/native OpenXR and public bridge; device-free validation only",
+  "rust_tests": {
+    "bridge": 42,
+    "core": 185,
+    "native_openxr": 61
+  },
+  "native_cpp_protocol_tests": 13,
+  "windows_runtime_and_test_targets": "cross-compiled and linked with official LLVM-MinGW20261020 UCRT (LLVM23.1.4); not executed",
+  "swift6_application_typecheck": "PASS",
+  "rustfmt": "PASS",
+  "clippy_workspace_all_targets_warnings_denied": "PASS",
+  "excluded": [
+    "Eye gaze/calibration",
+    "Native guest adapters/private APIs",
+    "Experimental PCM/haptic diagnostics",
+    "Experimental Metal display output",
+    "Head-stabilization experiments"
+  ],
+  "limits": [
+    "No headset/game/registry operation",
+    "No game-FPS or photon-latency claim",
+    "Windows compilation is not a Wine/D3DMetal execution test"
+  ]
+}

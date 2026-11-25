@@ -167,8 +167,8 @@ fn recorded_normal_left_only_normal_retains_both_real_hands() {
     for f in &capture {
         let world = PSVR2_BOTTOM.camera_from_world(f.head.unwrap());
         let started = std::time::Instant::now();
-        for hand in 0..2 {
-            legacy[hand].update(
+        for (hand, tracker) in legacy.iter_mut().enumerate() {
+            tracker.update(
                 &PSVR2_BOTTOM,
                 &world,
                 f.hands[hand].unwrap(),
@@ -674,7 +674,7 @@ fn verified_high_residual_left_reacquires_after_lost_yaw_without_weakening_weak_
             reference.rms, reference.sightings
         );
         assert!(
-            first.is_some_and(|n| n >= 2 && n <= 6),
+            first.is_some_and(|n| (2..=6).contains(&n)),
             "Strong recorded left must corroborate and recover within3 heading scans, got{first:?}"
         );
         checked += 1;
