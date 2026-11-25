@@ -149,9 +149,11 @@ pub struct StatusReport {
 
 /// One raw IMU record, in the headset's own axes.
 ///
-/// Timing (measured by GAV): samples arrive at exactly 2000 Hz, two per packet; `vts_us` ticks only
-/// once per millisecond, so both samples of a pair carry the same value. `imu_ts_us` is the
-/// precise 16-bit microsecond clock.
+/// Samples are nominally 2000 Hz but USB reports can regroup them. Bit 0 of `status` marks the
+/// early half-cycle; when clear, the sample is 500 us later than its `vts_us` label. Common early/
+/// late pairs share VTS, but consecutive late samples can have different VTS labels: do not infer
+/// phase from packet size or equality with the previous record. `imu_ts_us` is a separate precise
+/// wrapping 16-bit clock; its long-run rate must not be assumed identical to SLAM's VTS domain.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ImuRecord {
     /// Timestamp on the VTS timeline, shared with SLAM poses.

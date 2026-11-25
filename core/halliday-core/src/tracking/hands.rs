@@ -32,6 +32,10 @@ use super::stereo::{
 use crate::math::Quat;
 use crate::sense::Hand;
 
+#[path = "hand_pair.rs"]
+mod pair;
+pub use pair::{PairDiagnostics, PairedHandTracker};
+
 /// A bright spot of one picture: its middle in pixels and its size.
 #[derive(Debug, Clone, Copy, PartialEq)]
 pub struct Spot {
@@ -125,12 +129,19 @@ const MAX_REACH: f64 = 1.0;
 /// While lost, each camera alone is tried at every other exposure (a millisecond or so).
 const ALONE_EVERY: u32 = 2;
 const ALONE_SIGHTINGS: usize = 6;
+/// Cold monocular acquisition has no stereo points to seed the yaw scan. Spread the scan
+/// across exposures instead of testing all 60 headings on the compositor's main thread.
+const MONOCULAR_HEADINGS_PER_SCAN: u32 = 2;
+const MONOCULAR_CONFIRM_FRAMES: u32 = 12;
 /// Exposures after a fix during which the last place is still tried as a start.
 const NEAR_LAST_FRAMES: u32 = 60;
 
 #[derive(Debug, Clone, Copy)]
 struct Sighting {
     view: usize,
+    /// Identity of the actual source blob within this view/exposure, retained
+    /// even when another controller's observations are masked before refitting.
+    spot: usize,
     led: usize,
     at: [f64; 2],
 }
@@ -144,9 +155,42 @@ struct Solution {
     rms: f64,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct MonocularTrial {
+    position: V3,
+    heading: f64,
+    view: usize,
+    exposure: u32,
+}
+
 impl Solution {
     fn is_good(&self) -> bool {
         self.sightings.len() >= MIN_SIGHTINGS && self.rms < MAX_RMS
+    }
+
+    /// High-observability stereo support, using the existing large-heading
+    /// support count and cold-acquisition unique-LED count. Only the paired
+    /// tracker may use this branch: it also corroborates independent exposures.
+    fn strong_stereo(&self) -> bool {
+        self.rms < MAX_RMS
+            && self.sightings.len() >= JUMP_SIGHTINGS
+            && self
+                .sightings
+                .iter()
+                .map(|s| (s.view, s.spot))
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                == self.sightings.len()
+            && [0, 1].iter().all(|view| {
+                self.sightings.iter().filter(|s| s.view == *view).count() >= JUMP_SIGHTINGS / 2
+            })
+            && self
+                .sightings
+                .iter()
+                .map(|s| s.led)
+                .collect::<std::collections::BTreeSet<_>>()
+                .len()
+                >= SCAN_SIGHTINGS
     }
 }
 
@@ -155,6 +199,7 @@ impl Solution {
 struct Seen<'a> {
     cameras: Vec<Camera>,
     spots: Vec<&'a [Spot]>,
+    spot_ids: Vec<Vec<usize>>,
     points: Vec<V3>,
 }
 
@@ -218,6 +263,7 @@ impl<'a> Seen<'a> {
         }
         Seen {
             cameras,
+            spot_ids: spots.iter().map(|view| (0..view.len()).collect()).collect(),
             spots,
             points,
         }
@@ -366,7 +412,8 @@ fn vote(points: &[V3], shape: &Shape) -> Option<V3> {
 }
 
 /// Each LED facing a camera takes the spot nearest to where it should appear in that camera's
-/// picture, when that spot is within `radius` and has no nearer LED.
+/// picture, when that spot is within `radius` and has no nearer LED. An exact
+/// distance tie belongs to the lowest LED index, never to both observations.
 fn assign(seen: &Seen, shape: &Shape, p: V3, radius: f64) -> Vec<Sighting> {
     let mut out = Vec::new();
     for (view, (camera, spots)) in seen.cameras.iter().zip(&seen.spots).enumerate() {
@@ -394,12 +441,14 @@ fn assign(seen: &Seen, shape: &Shape, p: V3, radius: f64) -> Vec<Sighting> {
             else {
                 break;
             };
-            let nearer = expected
-                .iter()
-                .any(|(other, o)| other != led && apart(*o, &spots[j]) < d);
+            let nearer = expected.iter().any(|(other, o)| {
+                let other_distance = apart(*o, &spots[j]);
+                other != led && (other_distance < d || other_distance == d && other < led)
+            });
             if d < radius * radius && !nearer {
                 out.push(Sighting {
                     view,
+                    spot: seen.spot_ids[view][j],
                     led: *led,
                     at: [f64::from(spots[j].x), f64::from(spots[j].y)],
                 });
@@ -545,10 +594,19 @@ pub struct HandTracker {
     /// The bottom cameras as fisheyes (camera mode 0x10's raw pictures), or `None`: the
     /// rectified pair of modes 1 and 3.
     bottom: Option<[Camera; 2]>,
+    /// This headset's measured right-camera alignment, in that raw camera's local axes.
+    /// The generic camera model remains the default; this is not a controller pose offset.
+    bottom_alignment: V3,
     /// Whether the heading has ever been settled by a fix with enough LEDs. Until then a fix
     /// on few LEDs is not taken: with the heading unknown, five sightings fitted a controller
     /// 36° off its real heading.
     settled: bool,
+    /// Enables the expanded stereo gate only for the paired temporal owner.
+    paired_confirmation: bool,
+    /// Per-exposure paired identity support; legacy callers keep MIN_SIGHTINGS.
+    required_sightings: usize,
+    /// A cold monocular hypothesis must fit a later exposure before it establishes yaw.
+    monocular_trial: Option<MonocularTrial>,
 }
 
 impl HandTracker {
@@ -563,14 +621,53 @@ impl HandTracker {
             step: [0.0; 3],
             lost: SCAN_AFTER,
             bottom: None,
+            bottom_alignment: [0.0; 3],
             settled: false,
+            paired_confirmation: false,
+            required_sightings: MIN_SIGHTINGS,
+            monocular_trial: None,
         }
     }
 
     /// The bottom pair's spots are from the raw fisheyes (camera mode 0x10, about 170° across
     /// together) instead of the rectified pair (modes 1 and 3, 82°): `PSVR2_BOTTOM_FISHEYE`.
     pub fn set_bottom_fisheyes(&mut self, on: bool) {
-        self.bottom = on.then_some(super::stereo::PSVR2_BOTTOM_FISHEYE);
+        self.bottom = on.then(|| self.aligned_bottom_cameras());
+    }
+
+    fn aligned_bottom_cameras(&self) -> [Camera; 2] {
+        let mut cameras = super::stereo::PSVR2_BOTTOM_FISHEYE;
+        cameras[1].rotation = mul(
+            &from_rotation_vector(self.bottom_alignment),
+            &cameras[1].rotation,
+        );
+        cameras
+    }
+
+    /// Applies a measured, per-headset relative alignment to the raw bottom pair.
+    /// `rotation` is a rotation vector in radians, in the right raw camera's axes
+    /// (x right, y down, z forward). The same cameras are used for stereo seeding
+    /// and final raw-pixel reprojection; adjusting only the seed gate cannot fix
+    /// inconsistent camera geometry. Zero selects the unchanged generic model.
+    ///
+    /// Rejects nonfinite values or corrections beyond five degrees without
+    /// changing the tracker. A changed calibration retires old pose hypotheses.
+    pub fn set_bottom_fisheye_alignment(&mut self, rotation: V3) -> bool {
+        if !rotation.iter().all(|v| v.is_finite())
+            || dot(rotation, rotation) > 5f64.to_radians().powi(2)
+        {
+            return false;
+        }
+        if self.bottom_alignment == rotation {
+            return true;
+        }
+        let raw = self.bottom.is_some();
+        let paired = self.paired_confirmation;
+        *self = Self::new(self.hand);
+        self.paired_confirmation = paired;
+        self.bottom_alignment = rotation;
+        self.set_bottom_fisheyes(raw);
+        true
     }
 
     pub fn hand(&self) -> Hand {
@@ -643,7 +740,7 @@ impl HandTracker {
                 },
             );
         }
-        if !found.as_ref().is_some_and(Solution::is_good) {
+        if !found.as_ref().is_some_and(|s| self.usable(s)) {
             found = self.fit(
                 seen,
                 camera_from_world,
@@ -658,7 +755,7 @@ impl HandTracker {
         }
         // Out of the pair's sight there is nothing to vote on: for a second after a fix, the
         // controller is also looked for around where it was last, in whatever camera sees it.
-        if !found.as_ref().is_some_and(Solution::is_good)
+        if !found.as_ref().is_some_and(|s| self.usable(s))
             && self.lost > FOLLOW_FRAMES
             && self.lost <= NEAR_LAST_FRAMES
             && let Some(last) = self.last
@@ -676,7 +773,7 @@ impl HandTracker {
             );
         }
         // And by each camera alone, with the heading as it was last known.
-        if !found.as_ref().is_some_and(Solution::is_good) && self.lost % ALONE_EVERY == 0 {
+        if !found.as_ref().is_some_and(|s| self.usable(s)) && self.lost % ALONE_EVERY == 0 {
             let rotation = mul(
                 &mul(
                     &mul(
@@ -714,10 +811,11 @@ impl HandTracker {
                 }
             }
         }
-        if !found.as_ref().is_some_and(Solution::is_good)
+        if !found.as_ref().is_some_and(|s| self.usable(s))
             && self.lost >= SCAN_AFTER
             && (self.lost - SCAN_AFTER) % SCAN_EVERY == 0
-            && seen.points.len() >= 5
+            && (seen.points.len() >= 5
+                || self.paired_confirmation && self.last.is_some() && self.lost <= NEAR_LAST_FRAMES)
         {
             let steps = if self.settled && self.lost < RESCAN_AFTER {
                 -SCAN_NEAR_STEPS..=SCAN_NEAR_STEPS
@@ -727,7 +825,7 @@ impl HandTracker {
             found = steps
                 .filter_map(|step| {
                     let heading = self.heading + f64::from(step) * 6f64.to_radians();
-                    self.fit(
+                    let voted = self.fit(
                         seen,
                         camera_from_world,
                         imu,
@@ -737,32 +835,167 @@ impl HandTracker {
                             radii: &RADII_SEARCH,
                             hold: 0.0,
                         },
-                    )
+                    );
+                    let prior = if self.paired_confirmation && self.lost <= NEAR_LAST_FRAMES {
+                        self.last
+                            .and_then(|last| {
+                                self.fit(
+                                    seen,
+                                    camera_from_world,
+                                    imu,
+                                    heading,
+                                    Search {
+                                        start: Some(last),
+                                        radii: &RADII_SEARCH,
+                                        hold: 0.0,
+                                    },
+                                )
+                            })
+                            .filter(Solution::strong_stereo)
+                    } else {
+                        None
+                    };
+                    [voted, prior]
+                        .into_iter()
+                        .flatten()
+                        .filter(|s| self.scan_usable(s))
+                        .max_by(|a, b| {
+                            (a.sightings.len(), -a.rms)
+                                .partial_cmp(&(b.sightings.len(), -b.rms))
+                                .unwrap_or(std::cmp::Ordering::Equal)
+                        })
                 })
-                .filter(|s| s.sightings.len() >= SCAN_SIGHTINGS && s.rms < SCAN_RMS)
+                .filter(|s| self.scan_usable(s))
                 .max_by(|a, b| {
                     (a.sightings.len(), -a.rms)
                         .partial_cmp(&(b.sightings.len(), -b.rms))
                         .unwrap_or(std::cmp::Ordering::Equal)
                 });
         }
+        // Stereo cannot propose a place when only one camera sees a newly woken controller.
+        // Its initial yaw is arbitrary: retrying only yaw zero can never acquire it. Keep
+        // the IMU's tilt/roll, scan a bounded number of yaws, and require eight unique LEDs
+        // in one picture, the normal scan's tight RMS, and a confirming later exposure.
+        if (!self.settled || self.paired_confirmation && self.lost >= SCAN_AFTER)
+            && !found.as_ref().is_some_and(|s| self.usable(s))
+        {
+            if let Some(trial) = self.monocular_trial
+                && self.lost > trial.exposure
+                && self.lost - trial.exposure <= MONOCULAR_CONFIRM_FRAMES
+            {
+                let confirmed = self.fit(
+                    seen,
+                    camera_from_world,
+                    imu,
+                    trial.heading,
+                    Search {
+                        start: Some(trial.position),
+                        radii: &RADII_FOLLOW,
+                        hold: TILT_HOLD,
+                    },
+                );
+                if confirmed.as_ref().is_some_and(|s| {
+                    let shift = sub(s.position, trial.position);
+                    let turn = (s.heading - trial.heading + std::f64::consts::PI)
+                        .rem_euclid(std::f64::consts::TAU)
+                        - std::f64::consts::PI;
+                    s.sightings.iter().filter(|v| v.view == trial.view).count() >= SCAN_SIGHTINGS
+                        && s.rms < SCAN_RMS
+                        && dot(shift, shift) < 0.08 * 0.08
+                        && turn.abs() < 15f64.to_radians()
+                        && self.usable(s)
+                }) {
+                    found = confirmed;
+                }
+            }
+            if !found.as_ref().is_some_and(|s| self.usable(s))
+                && self.lost >= SCAN_AFTER
+                && (self.lost - SCAN_AFTER) % SCAN_EVERY == 0
+            {
+                let step = (self.lost - SCAN_AFTER) / SCAN_EVERY * MONOCULAR_HEADINGS_PER_SCAN;
+                let mut best: Option<(usize, usize, Solution)> = None;
+                let mut strong_best: Option<Solution> = None;
+                for offset in 0..MONOCULAR_HEADINGS_PER_SCAN {
+                    let heading = f64::from((step + offset) % 60) * 6f64.to_radians();
+                    let rotation = mul(
+                        &mul(
+                            &mul(
+                                camera_from_world,
+                                &from_rotation_vector([self.tilt[0], 0.0, self.tilt[1]]),
+                            ),
+                            &turn_y(heading),
+                        ),
+                        imu,
+                    );
+                    let shape = Shape::new(&self.leds, &rotation);
+                    for (view, (camera, spots)) in seen.cameras.iter().zip(&seen.spots).enumerate()
+                    {
+                        if spots.iter().filter(|s| PAIR_AREA.contains(&s.area)).count()
+                            < SCAN_SIGHTINGS
+                        {
+                            continue;
+                        }
+                        let Some(start) = vote_alone(camera, spots, &shape) else {
+                            continue;
+                        };
+                        let Some(tried) = self.fit(
+                            seen,
+                            camera_from_world,
+                            imu,
+                            heading,
+                            Search {
+                                start: Some(start),
+                                radii: &RADII_SEARCH,
+                                hold: TILT_HOLD,
+                            },
+                        ) else {
+                            continue;
+                        };
+                        let count = tried.sightings.iter().filter(|v| v.view == view).count();
+                        if self.paired_confirmation && tried.strong_stereo() && self.usable(&tried)
+                        {
+                            // A single-camera seed is only a proposal. Both raw
+                            // cameras validate it, and the paired owner requires
+                            // an independent exposure before publishing this pose.
+                            if strong_best.as_ref().is_none_or(|old| {
+                                (tried.sightings.len(), -tried.rms)
+                                    > (old.sightings.len(), -old.rms)
+                            }) {
+                                strong_best = Some(tried);
+                            }
+                            continue;
+                        }
+                        if count < SCAN_SIGHTINGS || tried.rms >= SCAN_RMS || !self.usable(&tried) {
+                            continue;
+                        }
+                        if best
+                            .as_ref()
+                            .is_none_or(|(_, n, b)| (count, -tried.rms) > (*n, -b.rms))
+                        {
+                            best = Some((view, count, tried));
+                        }
+                    }
+                }
+                if let Some(strong) = strong_best {
+                    found = Some(strong);
+                }
+                if let Some((view, _, tried)) = best {
+                    self.monocular_trial = Some(MonocularTrial {
+                        position: tried.position,
+                        heading: tried.heading,
+                        view,
+                        exposure: self.lost,
+                    });
+                }
+            }
+        }
         // Nothing a hand holds is farther from the cameras than an arm is long: what is found
         // beyond is a reflection or a lamp (both trackers once locked onto the same thing 1.1 m
         // away, and the user saw a hand jump away).
-        let enough = |s: &Solution| self.settled || s.sightings.len() >= SCAN_SIGHTINGS;
-        let turned = |s: &Solution| {
-            let jump = (s.heading - self.heading + std::f64::consts::PI)
-                .rem_euclid(std::f64::consts::TAU)
-                - std::f64::consts::PI;
-            self.settled
-                && jump.abs() > HEADING_JUMP
-                && !(s.sightings.len() >= JUMP_SIGHTINGS && s.rms < SCAN_RMS)
-        };
-        match found.filter(|s| {
-            s.is_good() && dot(s.position, s.position).sqrt() < MAX_REACH && enough(s) && !turned(s)
-        }) {
+        match found.filter(|s| self.usable(s)) {
             Some(mut s) => {
                 self.settled = true;
+                self.monocular_trial = None;
                 // Keep the heading within a turn.
                 s.heading = (s.heading + std::f64::consts::PI).rem_euclid(std::f64::consts::TAU)
                     - std::f64::consts::PI;
@@ -783,6 +1016,27 @@ impl HandTracker {
                 None
             }
         }
+    }
+
+    /// Use the same acceptance gate during search and at publication. A weak cold-start fit
+    /// must not suppress yaw acquisition only to be rejected at the end of every exposure.
+    fn usable(&self, s: &Solution) -> bool {
+        let jump = (s.heading - self.heading + std::f64::consts::PI)
+            .rem_euclid(std::f64::consts::TAU)
+            - std::f64::consts::PI;
+        s.is_good()
+            && s.sightings.len() >= self.required_sightings
+            && dot(s.position, s.position).sqrt() < MAX_REACH
+            && (self.settled || s.sightings.len() >= SCAN_SIGHTINGS)
+            && !(self.settled
+                && jump.abs() > HEADING_JUMP
+                && !(s.sightings.len() >= JUMP_SIGHTINGS && s.rms < SCAN_RMS
+                    || self.paired_confirmation && s.strong_stereo()))
+    }
+
+    fn scan_usable(&self, s: &Solution) -> bool {
+        s.sightings.len() >= SCAN_SIGHTINGS && s.rms < SCAN_RMS
+            || self.paired_confirmation && s.strong_stereo()
     }
 
     /// The place, heading and lean that fit the spots, starting from `start` or, without one, from
@@ -923,20 +1177,17 @@ pub fn at_exposure(frames: &mut [Frame], lag_ns: i64) {
                 continue;
             }
             let ((t0, q0), (t1, q1)) = (reports[after - 1], reports[after]);
-            if wanted - t0 > 50_000_000 || t1 - wanted > 50_000_000 {
+            let (Ok(t0), Ok(t1), Ok(wanted_time)) =
+                (i64::try_from(t0), i64::try_from(t1), i64::try_from(wanted))
+            else {
                 continue;
-            }
-            let k = (wanted - t0) as f32 / (t1 - t0).max(1) as f32;
-            let q1 = if q0.dot(q1) < 0.0 { -q1 } else { q1 };
-            frame.hands[hand] = Some(
-                Quat {
-                    w: q0.w + (q1.w - q0.w) * k,
-                    x: q0.x + (q1.x - q0.x) * k,
-                    y: q0.y + (q1.y - q0.y) * k,
-                    z: q0.z + (q1.z - q0.z) * k,
-                }
-                .normalized(),
-            );
+            };
+            let Some(q) =
+                crate::sense_orientation_history::between((t0, q0), (t1, q1), wanted_time)
+            else {
+                continue;
+            };
+            frame.hands[hand] = Some(q);
             frame.hands_at[hand] = Some(wanted);
         }
     }
@@ -1358,6 +1609,172 @@ pub fn calibrate(frames: &[Frame], start: &StereoPair) -> Option<Calibration> {
 mod tests {
     use super::*;
     use crate::tracking::stereo::PSVR2_BOTTOM;
+
+    // Measured on one headset from fourteen same-LED correspondences in ONE normal
+    // exposure. Fifteen correspondences in two different, held-out exposures independently
+    // validate this rotation (under 0.61px row error). It must never become a global default.
+    const RECORDED_ALIGNMENT: V3 = [
+        -0.004112071331861413,
+        0.003328861353291489,
+        -0.01492005963837453,
+    ];
+
+    #[test]
+    fn measured_camera_alignment_recovers_both_hands_across_the_recorded_field() {
+        let frames = parse_dump(include_str!(
+            "../../tests/fixtures/sense_fisheye_alignment.txt"
+        ));
+        // Complete 60Hz exposures, not the 5Hz RAW-image subset: acquisition/following
+        // thresholds count exposures. The left ring is illuminated in every phase;
+        // the right is explicitly switched off in the middle phase.
+        let phases = [
+            1_353_585_370..2_357_257_162,
+            2_467_341_662..7_470_531_245,
+            7_523_847_620..8_529_437_120,
+        ];
+        let mut observed = [[[0usize; 2]; 3]; 2];
+        let mut exposures = [0usize; 3];
+        for (variant, alignment) in [[0.0; 3], RECORDED_ALIGNMENT].into_iter().enumerate() {
+            let mut hands = [HandTracker::new(Hand::Left), HandTracker::new(Hand::Right)];
+            for hand in &mut hands {
+                hand.set_bottom_fisheyes(true);
+                assert!(hand.set_bottom_fisheye_alignment(alignment));
+            }
+            for frame in &frames {
+                let phase = phases.iter().position(|p| p.contains(&frame.t_ns));
+                if variant == 0
+                    && let Some(phase) = phase
+                {
+                    exposures[phase] += 1;
+                }
+                let world = PSVR2_BOTTOM.camera_from_world(frame.head.unwrap());
+                for (index, tracker) in hands.iter_mut().enumerate() {
+                    if let Some(fix) = tracker.update(
+                        &PSVR2_BOTTOM,
+                        &world,
+                        frame.hands[index].unwrap(),
+                        &frame.left,
+                        &frame.right,
+                    ) && let Some(phase) = phase
+                    {
+                        observed[variant][phase][index] += 1;
+                        if variant == 1 {
+                            assert!(
+                                fix.sightings >= 10 && fix.rms < MAX_RMS as f32,
+                                "phase{phase}/hand{index}/frame{}: {fix:?}",
+                                frame.counter
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        assert_eq!(exposures, [60, 300, 48]);
+        assert_eq!(
+            observed[0],
+            [[0, 60], [0, 0], [0, 0]],
+            "generic calibration repro"
+        );
+        assert_eq!(
+            observed[1],
+            [[60, 60], [300, 0], [48, 48]],
+            "both illuminated hands must remain acquired; the unlit hand must not false-lock"
+        );
+    }
+
+    #[test]
+    fn a_headset_alignment_does_not_change_rectified_or_other_headset_defaults() {
+        let frames = parse_dump(include_str!("../../tests/fixtures/sense_spots_1s.txt"));
+        for hand in [Hand::Left, Hand::Right] {
+            let mut generic = HandTracker::new(hand);
+            let mut profile = HandTracker::new(hand);
+            assert!(profile.set_bottom_fisheye_alignment(RECORDED_ALIGNMENT));
+            for frame in &frames {
+                let Some(orientation) = frame.hands[hand as usize] else {
+                    continue;
+                };
+                let world = PSVR2_BOTTOM.camera_from_world(frame.head.unwrap());
+                assert_eq!(
+                    generic.update(
+                        &PSVR2_BOTTOM,
+                        &world,
+                        orientation,
+                        &frame.left,
+                        &frame.right
+                    ),
+                    profile.update(
+                        &PSVR2_BOTTOM,
+                        &world,
+                        orientation,
+                        &frame.left,
+                        &frame.right
+                    )
+                );
+            }
+            let mut other_headset = HandTracker::new(hand);
+            other_headset.set_bottom_fisheyes(true);
+            assert_eq!(
+                other_headset.bottom.unwrap(),
+                super::super::stereo::PSVR2_BOTTOM_FISHEYE
+            );
+        }
+    }
+
+    #[test]
+    fn camera_alignment_validation_is_transactional_and_changed_geometry_retires_old_fixes() {
+        let frame = parse_dump(include_str!(
+            "../../tests/fixtures/sense_fisheye_alignment.txt"
+        ))
+        .into_iter()
+        .next()
+        .unwrap();
+        let mut tracker = HandTracker::new(Hand::Left);
+        tracker.set_bottom_fisheyes(true);
+        assert!(tracker.set_bottom_fisheye_alignment(RECORDED_ALIGNMENT));
+        let cameras = tracker.bottom;
+        tracker.set_bottom_fisheyes(false);
+        assert!(tracker.bottom.is_none());
+        tracker.set_bottom_fisheyes(true);
+        assert_eq!(
+            tracker.bottom, cameras,
+            "raw-mode toggle must retain this headset's alignment"
+        );
+        let world = PSVR2_BOTTOM.camera_from_world(frame.head.unwrap());
+        assert!(
+            tracker
+                .update(
+                    &PSVR2_BOTTOM,
+                    &world,
+                    frame.hands[0].unwrap(),
+                    &frame.left,
+                    &frame.right
+                )
+                .is_some()
+        );
+        assert!(tracker.settled && tracker.last.is_some());
+        let last = tracker.last;
+        for invalid in [
+            [f64::NAN, 0.0, 0.0],
+            [0.0, f64::INFINITY, 0.0],
+            [0.0, 0.0, 0.10],
+        ] {
+            assert!(!tracker.set_bottom_fisheye_alignment(invalid));
+            assert_eq!(tracker.bottom, cameras);
+            assert_eq!(tracker.last, last);
+            assert!(tracker.settled);
+        }
+        assert!(tracker.set_bottom_fisheye_alignment(RECORDED_ALIGNMENT));
+        assert_eq!(
+            tracker.last, last,
+            "idempotent profile refresh must not reset tracking"
+        );
+        assert!(tracker.set_bottom_fisheye_alignment([0.0; 3]));
+        assert!(!tracker.settled && tracker.last.is_none() && tracker.monocular_trial.is_none());
+        assert_eq!(
+            tracker.bottom.unwrap(),
+            super::super::stereo::PSVR2_BOTTOM_FISHEYE
+        );
+    }
 
     /// Numbers in 0..1 that are the same on every run.
     struct Dice(u64);
@@ -1953,6 +2370,196 @@ mod tests {
             assert!(
                 (tilt[0] - truth.pitch).abs() < 0.01 && tilt[1].abs() < 0.01,
                 "{tilt:?}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod strong_stereo_contract_tests {
+    use super::*;
+    fn strong() -> Solution {
+        Solution {
+            position: [0., 0., 0.5],
+            heading: 0.,
+            tilt: [0.; 2],
+            rms: 1.7,
+            sightings: (0..16)
+                .map(|i| Sighting {
+                    view: i / 8,
+                    spot: i % 8,
+                    led: i % 8,
+                    at: [0.; 2],
+                })
+                .collect(),
+        }
+    }
+    #[test]
+    fn strong_stereo_requires_unique_leds_unique_blobs_both_views_and_existing_rms_bound() {
+        let good = strong();
+        assert!(good.strong_stereo());
+        let mut weak = good.clone();
+        weak.sightings.truncate(8);
+        assert!(!weak.strong_stereo());
+        let mut one = good.clone();
+        for s in &mut one.sightings {
+            s.view = 0;
+        }
+        assert!(!one.strong_stereo());
+        let mut repeat = good.clone();
+        for s in &mut repeat.sightings {
+            s.led %= 4;
+        }
+        assert!(!repeat.strong_stereo());
+        let mut duplicate = good.clone();
+        duplicate.sightings[1].spot = duplicate.sightings[0].spot;
+        assert!(!duplicate.strong_stereo());
+        let mut loose = good.clone();
+        loose.rms = MAX_RMS;
+        assert!(!loose.strong_stereo());
+        let legacy = HandTracker::new(Hand::Left);
+        assert!(!legacy.scan_usable(&good));
+        let mut paired = legacy;
+        paired.paired_confirmation = true;
+        assert!(paired.scan_usable(&good));
+        let mut weak_tight = good.clone();
+        weak_tight.sightings.truncate(8);
+        weak_tight.rms = 1.1;
+        assert!(paired.scan_usable(&weak_tight));
+        assert!(HandTracker::new(Hand::Left).scan_usable(&weak_tight));
+    }
+}
+
+#[cfg(test)]
+mod assign_unique_blob_contract_tests {
+    use super::*;
+
+    fn camera() -> Camera {
+        Camera {
+            focal: 1.,
+            cx: 128.,
+            cy: 128.,
+            rotation: [[1., 0., 0.], [0., 1., 0.], [0., 0., 1.]],
+            place: [0.; 3],
+            fisheye: None,
+            size: [640.; 2],
+        }
+    }
+    fn shape(xs: &[f64]) -> Shape {
+        let mut shape = Shape {
+            places: [[0.; 3]; LED_COUNT],
+            facings: [[0., 0., 1.]; LED_COUNT],
+        };
+        for (i, x) in xs.iter().enumerate() {
+            shape.places[i] = [*x, 0., 0.];
+            shape.facings[i] = [0., 0., -1.];
+        }
+        shape
+    }
+    fn seen(spots: &[Spot], views: usize) -> Seen<'_> {
+        Seen {
+            cameras: vec![camera(); views],
+            spots: vec![spots; views],
+            spot_ids: vec![(0..spots.len()).map(|i| i + 41).collect(); views],
+            points: Vec::new(),
+        }
+    }
+    fn blob(x: f64) -> Spot {
+        Spot {
+            x: (128. + x) as f32,
+            y: 128.,
+            area: 20,
+        }
+    }
+
+    #[test]
+    fn equal_distance_blob_cannot_inflate_weak_support_for_either_mirror() {
+        for mirror in [-1., 1.] {
+            // Synthetic exact pixels, not a physical controller calibration:
+            // four real blobs lie halfway between eight projected LEDs.
+            let xs: Vec<_> = [10., 30., 50., 70.]
+                .into_iter()
+                .flat_map(|x| [mirror * (x - 1.), mirror * (x + 1.)])
+                .collect();
+            let spots: Vec<_> = [10., 30., 50., 70.].map(|x| blob(mirror * x)).into();
+            let matches = assign(&seen(&spots, 1), &shape(&xs), [0., 0., 1.], 2.);
+            assert_eq!(matches.len(), 4, "One source blob was counted for two LEDs");
+            assert_eq!(
+                matches.iter().map(|s| s.led).collect::<Vec<_>>(),
+                vec![0, 2, 4, 6]
+            );
+            let weak = Solution {
+                position: [0., 0., 1.],
+                heading: 0.,
+                tilt: [0.; 2],
+                rms: 1.,
+                sightings: matches,
+            };
+            assert!(
+                !weak.is_good(),
+                "Four source blobs must not pass five-sighting weak continuation"
+            );
+        }
+    }
+
+    #[test]
+    fn coincident_led_projection_has_one_owner_per_view_and_keeps_source_identity() {
+        let spots = [blob(0.)];
+        let matches = assign(&seen(&spots, 2), &shape(&[0., 0.]), [0., 0., 1.], 2.);
+        assert_eq!(
+            matches.len(),
+            2,
+            "One observation in each camera remains two independent sightings"
+        );
+        assert_eq!(
+            matches
+                .iter()
+                .map(|s| (s.view, s.spot, s.led))
+                .collect::<Vec<_>>(),
+            vec![(0, 41, 0), (1, 41, 0)]
+        );
+    }
+
+    #[test]
+    fn strictly_nearer_assignments_and_original_spot_indices_are_unchanged() {
+        for mirror in [-1., 1.] {
+            for reverse in [false, true] {
+                let mut spots = vec![
+                    blob(mirror * -1.25),
+                    blob(mirror * 0.75),
+                    blob(mirror * 40.),
+                ];
+                if reverse {
+                    spots.reverse();
+                }
+                let matches = assign(
+                    &seen(&spots, 1),
+                    &shape(&[-mirror, mirror]),
+                    [0., 0., 1.],
+                    2.,
+                );
+                let ids = if reverse { [43, 42] } else { [41, 42] };
+                assert_eq!(
+                    matches
+                        .iter()
+                        .map(|s| (s.view, s.spot, s.led))
+                        .collect::<Vec<_>>(),
+                    vec![(0, ids[0], 0), (0, ids[1], 1)]
+                );
+            }
+            // A one-f32-step displacement is strictly nearer, not an epsilon
+            // tie: the higher LED index must still win for either mirror.
+            let step = f64::from(f32::from_bits(128f32.to_bits() + 1) - 128.);
+            let spots = [blob(mirror * step)];
+            let matches = assign(
+                &seen(&spots, 1),
+                &shape(&[-mirror, mirror]),
+                [0., 0., 1.],
+                2.,
+            );
+            assert_eq!(
+                matches.iter().map(|s| (s.spot, s.led)).collect::<Vec<_>>(),
+                vec![(41, 1)]
             );
         }
     }

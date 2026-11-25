@@ -214,3 +214,20 @@ clean:
 	cargo clean --manifest-path core/Cargo.toml
 	cargo clean --manifest-path core/halliday-vrclient/Cargo.toml
 	rm -rf $(BUILD)
+
+# Device-free Sense validation; no HID manager, camera, application or game is opened.
+.PHONY: sense-check
+sense-check:
+	cargo test --manifest-path core/Cargo.toml -p halliday-core --lib --test monocular_acquisition --test paired_hand_tracking --test controller_orientation_history
+	cargo build --manifest-path core/Cargo.toml -p halliday-core
+	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-calibration.sh
+	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-pose-timeline.sh
+	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-sense-led-programming.sh
+	HALLIDAY_CORE_LIBRARY_DIR="$(CURDIR)/core/target/debug" tools/test-hand-tracking-worker.sh
+	tools/test-sense-led-feedback-and-touch.sh
+	tools/test-sense-haptics.sh
+	tools/test-camera-tracking-profiles.sh
+	tools/test-game-controller-alignment.sh
+	tools/test-game-controller-motion.sh
+	tools/test-sense-aim-defaults.sh
+	python3 tools/tests/test_paired_hand_tracking_wiring.py

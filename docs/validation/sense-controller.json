@@ -1,0 +1,38 @@
+{
+  "scope": "Consolidated Sense tracking, orientation, LED feedback and contact input; device-free validation only",
+  "upstream_base": "0f048af436bf8a0f1b1ebcea38879b7287c8a3c5",
+  "rust": {
+    "core_unit": 150,
+    "orientation_history": 6,
+    "monocular_acquisition": 5,
+    "paired_hand_tracking": 16,
+    "failed": 0
+  },
+  "swift_and_c_abi": {
+    "executed_suites": 10,
+    "paired_tracking_source_contract": "PASS",
+    "exposure_orientation_source_contract": "PASS",
+    "full_swift_6_typecheck": "PASS; arm64-apple-macos14.0; baseline unused-view warning"
+  },
+  "hardware_or_games_executed": false,
+  "headset_acceptance": "Earlier user tests confirmed correct hand angle, contact animation and improved operation. Intermittent left-hand loss is not claimed eliminated under every condition.",
+  "excluded": [
+    "experimental PCM",
+    "eye tracking/calibration",
+    "native game adapters",
+    "private camera captures",
+    "head stabilization experiments"
+  ],
+  "limits": [
+    "CPU replay does not measure physical tracking coverage or haptic quality",
+    "Generic camera geometry remains default; optional profiles are device matched",
+    "No anatomical wrist translation is introduced"
+  ],
+  "code_quality": {
+    "rustfmt": "PASS; cargo fmt --all --check",
+    "clippy": "PASS; cargo clippy -p halliday-core --all-targets -- -D warnings",
+    "style_cleanup": "Equivalent short-circuit condition and inclusive range predicate; test-only initializer/enumeration/negation cleanup",
+    "f32_fixture_bits_preserved": "447374bc"
+  },
+  "rust_after_style_cleanup": "All177 checks passed again (150 unit +6 orientation +5 monocular +16paired)"
+}

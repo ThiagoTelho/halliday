@@ -359,6 +359,10 @@ left and right click are the trigger and grip, and **Option** + mouse places the
 Space play/pause, ←/→ ±10 s, **F** projection, **G** stereo, **C** subtitles, **X** close. The full
 list is in Halliday itself (the **/** key) and in the companion.
 
+Sense tracking uses a bounded optical worker, optional per-headset camera alignment and
+a separate game-hand mounting frame. See [tracking and validation](docs/sense-tracking.md)
+for the controls, source references and remaining physical acceptance.
+
 ## Repository layout
 
 | Path | What |

@@ -46,8 +46,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var windowManager: WindowManager?
     private let mouseOwner = MouseOwner()
     /// The PS VR2 Sense controllers (SenseControllers.swift): the one in use aims Halliday's
-    /// pointer, its trigger clicks, its grip right-clicks, its stick scrolls, PS says "this is
-    /// straight ahead".
+    /// pointer, its trigger clicks, its grip right-clicks and its stick scrolls.
+    /// Hold PS to recenter; a tap in a game opens or closes Halliday's dashboard.
     private let sense = SenseControllers()
     private var senseHand = SenseControllers.Hand.right
     private var senseButtons: [SenseControllers.Hand: SenseControllers.Buttons] = [:]
@@ -55,15 +55,13 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// When a controller last moved or was pressed: it has the pointer until the mouse moves.
     private var senseActivity: CFTimeInterval = 0
     /// What turns a controller's sensor axes into where it points, per hand: a tilt about its
-    /// own x (the sensor sits tilted in the grip, and people hold it differently) and a heading
-    /// about y (it has no compass). Both are set by pointing at the middle of the view and
-    /// pressing PS, Create or Options (`calibrateSense`); the tilt is remembered.
-    /// Until a hand has been calibrated the tilt is 42°: what suits a controller held as usual.
-    private static let defaultSenseTilt: Float = 42 * .pi / 180
-    private var senseTilt: [SenseControllers.Hand: Float] = [
-        .left: UserDefaults.standard.object(forKey: "senseTilt.left") as? Float ?? defaultSenseTilt,
-        .right: UserDefaults.standard.object(forKey: "senseTilt.right") as? Float ?? defaultSenseTilt,
-    ]
+    /// own x (the sensor sits tilted in the grip) and a heading about y (no compass).
+    /// The original 42° mount correction remains until the user deliberately
+    /// calibrates from the game panel; controller button taps never retune it.
+    private var senseTilt: [SenseControllers.Hand: Float] = {
+        let saved = SenseAimDefaults.load(from: .standard)
+        return [.left: saved.left, .right: saved.right]
+    }()
     private var senseHeading: [SenseControllers.Hand: Float] = [:]
     /// True while a controller, not the mouse, has the pointer: the saber then leaves from the hand.
     private var senseHasPointer = false
@@ -71,16 +69,16 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// A controller's orientation when the frame being drawn is seen: carried forward from its
     /// newest report (they come 60 times a second over Bluetooth, and a frame takes about 30 ms
     /// to reach the eyes) by its own angular velocity. Unpredicted, the pointer trailed the hand.
-    private func sensePredicted(_ state: SenseControllers.State) -> simd_quatf {
-        let ahead = min(0.08, state.age + Float((view?.lookaheadMs ?? 30) / 1000))
-        let turn = state.angularVelocity * ahead
-        let angle = simd_length(turn)
-        guard angle > 1e-5 else { return state.orientation }
-        return state.orientation * simd_quatf(angle: angle, axis: turn / angle)
+    private func sensePredicted(_ hand: SenseControllers.Hand, _ state: SenseControllers.State,
+                                now: Double) -> SensePoseTimeline.Sample? {
+        SensePoseTimeline.sample(orientation: state.orientation, bodyAngular: state.angularVelocity,
+            sampleHostNs: state.sampleHostNs, reportAge: state.age, now: now,
+            frameTarget: HeadsetView.frameTarget, fallbackLead: (view?.lookaheadMs ?? 30) / 1000,
+            historical: { sense.orientation(hand, atHostNs: $0) })
     }
 
-    private func senseAim(_ hand: SenseControllers.Hand, _ orientation: simd_quatf) -> simd_quatf {
-        seenLean(hand) * simd_quatf(angle: senseHeading[hand] ?? 0, axis: [0, 1, 0]) * orientation * simd_quatf(angle: senseTilt[hand] ?? 0, axis: [1, 0, 0])
+    private func senseAim(_ hand: SenseControllers.Hand, _ orientation: simd_quatf, atTime: Double? = nil) -> simd_quatf {
+        seenLean(hand, atTime: atTime) * simd_quatf(angle: senseHeading[hand] ?? 0, axis: [0, 1, 0]) * orientation * simd_quatf(angle: senseTilt[hand] ?? SenseAimDefaults.tilt, axis: [1, 0, 0])
     }
 
     /// The lean the cameras see between a controller's IMU and the room (`HallidayHandFix.tilt`),
@@ -89,9 +87,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// moves (its accelerometer, pulling "up" towards gravity, is pulled aside too), which its
     /// filter undoes within a second or so: so it is taken while the controller is seen, and
     /// fades out over 0.3 s once it is not.
-    private func seenLean(_ hand: SenseControllers.Hand) -> simd_quatf {
+    private func seenLean(_ hand: SenseControllers.Hand, atTime: Double? = nil) -> simd_quatf {
         guard let lean = leanSeen[hand] else { return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
-        let since = Float(max(0, CACurrentMediaTime() - lean.time - 0.1))
+        let since = Float(max(0, (atTime ?? CACurrentMediaTime()) - lean.time - 0.1))
         let v = lean.turn * exp(-since / 0.3)
         let angle = simd_length(v)
         return angle > 1e-5 ? simd_quatf(angle: angle, axis: v / angle) : simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -102,6 +100,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private func calibrateSense(_ hand: SenseControllers.Hand, _ orientation: simd_quatf, head: HeadPose, tilt: Bool) {
         let look = Self.angles(of: head.orientation.act(SIMD3<Float>(0, 0, -1)))
         if tilt {
+            // A deliberate new calibration replaces the previous manual offset,
+            // even when the cameras have no recent heading for this hand.
+            headingOffset[hand] = nil
             // The tilt whose aim is as high as the head looks (a scan: roll makes it no formula).
             var best: (tilt: Float, off: Float) = (0, .infinity)
             let leaned = seenLean(hand) * orientation
@@ -954,6 +955,7 @@ if !open, passthroughForVideo {
 
     func applicationWillTerminate(_ notification: Notification) {
         log("[app] quitting: releasing the mouse and putting windows back")
+        discardHandTrackingWork()
         // A game in Halliday is asked to quit too (as SteamVR's do): it reads the request from the
         // bridge it still maps after Halliday closes it.
         game?.requestQuit()
@@ -1235,7 +1237,16 @@ if !open, passthroughForVideo {
     /// it goes. On whenever Halliday runs on the headset; `--no-hands` turns it off (`--hands`, the
     /// switch it was behind at first, is still taken and changes nothing).
     private static let trackHands = !CommandLine.arguments.contains("--no-hands")
-    private var handTrackers: [SenseControllers.Hand: OpaquePointer] = [:]
+    private var handTrackingWorker: HandTrackingWorker?
+    private var handExposureStaging = HandExposureStaging()
+    private var handWorkerEpoch: UInt64 = 0
+    private var handTrackingSource: ObjectIdentifier?
+    private var lastHandResultExposure: Int64 = 0
+    private var handCameraSource: ObjectIdentifier?
+    private var handCameraIdentity: String?
+    private var handCameraProfile: CameraTrackingCalibration?
+    private var handCameraProfilePolled: CFTimeInterval = -.infinity
+    private var handFisheyeAlignment = SIMD3<Float>.zero
     /// Where each controller was last seen, in the room, when (`CACurrentMediaTime`: when it was
     /// found, and the exposure's own time in seconds), and how fast it was moving, m/s.
     private var handPlaces: [SenseControllers.Hand: (position: SIMD3<Float>, time: CFTimeInterval, exposed: Double, velocity: SIMD3<Float>)] = [:]
@@ -1308,6 +1319,12 @@ if !open, passthroughForVideo {
         }
         guard now - ledSyncTime >= 0.1 else { return }
         ledSyncTime = now
+        if UserDefaults.standard.object(forKey: "senseLEDFeedback") as? Bool ?? true {
+            sense.synchronizeLEDs(counter: Int64(v.counter), exposureHostNs: v.exposureHostNs,
+                periodNs: exposurePeriod, centreOffsetNs: Int64(ledOffsetMs * 1e6),
+                excluding: [])
+            return
+        }
         // A pulse at the newest exposure (already past, as Monado gives it), and one every period
         // after it. With a moment still to come, 50 ms ahead, the LEDs never lit at any offset.
         let target = v.exposureHostNs + Int64(ledOffsetMs * 1e6)
@@ -1318,16 +1335,20 @@ if !open, passthroughForVideo {
         }
     }
 
+    /// Opt-in, short-lived LED isolation while capturing camera evidence. Expiry
+    /// restores normal synchronisation without another app or game restart.
+
+
     /// A controller's place for drawing, while it was seen within the last three seconds.
     /// Called once a frame for the hand that points.
-    private func handPlace(_ hand: SenseControllers.Hand) -> SIMD3<Float>? {
+    private func handPlace(_ hand: SenseControllers.Hand, atNs targetNs: Int64? = nil) -> SIMD3<Float>? {
         // The cameras' fixes fused with the controller's accelerometer, for the moment this
         // frame is seen (`tracking/place.rs`): between fixes, through short losses, and ahead
         // across the 30 to 40 ms a fix is old by the time it is drawn. `--no-hand-fusion`
         // for what was done before (the newest fix carried along its velocity, and eased).
         if Self.fusesHands {
-            let seen = HeadsetView.frameTarget > 0 ? HeadsetView.frameTarget : CACurrentMediaTime()
-            return sense.place(hand, atNs: Int64(seen * 1e9))?.position
+            let seen = targetNs ?? Int64((HeadsetView.frameTarget > 0 ? HeadsetView.frameTarget : CACurrentMediaTime()) * 1e9)
+            return sense.place(hand, atNs: seen)?.position
         }
         let now = CACurrentMediaTime()
         guard let p = handPlaces[hand], now - p.time < 3 else { handShown[hand] = nil; return nil }
@@ -1336,7 +1357,7 @@ if !open, passthroughForVideo {
         // for a moment it would stand still in the air and then jump. The motion dies away
         // (in 120 ms it has gone two thirds of as far as it will): a hand that was moving
         // drifts on and comes to rest, not farther than 0.12 s of its speed.
-        let since = Float(max(0, now - p.exposed))
+        let since = Float(max(0, (targetNs.map { Double($0) * 1e-9 } ?? now) - p.exposed))
         let fade: Float = 0.12
         let target = p.position + p.velocity * (fade * (1 - exp(-since / fade)))
         // What is drawn eases to that (25 ms): a controller found again after a gap glides to
@@ -1349,54 +1370,175 @@ if !open, passthroughForVideo {
         handShown[hand] = (position, now)
         return position
     }
+
+    /// Motion uses the same sensor target and world calibration as the hand pose.
+    /// Fixed local mounts do not change the measured sensor gyro axes.
+    private func gameHandMotion(_ hand: SenseControllers.Hand, state: SenseControllers.State,
+                                now: Double, sample: SensePoseTimeline.Sample) -> GameControllerMotion {
+        let seen = sample.targetSeconds
+        let linear: SIMD3<Float>?
+        if Self.fusesHands {
+            linear = sense.place(hand, atNs: Int64(seen * 1e9))?.velocity
+        } else if let place = handPlaces[hand] {
+            // Derivative of the legacy display's existing decaying continuation.
+            linear = place.velocity * exp(-Float(max(0, seen - place.exposed)) / 0.12)
+        } else { linear = nil }
+        // Raw Sense gyro is in SENSOR axes. The final mount tilt changes the
+        // aim's local axes, so remove that fixed right-hand transform before
+        // rotating the gyro into the room. Keep all existing calibration values.
+        let mount = simd_quatf(angle: senseTilt[hand] ?? SenseAimDefaults.tilt, axis: [1, 0, 0])
+        let sensorInRoom = senseAim(hand, sample.orientation, atTime: seen) * mount.inverse
+        return GameControllerMotion.sample(linearWorld: linear, bodyAngular: state.angularVelocity,
+            sensorInRoom: sensorInRoom, reportAge: state.age,
+            opticalAge: handPlaces[hand].map { now - $0.exposed }, now: now)
+    }
     private var handShown: [SenseControllers.Hand: (position: SIMD3<Float>, time: CFTimeInterval)] = [:]
     private static let fusesHands = !CommandLine.arguments.contains("--no-hand-fusion")
-    /// What the cameras add to each controller's own heading, eased, and what the user's own
-    /// calibration (pointing and pressing PS) adds to that.
+    /// What the cameras add to each controller's own heading, eased, and what an
+    /// intentional calibration from the game panel adds to that.
     private var seenHeading: [SenseControllers.Hand: Float] = [:]
     private var headingOffset: [SenseControllers.Hand: Float] = [:]
     /// The cameras' lean for each controller (a rotation vector about the room's x and z), eased,
     /// and when it was last seen: `seenLean`.
     private var leanSeen: [SenseControllers.Hand: (turn: SIMD3<Float>, time: CFTimeInterval)] = [:]
 
-    /// One new exposure of both bottom cameras: each connected controller looked for.
-    private func trackHands(_ headset: Headset) {
-        guard let l = headset.cameraView(0), let r = headset.cameraView(1), l.counter == r.counter, l.counter != handExposure,
-              l.exposureHostNs != 0, let head = headset.predict(atHostNs: l.exposureHostNs) else { return }
-        handExposure = l.counter
-        handExposures += 1
-        sweepSeen.exposures += 1
-        sweepSeen.spots += l.spots.filter { $0.area >= 4 && $0.area <= 400 }.count
-        let spots = { (v: Headset.CameraView) in v.spots.map { HallidayCameraSpot(x: $0.x, y: $0.y, area: UInt32($0.area), peak: UInt32($0.peak)) } }
-        let (left, right) = (spots(l), spots(r))
-        // The top cameras' pictures of the same exposure, when they have arrived.
-        let top = [2, 3].map { view in headset.cameraView(view).flatMap { $0.counter == l.counter ? spots($0) : nil } ?? [] }
-        let headQ = [head.orientation.imag.x, head.orientation.imag.y, head.orientation.imag.z, head.orientation.real]
+    /// Identity is cached by Headset; only the tiny optional profile file is read here.
+    /// Applying another camera geometry retires every old optical result/history.
+    private func refreshHandCameraProfile(_ headset: Headset) {
+        let source = ObjectIdentifier(headset), now = CACurrentMediaTime()
+        let newSource = handCameraSource != source
+        guard newSource || now - handCameraProfilePolled >= 1 else { return }
+        handCameraProfilePolled = now
+        let identity = headset.hardwareIdentity
+        let profile = Self.bottomFisheyes ? CameraTrackingProfiles.load(for: identity,
+            from: FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Halliday/camera-tracking-calibration.json")) : nil
+        let alignment = profile?.rightFisheyeRotation ?? .zero
+        let changed = newSource || identity != handCameraIdentity || profile != handCameraProfile || alignment != handFisheyeAlignment
+        handCameraSource = source
+        handCameraIdentity = identity
+        handCameraProfile = profile
+        handFisheyeAlignment = alignment
+        if changed {
+            discardHandTrackingWork()
+            clearOpticalHandHistory()
+            log("[hands] camera geometry: \(profile == nil ? "default" : "calibrated")")
+        }
+    }
+
+    private func clearOpticalHandHistory() {
+        handExposureStaging.reset()
         for hand in SenseControllers.Hand.allCases {
-            guard let state = sense.state(hand), state.settled else { continue }
-            if handTrackers[hand] == nil {
-                handTrackers[hand] = halliday_hand_open(hand == .left)
-                halliday_hand_set_fisheyes(handTrackers[hand], Self.bottomFisheyes)
+            // Remove the previous camera correction, retaining the user's own
+            // heading/mount offsets until a new optical result is accepted.
+            if let seen = seenHeading[hand], let current = senseHeading[hand] {
+                senseHeading[hand] = current - seen
             }
-            let q = state.orientation
-            var fix = HallidayHandFix()
-            guard halliday_hand_update(handTrackers[hand], headQ, [q.imag.x, q.imag.y, q.imag.z, q.real],
-                                       left, UInt32(left.count), right, UInt32(right.count),
-                                       top[0], UInt32(top[0].count), top[1], UInt32(top[1].count), &fix) else { continue }
+            sense.clearOpticalPlace(hand)
+        }
+        handPlaces.removeAll()
+        handShown.removeAll()
+        seenHeading.removeAll()
+        leanSeen.removeAll()
+        handStats.removeAll()
+        handExposure = -1
+        handExposures = 0
+    }
+
+    /// Snapshot one exposure on the display actor; the optical solver never blocks it.
+    private func trackHands(_ headset: Headset) {
+        refreshHandCameraProfile(headset)
+        let source = ObjectIdentifier(headset)
+        if handTrackingSource != source {
+            if handTrackingWorker != nil { discardHandTrackingWork() }
+            handTrackingSource = source
+            handExposure = -1
+        }
+        let nowNs = hostTimeNs()
+        if let l = headset.cameraView(0), let r = headset.cameraView(1), l.counter == r.counter {
+            if l.counter < handExposure { discardHandTrackingWork() }
+            if l.counter != handExposure, l.exposureHostNs != 0,
+               let head = headset.predict(atHostNs: l.exposureHostNs) {
+                handExposure = l.counter
+                handExposures += 1
+                sweepSeen.exposures += 1
+                sweepSeen.spots += l.spots.filter { $0.area >= 4 && $0.area <= 400 }.count
+                let spots = { (v: Headset.CameraView) in v.spots.map { HandTrackingWorker.Spot(x: $0.x, y: $0.y, area: UInt32($0.area), peak: UInt32($0.peak)) } }
+                let (left, right) = (spots(l), spots(r))
+                let top = [2, 3].map { view in headset.cameraView(view).flatMap { $0.counter == l.counter ? spots($0) : nil } ?? [] }
+                var expected: Set<Int> = []
+                let orientations = SenseControllers.Hand.allCases.compactMap { hand -> HandTrackingWorker.HandOrientation? in
+                    guard let state = sense.state(hand), state.settled,
+                          state.age.isFinite, state.age >= 0, Double(state.age) <= GameControllerMotion.freshness else { return nil }
+                    expected.insert(hand.rawValue)
+                    guard let q = sense.orientation(hand, atHostNs: l.exposureHostNs) else { return nil }
+                    return HandTrackingWorker.HandOrientation(index: hand.rawValue, orientation: q.vector)
+                }
+                let frame = HandTrackingWorker.Frame(counter: l.counter, exposureHostNs: l.exposureHostNs,
+                    headOrientation: head.orientation.vector, headPosition: head.position, heightLift: usb?.heightLift ?? 0,
+                    handOrientations: orientations, views: [left, right, top[0], top[1]], fisheyes: Self.bottomFisheyes,
+                    fisheyeAlignment: handFisheyeAlignment, trackingGeneration: head.trackingGeneration)
+                handExposureStaging.insert(frame, expected: expected, nowNs: nowNs)
+            }
+        }
+        // Retry between camera arrivals too: a late Bluetooth bracket must be
+        // attached to its original exposure, not silently erase this hand.
+        guard let ready = handExposureStaging.ready(nowNs: nowNs, orientation: { index, exposure in
+            guard let hand = SenseControllers.Hand(rawValue: index) else { return nil }
+            return sense.orientation(hand, atHostNs: exposure)?.vector
+        }) else { return }
+        if handTrackingWorker == nil {
+            handWorkerEpoch &+= 1
+            let epoch = handWorkerEpoch
+            handTrackingWorker = HandTrackingWorker { [weak self] output in
+                Task { @MainActor [weak self] in
+                    guard let self, self.handWorkerEpoch == epoch,
+                          self.handTrackingWorker?.isCurrent(output) == true else { return }
+                    self.applyHandTracking(output)
+                }
+            }
+        }
+        handTrackingWorker?.submit(ready)
+    }
+
+    private func discardHandTrackingWork() {
+        handExposureStaging.reset()
+        handWorkerEpoch &+= 1
+        handTrackingWorker?.close()
+        handTrackingWorker = nil
+        lastHandResultExposure = 0
+    }
+
+    /// Keep the exposure's original head pose and time; only result delivery changes threads.
+    private func applyHandTracking(_ output: HandTrackingWorker.Output) {
+        guard let headset = usb?.headset, headset.linkState == .connected,
+              handTrackingSource == ObjectIdentifier(headset) else { return }
+        let frame = output.frame
+        if frame.trackingGeneration != 0, let current = lastHead?.trackingGeneration,
+           current != 0, current != frame.trackingGeneration { return }
+        guard frame.fisheyes == Self.bottomFisheyes, frame.fisheyeAlignment == handFisheyeAlignment else { return }
+        let age = hostTimeNs() - frame.exposureHostNs
+        guard frame.exposureHostNs > lastHandResultExposure, age >= -20_000_000, age <= 250_000_000 else { return }
+        lastHandResultExposure = frame.exposureHostNs
+        let headOrientation = simd_quatf(vector: frame.headOrientation)
+        for fix in output.fixes {
+            guard let hand = SenseControllers.Hand(rawValue: fix.index), sense.state(hand)?.settled == true else { continue }
             // From the head's frame at the exposure to the room, at the height Halliday shows.
-            var at = head.position + head.orientation.act(SIMD3(fix.position.0, fix.position.1, fix.position.2))
-            at.y += usb?.heightLift ?? 0
-            let exposed = Double(l.exposureHostNs) * 1e-9
+            var at = frame.headPosition + headOrientation.act(fix.position)
+            at.y += frame.heightLift
+            let exposed = Double(frame.exposureHostNs) * 1e-9
             var velocity = SIMD3<Float>.zero
             if let before = handPlaces[hand], exposed - before.exposed > 0, exposed - before.exposed < 0.06 {
                 // Half the newest step, half what it was: a place is steady to under a millimeter.
                 velocity = simd_mix(before.velocity, (at - before.position) / Float(exposed - before.exposed), SIMD3(repeating: 0.5))
             }
             handPlaces[hand] = (at, CACurrentMediaTime(), exposed, velocity)
-            sense.placeFix(hand, ns: l.exposureHostNs, at)
+            sense.placeFix(hand, ns: frame.exposureHostNs, at)
             // The controller has no compass, and its heading drifts (up to 12° a minute): the
             // cameras see where it really points. Eased, and taken the short way round.
             if fix.sightings >= 8 {
+                if UserDefaults.standard.object(forKey: "senseLEDFeedback") as? Bool ?? true {
+                    sense.confirmLEDVisibility(hand, counter: Int64(frame.counter), exposureHostNs: frame.exposureHostNs)
+                }
                 var heading = fix.heading
                 if let before = seenHeading[hand] {
                     let step = atan2(sin(heading - before), cos(heading - before))
@@ -1406,7 +1548,7 @@ if !open, passthroughForVideo {
                 sense.setRoomYaw(hand, heading)
                 senseHeading[hand] = heading + (headingOffset[hand] ?? 0)
                 // The lean too (solved from eight sightings on, held near its running value).
-                let lean = SIMD3<Float>(fix.tilt.0, 0, fix.tilt.1)
+                let lean = SIMD3<Float>(fix.tilt.x, 0, fix.tilt.y)
                 let before = leanSeen[hand].map { CACurrentMediaTime() - $0.time < 0.5 ? $0.turn : .zero } ?? .zero
                 leanSeen[hand] = (simd_mix(before, lean, SIMD3(repeating: 0.3)), CACurrentMediaTime())
             }
@@ -1491,7 +1633,19 @@ if !open, passthroughForVideo {
 
     private func updateCameras() {
         // (Passthrough needs the cameras too: with hand tracking off, mode 1, the bottom pair.)
-        guard let mode = Self.cameraMode ?? (passthrough ? (Self.wideCameras ? 0x10 : 1) : nil), let headset = usb?.headset, headset.linkState == .connected else { return }
+        guard let headset = usb?.headset, headset.linkState == .connected else {
+            if handTrackingWorker != nil { discardHandTrackingWork() }
+            if handTrackingSource != nil { clearOpticalHandHistory() }
+            handTrackingSource = nil
+            handCameraSource = nil
+            handCameraIdentity = nil
+            handCameraProfile = nil
+            handCameraProfilePolled = -.infinity
+            handFisheyeAlignment = .zero
+            handExposure = -1
+            return
+        }
+        guard let mode = Self.cameraMode ?? (passthrough ? (Self.wideCameras ? 0x10 : 1) : nil) else { return }
         let a = CommandLine.arguments
         if !cameraStarted {
             cameraStarted = true
@@ -1502,14 +1656,16 @@ if !open, passthroughForVideo {
         if let i = a.firstIndex(of: "--leds"), !ledsStarted, SenseControllers.Hand.allCases.allSatisfy({ sense.state($0) != nil }) {
             ledsStarted = true
             let cycle = (i + 1 < a.count ? Double(a[i + 1]) : nil) ?? 1000.0 / 60
-            log("[cameras] LEDs pulsing every \(String(format: "%.3f", cycle)) ms: \(sense.setLEDs(phase: 1, cycle: cycle / 1000)) controller(s) took it")
+            log("[cameras] LED pulse every \(String(format: "%.3f", cycle)) ms queued for \(sense.setLEDs(phase: 1, cycle: cycle / 1000)) controller(s)")
         }
         if Self.trackHands {
             // The LEDs are asked for again whenever a controller arrives (or comes back from sleep).
             let connected = Set(SenseControllers.Hand.allCases.filter { sense.state($0) != nil })
             if connected != ledHands {
+                handTrackingWorker?.reset()
+                lastHandResultExposure = 0
                 if !connected.subtracting(ledHands).isEmpty {
-                    log("[hands] LEDs pulsing: \(sense.setLEDs(phase: 1)) controller(s) took it")
+                    log("[hands] LED pulse queued for \(sense.setLEDs(phase: 1)) controller(s)")
                 }
                 ledHands = connected
             }
@@ -1573,9 +1729,8 @@ if !open, passthroughForVideo {
     }
 
     /// The Sense controllers, once per frame: the one in use aims the pointer, and its buttons act.
-    /// A controller has no compass and no position yet: its heading starts as the head's, PS sets
-    /// it again (point at the middle of the view and press), and the pointer's ray still leaves
-    /// from the head, towards where the controller points.
+    /// Its heading starts as the head's and optical tracking refines its pose.
+    /// System/menu button taps never recalibrate the sensor-to-pointer alignment.
     private func updateSense(head: HeadPose) {
         let now = CACurrentMediaTime()
         defer { lastStickTime = now }
@@ -1593,21 +1748,21 @@ if !open, passthroughForVideo {
                 notify("\(hand == .left ? "Left" : "Right") controller connected · \(state.batteryPercent)%", symbol: "gamecontroller")
                 continue
             }
+            guard let predicted = sensePredicted(hand, state, now: now) else { game?.realHands[slot] = nil; continue }
             let before = senseButtons[hand] ?? []
             let pressed = state.buttons.subtracting(before), released = before.subtracting(state.buttons)
             senseButtons[hand] = state.buttons
             // A game (or a Quest app) has the input: the controller is its hand, where the
             // cameras see it (beside the body until they do), pointing as Halliday's pointer
-            // does, and its buttons are the game's. PS still sets where it points.
-            // PS held recenters, as R held does (the ring fills); a tap sets where the controller
-            // points. It is never a game's button.
+            // does, and its buttons are the game's. PS held recenters, as R held does
+            // (the ring fills). PS is never a game's button or an aim-calibration shortcut.
             if pressed.contains(.ps) { recenterHold(began: true) }
-            let tapped = released.contains(.ps) && !recenterHoldFired
+            let tapAction = SenseAimDefaults.tapAction(psReleased: released.contains(.ps),
+                recenterFired: recenterHoldFired, gamePresenting: game?.isPresenting == true)
             if released.contains(.ps) { recenterHold(began: false) }
             // PS tapped in a game (or a Quest app) brings Halliday up over it, as Esc does, and
-            // tapped again goes back; where the controller points is set with Create or Options
-            // while Halliday is up.
-            if tapped, game?.isPresenting == true {
+            // tapped again goes back. Create/Options remain the game's menu buttons.
+            if tapAction == .toggleGameDashboard {
                 setGameAway(!gameAway)
                 continue
             }
@@ -1620,17 +1775,18 @@ if !open, passthroughForVideo {
                 let adjusting = sense.state(.right)?.buttons.contains(.grip) == true
                 if adjusting, abs(state.stick.y) > 0.25 { game.raise(by: state.stick.y) }
                 game.realHands[slot] = GameBridge.RealHand(
-                    position: handPlace(hand) ?? guess, orientation: senseAim(hand, sensePredicted(state)),
-                    trigger: max(state.trigger, state.buttons.contains(.trigger) ? 1 : 0), grip: state.buttons.contains(.grip),
+                    position: handPlace(hand, atNs: predicted.targetHostNs) ?? guess,
+                    orientation: GameControllerAlignment.senseOrientation(senseAim(hand, predicted.orientation, atTime: predicted.targetSeconds),
+                        pointerMountRadians: senseTilt[hand] ?? SenseAimDefaults.tilt),
+                    trigger: state.trigger, triggerPressed: state.buttons.contains(.trigger), grip: state.buttons.contains(.grip),
                     stick: adjusting ? .zero : state.stick, stickClick: state.buttons.contains(.stick), stickTouch: state.buttons.contains(.stickTouch),
-                    lower: state.buttons.contains(.lower), upper: state.buttons.contains(.upper), menu: state.buttons.contains(.menu))
+                    lower: state.buttons.contains(.lower), upper: state.buttons.contains(.upper), menu: state.buttons.contains(.menu),
+                    motion: gameHandMotion(hand, state: state, now: now, sample: predicted),
+                    poseFrame: .senseAim,
+                    touch: GameControllerTouch(buttons: state.buttons.rawValue, triggerProximity: state.triggerProximity, gripProximity: state.gripProximity))
                 continue
             }
             game?.realHands[slot] = nil
-            if tapped || pressed.contains(.menu) {
-                calibrateSense(hand, state.orientation, head: head, tilt: true)
-                notify(String(format: "%@ controller points where you look · tilt %.0f°", hand == .left ? "Left" : "Right", (senseTilt[hand] ?? 0) * 180 / .pi), symbol: "scope")
-            }
             // The hand that pulls a trigger or a grip is the hand that points.
             if pressed.contains(.trigger) || pressed.contains(.grip) { senseHand = hand }
             if sense.state(senseHand) == nil { senseHand = hand }
@@ -1656,12 +1812,12 @@ if !open, passthroughForVideo {
             if pressed.contains(.lower), video?.isOpen == true {
                 if chromeShown { dismissChrome() } else { chromeDismissed = false; lastPointerActivity = now }
             }
-            var aim = senseAim(hand, sensePredicted(state)).act(SIMD3<Float>(0, 0, -1))
+            var aim = senseAim(hand, predicted.orientation, atTime: predicted.targetSeconds).act(SIMD3<Float>(0, 0, -1))
             // The pointer is a ray from the head; the hand is somewhere else. Where the cameras
             // see the hand, the pointer goes to what the hand's own ray meets (4 m out when it
             // meets nothing): taken from the head, a controller aimed at something near, the
             // dock under the hands, pointed past it, and only far things could be picked.
-            if let from = handPlace(hand), let renderer {
+            if let from = handPlace(hand, atNs: predicted.targetHostNs), let renderer {
                 let reach = renderer.nearestHit(origin: from, direction: aim) ?? 4
                 let target = from + aim * reach - head.position
                 if simd_length(target) > 0.05 { aim = simd_normalize(target) }
@@ -2529,6 +2685,7 @@ if !open, passthroughForVideo {
 
     /// Applies the settings that take effect at once (the rest are read where they are used).
     private func applySettings() {
+        sense.setLEDFeedbackEnabled(UserDefaults.standard.object(forKey: "senseLEDFeedback") as? Bool ?? true)
         let s = Settings.shared
         Motion.reduced = s.reduceMotion
         windowManager?.remembersLayouts = s.rememberLayouts

@@ -7,10 +7,14 @@
 pub mod apk;
 pub mod ffi;
 pub mod game_bridge;
+mod hand_pair_ffi;
 pub mod math;
 pub mod psvr2;
 pub mod recording;
 pub mod sense;
+mod sense_orientation_history;
+pub mod sense_output;
+mod sense_output_ffi;
 pub mod session;
 pub mod summary;
 pub mod synthetic;

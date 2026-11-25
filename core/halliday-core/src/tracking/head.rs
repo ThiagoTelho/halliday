@@ -127,10 +127,38 @@ pub struct HeadPose {
     pub pose: Pose,
     /// Latest angular velocity in rad/s, in the head's own frame (for rolling-shutter correction).
     pub angular_velocity: Vec3,
+    /// Eye-centre velocity in the same recentered world axes as `pose.position`.
+    pub linear_velocity: Vec3,
+    /// Bit 0: measured linear motion; bit 1: measured angular motion.
+    pub motion_flags: u32,
     /// Age of the SLAM pose the prediction started from, at the requested time.
     pub slam_age_ns: i64,
     /// False until IMU data has arrived: the pose is then the plain SLAM pose, not predicted.
     pub predicted: bool,
+}
+
+/// One coherent prediction plus the tracker's discontinuity token.
+/// A changed token conservatively retires images rendered before a reset/correction;
+/// it does not claim that every large SLAM correction changes the world's basis.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TrackedHeadPose {
+    pub motion: HeadPose,
+    pub tracking_generation: u64,
+}
+
+#[derive(Debug)]
+struct TrackingGeneration(u64);
+
+impl Default for TrackingGeneration {
+    fn default() -> Self {
+        // Process-wide allocation also distinguishes replacement trackers/sessions. Zero
+        // remains the legacy/unknown value. Exhaustion requires 2^64 discontinuities.
+        static NEXT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(1);
+        Self(
+            NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
+                .max(1),
+        )
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -160,14 +188,17 @@ pub struct HeadsetStatus {
 
 #[derive(Debug, Default)]
 pub struct HeadTracker {
+    tracking_generation: TrackingGeneration,
     config: TrackerConfig,
     vts: VtsUnwrapper,
     clock: ClockOffset,
-    last_imu_raw_vts: Option<u32>,
     imu: VecDeque<ImuSample>,
     slam: Option<SlamSample>,
     /// Tracker-space velocity in m/s, smoothed over SLAM poses.
     velocity: Vec3,
+    /// The same SLAM-derived estimator, reset for reporting across discontinuities.
+    /// Keeping it separate leaves the existing display prediction trajectory intact.
+    motion_velocity: Option<Vec3>,
     /// What the newest SLAM pose changed, still to be taken (`correction_smoothing_ns`): the
     /// turn (in the pose's own frame) and the pivot's shift that put the view back where it was
     /// when the pose arrived, and the time (headset clock) they were taken at.
@@ -198,6 +229,18 @@ impl HeadTracker {
         self.clock.offset_ns()
     }
 
+    /// Must be read with the exact pose under the same Session tracker lock.
+    pub fn predict_tracked(&self, at_host_ns: i64) -> Option<TrackedHeadPose> {
+        self.predict(at_host_ns).map(|motion| TrackedHeadPose {
+            motion,
+            tracking_generation: self.tracking_generation.0,
+        })
+    }
+
+    fn discontinuity(&mut self) {
+        self.tracking_generation = TrackingGeneration::default();
+    }
+
     /// Feeds a status packet received at `host_ns` (host monotonic clock).
     pub fn ingest_status(&mut self, report: &StatusReport, host_ns: i64) {
         self.status = HeadsetStatus {
@@ -207,15 +250,14 @@ impl HeadTracker {
         };
         let mut newest = None;
         for rec in &report.imu {
-            // vts_us ticks once per millisecond, so the two samples of a pair share a value; the
-            // second one is really 500 us later (measured by GAV).
-            let pair_fix = if self.last_imu_raw_vts == Some(rec.vts_us) {
-                500
-            } else {
-                0
-            };
-            self.last_imu_raw_vts = Some(rec.vts_us);
-            let vts_ns = self.vts.unwrap_ns(rec.vts_us) + pair_fix * 1000;
+            // VTS labels a sensor half-cycle, not an immutable USB packet pair. Bit 0 marks
+            // the early sample; the late sample's VTS is 500 us before its actual sample time.
+            // USB reports can regroup 1/3/4 or more samples, including consecutive status=0
+            // records with different VTS labels. Equality with the previous VTS therefore
+            // creates duplicate/1-us times and false 1-ms gaps. Preserve the shared SLAM VTS
+            // domain and derive only this half-cycle phase from the record itself.
+            let phase_us = if rec.status & 1 == 0 { 500 } else { 0 };
+            let vts_ns = self.vts.unwrap_ns(rec.vts_us) + phase_us * 1000;
             if self.imu.len() == IMU_HISTORY {
                 self.imu.pop_front();
             }
@@ -254,15 +296,18 @@ impl HeadTracker {
             .last_target_vts
             .load(std::sync::atomic::Ordering::Relaxed)
             .max(sample.vts_ns);
-        let before = match self.slam {
-            Some(prev)
-                if self.config.correction_smoothing_ns > 0
-                    && (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)) =>
-            {
-                Some(self.carried(&prev, anchor))
-            }
-            _ => None,
-        };
+        let continuous = self
+            .slam
+            .is_some_and(|prev| (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)));
+        // The residual is measured against gyro-carried prior motion, not the raw
+        // difference of two orientations: an ordinary fast turn is not a reset.
+        let continuity_before = self
+            .slam
+            .filter(|_| continuous)
+            .map(|prev| self.carried(&prev, anchor));
+        if self.slam.is_some() && !continuous {
+            self.discontinuity();
+        }
         match self.slam {
             Some(prev) if (5_000_000..=100_000_000).contains(&(sample.vts_ns - prev.vts_ns)) => {
                 let dt = (sample.vts_ns - prev.vts_ns) as f32 * 1e-9;
@@ -278,22 +323,42 @@ impl HeadTracker {
                 for (smoothed, newest) in self.velocity.iter_mut().zip(v) {
                     *smoothed += (newest - *smoothed) * weight;
                 }
+                let previous = self.motion_velocity.unwrap_or([0.; 3]);
+                self.motion_velocity = v
+                    .iter()
+                    .all(|x| x.is_finite())
+                    .then(|| [0, 1, 2].map(|i| previous[i] + (v[i] - previous[i]) * weight));
             }
-            _ => self.velocity = [0.0; 3],
+            _ => {
+                self.velocity = [0.0; 3];
+                self.motion_velocity = None;
+            }
         }
         self.slam = Some(sample);
         self.held_turn = Quat::IDENTITY;
         self.held_shift = [0.0; 3];
         self.held_at_vts = anchor;
-        if let Some((orientation, pivot)) = before {
+        if let Some((orientation, pivot)) = continuity_before {
             let (now, now_pivot) = self.carried(&sample, anchor);
             let turn = (now.conjugate() * orientation).normalized();
-            let shift = [0, 1, 2].map(|i| pivot[i] - now_pivot[i]);
-            let far = shift[0].abs().max(shift[1].abs()).max(shift[2].abs());
-            // A real jump (tracking found again, a relocalization) is taken at once.
-            if Quat::IDENTITY.angle_to(turn) < 0.035 && far < 0.03 {
-                self.held_turn = turn;
-                self.held_shift = shift;
+            let far = (0..3)
+                .map(|i| (pivot[i] - now_pivot[i]).abs())
+                .fold(0.0, f32::max);
+            let small = Quat::IDENTITY.angle_to(turn) < 0.035 && far < 0.03;
+            if !small {
+                // Existing smoothing takes this correction at once. Retire old scene
+                // images even when correction smoothing has explicitly been disabled.
+                self.discontinuity();
+            }
+            if self.config.correction_smoothing_ns > 0 {
+                // Keep the existing prediction/smoothing trajectory exactly. Only the
+                // additive discontinuity token above is new.
+                if small {
+                    self.held_turn = turn;
+                    self.held_shift = [0, 1, 2].map(|i| pivot[i] - now_pivot[i]);
+                } else {
+                    self.motion_velocity = None;
+                }
             }
         }
     }
@@ -376,9 +441,42 @@ impl HeadTracker {
             Some(r) => r.compose(head),
             None => head,
         };
+        let gyro_fresh = self.imu.back().is_some_and(|s| {
+            self.clock
+                .host_to_vts(at_host_ns)
+                .is_some_and(|target| (target - s.vts_ns).abs() <= self.config.max_extrapolation_ns)
+        });
+        let angular_known = gyro_fresh && latest_gyro.iter().all(|x| x.is_finite());
+        let linear_known = angular_known
+            && (0..=MAX_POSITION_EXTRAPOLATION_NS).contains(&slam_age_ns)
+            && self.motion_velocity.is_some();
+        let linear_velocity = if linear_known {
+            let omega = tracker.orientation.rotate(latest_gyro);
+            let lever = tracker
+                .orientation
+                .rotate([0, 1, 2].map(|i| NECK_LEVER[i] + SLAM_TO_HEAD.position[i]));
+            let pivot = self.motion_velocity.unwrap();
+            let spin = [
+                omega[1] * lever[2] - omega[2] * lever[1],
+                omega[2] * lever[0] - omega[0] * lever[2],
+                omega[0] * lever[1] - omega[1] * lever[0],
+            ];
+            let velocity = [0, 1, 2].map(|i| pivot[i] + spin[i]);
+            self.recenter
+                .map_or(velocity, |r| r.orientation.rotate(velocity))
+        } else {
+            [0.; 3]
+        };
+        let linear_known = linear_known && linear_velocity.iter().all(|x| x.is_finite());
         Some(HeadPose {
             pose,
             angular_velocity: latest_gyro,
+            linear_velocity: if linear_known {
+                linear_velocity
+            } else {
+                [0.; 3]
+            },
+            motion_flags: u32::from(linear_known) | (u32::from(angular_known) << 1),
             slam_age_ns,
             predicted,
         })
@@ -488,6 +586,7 @@ impl HeadTracker {
     /// Recenters so that the current heading becomes forward (−z) and the current position the
     /// origin, keeping the horizon level and the height.
     pub fn recenter_yaw(&mut self, at_host_ns: i64) {
+        self.discontinuity();
         self.recenter = None;
         let Some(h) = self.predict(at_host_ns) else {
             return;
@@ -503,6 +602,7 @@ impl HeadTracker {
 
     /// Recenters fully: the current orientation becomes identity (useful lying down).
     pub fn recenter_full(&mut self, at_host_ns: i64) {
+        self.discontinuity();
         self.recenter = None;
         let Some(h) = self.predict(at_host_ns) else {
             return;
@@ -516,6 +616,7 @@ impl HeadTracker {
     }
 
     pub fn clear_recenter(&mut self) {
+        self.discontinuity();
         self.recenter = None;
     }
 }
@@ -567,15 +668,20 @@ mod tests {
             gyro,
             dp_frame_count: 0,
             dp_line_count: 0,
-            imu_ts_us: 0,
+            imu_ts_us: vts_us as u16,
+            status: 1,
+        };
+        let late = ImuRecord {
+            imu_ts_us: vts_us.wrapping_add(500) as u16,
             status: 0,
+            ..rec
         };
         StatusReport {
             dprx_status: 2,
             worn: true,
             function_button: false,
             ipd_mm: 63,
-            imu: vec![rec, rec],
+            imu: vec![rec, late],
         }
     }
 
@@ -603,6 +709,96 @@ mod tests {
     fn nothing_without_slam() {
         let t = HeadTracker::new(TrackerConfig::default());
         assert!(t.predict(0).is_none());
+    }
+
+    #[test]
+    fn tracked_prediction_keeps_legacy_motion_and_unique_replacement_generation() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        assert!(t.predict_tracked(0).is_none());
+        t.ingest_slam(
+            &slam_record(10_000, Quat::IDENTITY, [0.1, 1.6, -0.2]),
+            50 * MS,
+        );
+        let h = t.predict_tracked(60 * MS).unwrap();
+        assert_ne!(h.tracking_generation, 0);
+        assert_eq!(h.motion, t.predict(60 * MS).unwrap());
+        assert_eq!(h, t.predict_tracked(60 * MS).unwrap());
+        let mut replacement = HeadTracker::new(TrackerConfig::default());
+        replacement.ingest_slam(
+            &slam_record(10_000, Quat::IDENTITY, [0.1, 1.6, -0.2]),
+            50 * MS,
+        );
+        let new = replacement.predict_tracked(60 * MS).unwrap();
+        assert!(new.tracking_generation > h.tracking_generation);
+        assert_eq!(new.motion, h.motion);
+    }
+
+    #[test]
+    fn tracked_generation_preserves_a_normal_gyro_carried_fifteen_degree_turn() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        // Approximately 15 degrees of normal integrated motion, not a SLAM residual.
+        let gyro = raw_gyro([0., 5., 0.]);
+        let rate = status_pair(0, gyro).imu[0].gyro_rad_s()[1];
+        feed_imu(&mut t, 0, 100, gyro);
+        let q0 = Quat::IDENTITY;
+        let pivot = [0., 1.6, 0.];
+        let position = |q: Quat| {
+            let lever = (SLAM_CORRECTION * q).rotate(NECK_LEVER);
+            [0, 1, 2].map(|i| pivot[i] + lever[i])
+        };
+        t.ingest_slam(&slam_record(20_000, q0, position(q0)), 43 * MS + OFFSET);
+        let first = t.predict_tracked(43 * MS + OFFSET).unwrap();
+        let duration_s = 0.052;
+        let q1 = Quat::from_axis_angle([0., 1., 0.], rate * duration_s);
+        t.ingest_slam(&slam_record(72_000, q1, position(q1)), 95 * MS + OFFSET);
+        let turned = t.predict_tracked(95 * MS + OFFSET).unwrap();
+        assert!(q0.angle_to(q1) > 0.25);
+        assert_eq!(turned.tracking_generation, first.tracking_generation);
+        assert_eq!(turned.motion, t.predict(95 * MS + OFFSET).unwrap());
+    }
+
+    #[test]
+    fn tracked_generation_retires_large_corrections_gaps_and_explicit_recenters() {
+        for smoothing in [0, 60 * MS] {
+            for (angle, shift, changes) in
+                [(0.01, 0.001, false), (0.05, 0., true), (0., 0.05, true)]
+            {
+                let mut t = HeadTracker::new(TrackerConfig {
+                    correction_smoothing_ns: smoothing,
+                    ..TrackerConfig::default()
+                });
+                t.ingest_slam(&slam_record(0, Quat::IDENTITY, [0., 1.6, 0.]), 0);
+                let initial = t.predict_tracked(0).unwrap().tracking_generation;
+                t.ingest_slam(
+                    &slam_record(
+                        16_000,
+                        Quat::from_axis_angle([0., 1., 0.], angle),
+                        [shift, 1.6, 0.],
+                    ),
+                    16 * MS,
+                );
+                let after = t.predict_tracked(16 * MS).unwrap().tracking_generation;
+                assert_eq!(
+                    initial != after,
+                    changes,
+                    "smoothing={smoothing}, angle={angle}, shift={shift}"
+                );
+                t.ingest_slam(
+                    &slam_record(250_000, Quat::IDENTITY, [0., 1.6, 0.]),
+                    250 * MS,
+                );
+                let gap = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(gap > after);
+                t.recenter_yaw(250 * MS);
+                let yaw = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(yaw > gap);
+                t.recenter_full(250 * MS);
+                let full = t.predict_tracked(250 * MS).unwrap().tracking_generation;
+                assert!(full > yaw);
+                t.clear_recenter();
+                assert!(t.predict_tracked(250 * MS).unwrap().tracking_generation > full);
+            }
+        }
     }
 
     #[test]
@@ -661,6 +857,122 @@ mod tests {
         // Held as sent, it is 9 mm behind.
         let behind = held.predict(host).unwrap().pose.position;
         assert!((want[0] - behind[0] - v * 0.03).abs() < 1e-3);
+    }
+
+    #[test]
+    fn reported_eye_velocity_matches_translated_rotating_pose_and_recenter_basis() {
+        // Independently differentiate the existing predicted position, with
+        // smoothing disabled so correction decay cannot masquerade as motion.
+        for seed in 1..=20 {
+            let a = seed as f32 * 0.13;
+            let q = Quat::from_axis_angle([1., 0., 0.], a)
+                * Quat::from_axis_angle([0., 1., 0.], -a * 0.7)
+                * Quat::from_axis_angle([0., 0., 1.], a * 0.3);
+            let gyro = [0.21 + a * 0.02, -0.31, 0.17];
+            let raw = raw_gyro(gyro);
+            let mut t = HeadTracker::new(TrackerConfig {
+                correction_smoothing_ns: 0,
+                still_speed: 0.,
+                still_window_ns: 0,
+                still_turn: 0.,
+                ..Default::default()
+            });
+            feed_imu(&mut t, 0, 700, raw);
+            let velocity = [0.3, -0.13, 0.19];
+            let mut last = 0;
+            for i in 1..=40u32 {
+                last = i * 16_667;
+                let position = [0, 1, 2].map(|axis| {
+                    velocity[axis] * last as f32 * 1e-6 + if axis == 1 { 1.6 } else { 0. }
+                });
+                t.ingest_slam(
+                    &slam_record(last, q, position),
+                    last as i64 * 1000 + OFFSET + 23 * MS,
+                );
+            }
+            let at = last as i64 * 1000 + OFFSET + 20 * MS;
+            let pose = t.predict(at).unwrap();
+            assert_eq!(pose.motion_flags, 3);
+            let delta = 100_000;
+            let before = t.predict(at - delta).unwrap().pose.position;
+            let after = t.predict(at + delta).unwrap().pose.position;
+            let measured = [0, 1, 2].map(|i| (after[i] - before[i]) / (2 * delta) as f32 * 1e9);
+            assert_vec(pose.linear_velocity, measured, 0.002);
+            let r = Pose {
+                position: [100., -13., 87.],
+                orientation: Quat::from_axis_angle([0., 1., 0.], a)
+                    * Quat::from_axis_angle([0., 0., 1.], -0.4),
+            };
+            t.recenter = Some(r);
+            let transformed = t.predict(at).unwrap();
+            assert_eq!(transformed.motion_flags, 3);
+            assert_vec(
+                transformed.linear_velocity,
+                r.orientation.rotate(pose.linear_velocity),
+                1e-5,
+            );
+            // No velocity from recenter translation, and gyro remains body-local.
+            assert_vec(transformed.angular_velocity, pose.angular_velocity, 1e-6);
+        }
+    }
+
+    #[test]
+    fn motion_unknown_on_first_sample_gaps_and_relocalization_then_recovers() {
+        let mut t = HeadTracker::new(TrackerConfig::default());
+        feed_imu(&mut t, 0, 200, [0; 3]);
+        t.ingest_slam(
+            &slam_record(180_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            188 * MS,
+        );
+        assert_eq!(
+            t.predict(198 * MS).unwrap().motion_flags,
+            2,
+            "one SLAM sample cannot measure translation"
+        );
+        t.ingest_slam(
+            &slam_record(196_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            204 * MS,
+        );
+        let still = t.predict(208 * MS).unwrap();
+        assert_eq!(still.motion_flags, 3);
+        assert_vec(still.linear_velocity, [0.; 3], 1e-6);
+        assert_eq!(
+            t.predict(310 * MS).unwrap().motion_flags,
+            0,
+            "stale gyro and capped translation are unknown"
+        );
+        feed_imu(&mut t, 200_000, 160, [0; 3]);
+        t.ingest_slam(
+            &slam_record(330_000, Quat::IDENTITY, [0., 1.6, 0.]),
+            338 * MS,
+        );
+        assert_eq!(
+            t.predict(348 * MS).unwrap().motion_flags,
+            2,
+            "gap resets translation history"
+        );
+        t.ingest_slam(
+            &slam_record(346_000, Quat::IDENTITY, [1., 1.6, 0.]),
+            354 * MS,
+        );
+        assert_eq!(
+            t.predict(360 * MS).unwrap().motion_flags,
+            2,
+            "relocalization is not physical velocity"
+        );
+        feed_imu(&mut t, 360_000, 970, [0; 3]);
+        // The existing display correction may still be unwinding the jump;
+        // report no translation until the tracker's continuity test settles.
+        for i in 1..=60 {
+            let us = 346_000 + i * 16_000;
+            t.ingest_slam(
+                &slam_record(us, Quat::IDENTITY, [1., 1.6, 0.]),
+                us as i64 * 1000 + 8 * MS,
+            );
+        }
+        let recovered = t.predict(1320 * MS).unwrap();
+        assert_eq!(recovered.motion_flags, 3);
+        assert_vec(recovered.linear_velocity, [0.; 3], 1e-6);
     }
 
     #[test]
@@ -807,5 +1119,146 @@ mod tests {
             }
         );
         assert_eq!(t.clock_offset_ns(), Some(-500_000));
+    }
+}
+
+#[cfg(test)]
+mod imu_phase_contracts {
+    use super::*;
+    use crate::psvr2::protocol::ImuRecord;
+    fn record(raw: u32, phase: u16, fine: u16) -> ImuRecord {
+        ImuRecord {
+            vts_us: raw,
+            accel: [0, 8192, 0],
+            gyro: [7, -9, 11],
+            dp_frame_count: 0,
+            dp_line_count: 0,
+            imu_ts_us: fine,
+            status: phase,
+        }
+    }
+    fn report(records: Vec<ImuRecord>) -> StatusReport {
+        StatusReport {
+            dprx_status: 2,
+            worn: true,
+            function_button: false,
+            ipd_mm: 64,
+            imu: records,
+        }
+    }
+    fn samples(base: u32, n: usize) -> Vec<(i64, ImuRecord)> {
+        let phase = [1u16, 0, 0, 1, 0, 0, 0, 1, 0, 1, 0];
+        (0..n)
+            .map(|i| {
+                let t = base as i64 + i as i64 * 500;
+                let flag = phase[i % phase.len()];
+                let raw = (t - if flag & 1 == 0 { 500 } else { 0 }) as u32;
+                (t * 1000, record(raw, flag, (i * 500) as u16))
+            })
+            .collect()
+    }
+    #[test]
+    fn regrouped_one_three_four_and_forty_samples_keep_exact_sensor_time() {
+        for batches in [vec![2], vec![1, 3, 1, 4, 2, 3], vec![40, 1, 3, 2]] {
+            let expected = samples(100_000, 240);
+            let mut tracker = HeadTracker::new(TrackerConfig::default());
+            let mut at = 0;
+            let mut b = 0;
+            while at < expected.len() {
+                let end = (at + batches[b % batches.len()]).min(expected.len());
+                let packet = report(expected[at..end].iter().map(|(_, s)| *s).collect());
+                tracker.ingest_status(&packet, expected[end - 1].0 + 9_000_000);
+                at = end;
+                b += 1;
+            }
+            assert_eq!(
+                tracker.imu.iter().map(|s| s.vts_ns).collect::<Vec<_>>(),
+                expected.iter().map(|s| s.0).collect::<Vec<_>>()
+            );
+            assert_eq!(tracker.clock_offset_ns(), Some(9_000_000));
+        }
+    }
+    #[test]
+    fn status_zero_after_status_zero_is_not_a_duplicate_or_missing_sample() {
+        let mut tracker = HeadTracker::new(TrackerConfig::default());
+        let expected = samples(100_000, 12);
+        for (t, s) in &expected {
+            tracker.ingest_status(&report(vec![*s]), *t + 9_000_000);
+        }
+        for (a, b) in tracker.imu.iter().zip(tracker.imu.iter().skip(1)) {
+            assert_eq!(b.vts_ns - a.vts_ns, 500_000);
+        }
+    }
+    #[test]
+    fn dropped_samples_remain_real_gaps_without_invented_gyro() {
+        let expected = samples(100_000, 30);
+        let mut tracker = HeadTracker::new(TrackerConfig::default());
+        for (i, (t, s)) in expected.iter().enumerate() {
+            if (12..14).contains(&i) {
+                continue;
+            }
+            tracker.ingest_status(&report(vec![*s]), *t + 9_000_000);
+        }
+        let gaps: Vec<_> = tracker
+            .imu
+            .iter()
+            .zip(tracker.imu.iter().skip(1))
+            .map(|(a, b)| b.vts_ns - a.vts_ns)
+            .collect();
+        assert_eq!(gaps.iter().filter(|&&d| d == 1_500_000).count(), 1);
+        assert!(gaps.iter().all(|&d| d == 500_000 || d == 1_500_000));
+    }
+    #[test]
+    fn vts_wrap_and_late_slam_share_the_original_vts_domain() {
+        let expected = samples(u32::MAX - 2000, 40);
+        let mut tracker = HeadTracker::new(TrackerConfig::default());
+        for (i, (t, s)) in expected.iter().enumerate() {
+            tracker.ingest_status(&report(vec![*s]), *t + 9_000_000);
+            if i == 20 {
+                let record = SlamRecord {
+                    vts_us: (expected[3].0 / 1000) as u32,
+                    unknown1: 3,
+                    position: [0., 1.65, 0.],
+                    orientation: Quat::IDENTITY,
+                };
+                tracker.ingest_slam(&record, *t + 9_000_000);
+            }
+        }
+        assert_eq!(
+            tracker.imu.iter().map(|s| s.vts_ns).collect::<Vec<_>>(),
+            expected.iter().map(|s| s.0).collect::<Vec<_>>()
+        );
+    }
+    #[test]
+    fn unrelated_status_bits_do_not_change_half_cycle_phase() {
+        let mut a = HeadTracker::new(TrackerConfig::default());
+        let mut b = HeadTracker::new(TrackerConfig::default());
+        for (t, s) in samples(100_000, 40) {
+            a.ingest_status(&report(vec![s]), t + 9_000_000);
+            let mut marked = s;
+            marked.status |= 0x8010;
+            b.ingest_status(&report(vec![marked]), t + 9_000_000);
+        }
+        assert_eq!(
+            a.imu.iter().map(|s| s.vts_ns).collect::<Vec<_>>(),
+            b.imu.iter().map(|s| s.vts_ns).collect::<Vec<_>>()
+        );
+        assert_eq!(a.clock_offset_ns(), b.clock_offset_ns());
+    }
+    #[test]
+    fn normal_pairs_match_the_previous_timestamp_contract_bit_for_bit() {
+        let mut tracker = HeadTracker::new(TrackerConfig::default());
+        for i in 0..100u32 {
+            let raw = 10_000 + i * 1000;
+            let first = record(raw, 1, (i * 1000) as u16);
+            let late = record(raw, 0, (i * 1000 + 500) as u16);
+            tracker.ingest_status(&report(vec![first, late]), raw as i64 * 1000 + 9_500_000);
+        }
+        assert_eq!(
+            tracker.imu.iter().map(|s| s.vts_ns).collect::<Vec<_>>(),
+            (0..200)
+                .map(|i| 10_000_000 + i * 500_000)
+                .collect::<Vec<_>>()
+        );
     }
 }

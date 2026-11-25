@@ -56,6 +56,28 @@ typedef struct {
 /* Head pose predicted for host time at_host_ns. False when there is no live tracking. */
 bool halliday_session_predict(const HallidaySession *session, int64_t at_host_ns, HallidayHeadPose *out);
 
+/* Additive API: same pose plus eye-centre linear velocity in its recentered world axes.
+   motion_flags bit0=linear valid, bit1=angular valid; unknown linear motion is zero.
+   The nested legacy pose (including its latest body-local gyro) is unchanged. */
+typedef struct {
+    HallidayHeadPose pose;
+    float linear_velocity[3];
+    uint32_t motion_flags;
+} HallidayHeadPoseMotion;
+bool halliday_session_predict_motion(const HallidaySession *session, int64_t at_host_ns, HallidayHeadPoseMotion *out);
+
+/* Additive coherent prediction: pose/motion and discontinuity generation are read under
+   the SAME tracker lock. Nonzero generation changes on tracker/session replacement,
+   recenter, discontinuous SLAM gaps and large unsmoothed correction; ordinary integrated
+   head motion does not change it. It conservatively invalidates earlier scene images,
+   not a claim that every correction changes world coordinates. Zero=legacy/unknown.
+   False leaves out unchanged. Existing pose structs/getters retain their exact ABI. */
+typedef struct {
+    HallidayHeadPoseMotion motion;
+    uint64_t tracking_generation;
+} HallidayTrackedHeadPose;
+bool halliday_session_predict_tracked(const HallidaySession *session, int64_t at_host_ns, HallidayTrackedHeadPose *out);
+
 typedef struct {
     uint8_t worn;            /* proximity sensor */
     uint8_t function_button; /* Fn button under the visor */
@@ -63,6 +85,10 @@ typedef struct {
 } HallidayHeadsetStatus;
 
 bool halliday_session_status(const HallidaySession *session, HallidayHeadsetStatus *out);
+
+/* Cached connected headset PCB identity (UTF-8 plus NUL); no USB request.
+ * False and out unchanged when unavailable or capacity is too short. */
+bool halliday_session_headset_identity(const HallidaySession *session, uint8_t *out, uint32_t capacity);
 
 /* full = false: yaw only (keeps the horizon); true: also pitch and roll. */
 void halliday_session_recenter(const HallidaySession *session, bool full);
@@ -129,6 +155,12 @@ void halliday_hand_close(HallidayHand *hand);
 /* The bottom pair's spots are the raw fisheyes' (camera mode 0x10, their own pixels): true; the
    rectified pair's (modes 1 and 3): false, as a tracker starts. */
 void halliday_hand_set_fisheyes(const HallidayHand *hand, bool on);
+/* Measured per-headset right raw-camera alignment: rotation vector in radians,
+   camera-local x right/y down/z forward. Used for both stereo pairing and raw
+   reprojection. Zero restores the generic model. False for NULL, nonfinite or
+   >5-degree values; invalid values leave the tracker unchanged. A changed
+   alignment resets old pose hypotheses. Apply the same headset profile to both hands. */
+bool halliday_hand_set_fisheye_alignment(const HallidayHand *hand, const float *rotation);
 /* One exposure: the head's and the controller's orientations in the tracking space at that moment
  * (x, y, z, w), the spots of views 0 and 1 (the bottom pair) and, in camera mode 3, of views 2 and 3
  * (the top cameras; NULL or 0 when missed). True, with out written, when the controller is found. */
@@ -137,6 +169,21 @@ bool halliday_hand_update(const HallidayHand *hand, const float *head, const flo
                           const HallidayCameraSpot *right, uint32_t right_count,
                           const HallidayCameraSpot *top_left, uint32_t top_left_count,
                           const HallidayCameraSpot *top_right, uint32_t top_right_count, HallidayHandFix *out);
+
+/* Transactional paired optical association. Existing single-hand API remains valid.
+ * Input positions are used only for world-space temporal consistency, never as a hand offset.
+ * head=XYZW, head_position=XYZ, controllers=leftXYZW/rightXYZW; controller_mask bits0/1.
+ * out holds two fixes (left/right); return bits0/1 identify accepted fixes. */
+typedef struct HallidayHandPair HallidayHandPair;
+HallidayHandPair *halliday_hand_pair_open(void);
+void halliday_hand_pair_close(HallidayHandPair *pair);
+void halliday_hand_pair_set_fisheyes(const HallidayHandPair *pair, bool on);
+bool halliday_hand_pair_set_fisheye_alignment(const HallidayHandPair *pair, const float *rotation);
+uint32_t halliday_hand_pair_update(const HallidayHandPair *pair, uint64_t exposure_ns,
+    const float *head, const float *head_position, const float *controllers, uint32_t controller_mask,
+    const HallidayCameraSpot *left, uint32_t left_count, const HallidayCameraSpot *right, uint32_t right_count,
+    const HallidayCameraSpot *top_left, uint32_t top_left_count,
+    const HallidayCameraSpot *top_right, uint32_t top_right_count, HallidayHandFix *out);
 
 /* --- Sense controllers --------------------------------------------------------------------- */
 
@@ -188,6 +235,14 @@ bool halliday_sense_calibrate(const HallidaySense *sense, const uint8_t *first, 
 bool halliday_sense_report(const HallidaySense *sense, const uint8_t *bytes, size_t len);
 /* The newest state. False until a report has been taken. */
 bool halliday_sense_state(const HallidaySense *sense, HallidaySenseState *out);
+/* Atomic newest-state snapshot plus its sensor sample on the camera/frame host
+   clock, including transport mapping. Time is zero when unavailable; optional
+   time pointer. Outputs unchanged on failure. Existing State ABI is unchanged. */
+bool halliday_sense_state_timed(const HallidaySense *sense, HallidaySenseState *out, int64_t *sample_host_ns);
+/* Cached raw sensor orientation at camera exposure host ns; no wait/HID/prediction.
+ * False for unbracketed/stale history; out4 XYZW floats unchanged on failure.
+ * Existing current-state/game-controller APIs are unaffected. */
+bool halliday_sense_orientation_at(const HallidaySense *sense, int64_t exposure_host_ns, float *out);
 /* Writes the 48-byte feature report (id 0x08) that asks for about 133 reports a second, not 60. */
 void halliday_sense_polling_report(uint8_t *out);
 /* Writes the 78-byte Bluetooth output report (id 0x31) that sets the tracking LEDs: phase 1
@@ -196,6 +251,15 @@ void halliday_sense_polling_report(uint8_t *out);
  * counter go up by one per report sent, led_sequence when the timing changes. */
 void halliday_sense_led_report(uint8_t sequence, uint8_t counter, uint8_t phase, uint8_t led_sequence, uint8_t period_id,
                                uint32_t cycle_position, uint32_t cycle_length, uint32_t host_us, uint8_t *out);
+/* Documented 78-byte Bluetooth vibration output. USB output is not inferred. */
+void halliday_sense_vibration_report(uint8_t sequence, uint8_t counter, float amplitude, float frequency_hz,
+                                     uint32_t host_us, uint8_t *out);
+/* Same vibration output with the current connection's LED settings/latch retained.
+ * programmed is NULL before LEDs are programmed, otherwise a valid 78-byte report.
+ * Returns false for invalid retained packet or NULL out; out is unchanged on failure.
+ * The input and output buffers may alias. No LED latch sequence is advanced. */
+bool halliday_sense_vibration_report_with_led(uint8_t sequence, uint8_t counter, float amplitude, float frequency_hz,
+                                             uint32_t host_us, const uint8_t *programmed, uint8_t *out);
 /* Makes where the controller points now the heading yaw (radians about y, 0 forward). */
 void halliday_sense_recenter(const HallidaySense *sense, float yaw);
 
@@ -390,6 +454,14 @@ void halliday_bridge_set_overlay_height(const HallidayGameBridge *bridge, uint32
 void halliday_bridge_present_status(const HallidayGameBridge *bridge, HallidayBridgePresent *out);
 bool halliday_bridge_present_frame(const HallidayGameBridge *bridge, uint32_t number, HallidayBridgePresentFrame *out);
 void halliday_bridge_present_seen(const HallidayGameBridge *bridge, uint32_t number);
+
+/* --- Additional Sense output (stateless; existing Sense pose ABI is unchanged) ------------ */
+typedef struct {
+    uint32_t sequence, device_ticks, echoed_host_us;
+    uint8_t crc_failures, bluetooth, reserved[2];
+} HallidaySenseOutputFeedback;
+bool halliday_sense_output_feedback(uint16_t product_id, const uint8_t *bytes, size_t len,
+                                   HallidaySenseOutputFeedback *out);
 
 /* --- Android packages (Quest apps) ------------------------------------------------------- */
 

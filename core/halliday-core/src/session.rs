@@ -17,7 +17,7 @@ use crate::psvr2::protocol::{DistortionCalibration, FirmwareInfo, SlamRecord, St
 use crate::recording::{Reader, RecordingError, Stream};
 use crate::time::host_time_ns;
 use crate::tracking::blobs::Blob;
-use crate::tracking::{HeadPose, HeadTracker, HeadsetStatus, TrackerConfig};
+use crate::tracking::{HeadPose, HeadTracker, HeadsetStatus, TrackedHeadPose, TrackerConfig};
 
 /// The bright spots one tracking camera saw at its newest exposure (the controllers' LEDs, and
 /// whatever else is bright). Views: a frame holds two cameras' pictures, left then right or top
@@ -143,6 +143,13 @@ impl Shared {
         self.tracker.lock().unwrap_or_else(|e| e.into_inner())
     }
 
+    fn reset_tracker(&self) {
+        // Allocate replacement state while holding the same lock as prediction. The
+        // replacement's token cannot be observed with the previous tracker's pose.
+        let mut tracker = self.tracker();
+        *tracker = HeadTracker::new(TrackerConfig::default());
+    }
+
     fn ingest(&self, stream: Stream, data: &[u8], host_ns: i64) {
         match stream {
             Stream::Status => {
@@ -218,6 +225,12 @@ impl Session {
         self.shared.tracker().predict(at_host_ns)
     }
 
+    /// Pose, motion validity and discontinuity generation from ONE tracker lock.
+    /// A replacement tracker (USB reconnect/replay loop) receives a new token.
+    pub fn predict_tracked(&self, at_host_ns: i64) -> Option<TrackedHeadPose> {
+        self.shared.tracker().predict_tracked(at_host_ns)
+    }
+
     pub fn status(&self) -> HeadsetStatus {
         self.shared.tracker().status()
     }
@@ -243,6 +256,23 @@ impl Session {
 
     pub fn firmware(&self) -> Option<FirmwareInfo> {
         self.shared.firmware.lock().unwrap().clone()
+    }
+
+    /// Cached PCB identity for per-headset camera calibration. No USB request is made here.
+    /// Do not return the previous device's identity while reconnecting or replaying.
+    pub fn headset_identity(&self) -> Option<String> {
+        if self.link_state() != LinkState::Connected {
+            return None;
+        }
+        let id = self.firmware()?.pcb_id;
+        if self.link_state() != LinkState::Connected
+            || id.is_empty()
+            || id.len() > 16
+            || !id.bytes().all(|b| b.is_ascii_graphic())
+        {
+            return None;
+        }
+        Some(id)
     }
 
     pub fn last_error(&self) -> Option<String> {
@@ -345,7 +375,7 @@ fn replay(shared: &Shared, path: &PathBuf, looping: bool) {
                 return;
             }
         };
-        *shared.tracker() = HeadTracker::new(TrackerConfig::default());
+        shared.reset_tracker();
         let start = host_time_ns();
         let mut first_t: Option<u64> = None;
         for record in reader {
@@ -585,10 +615,9 @@ mod usb {
     }
 
     fn run_connected(shared: &Shared, headset: Arc<Headset>) {
-        *shared.tracker() = HeadTracker::new(TrackerConfig::default());
-        if let Ok(f) = headset.firmware_info() {
-            *shared.firmware.lock().unwrap() = Some(f);
-        }
+        shared.reset_tracker();
+        // A failed read must not attach the previous headset's camera profile to a new device.
+        *shared.firmware.lock().unwrap() = headset.firmware_info().ok();
         match headset.distortion_calibration() {
             Ok(c) => *shared.calibration.lock().unwrap() = Some(c),
             Err(e) => *shared.last_error.lock().unwrap() = Some(format!("calibration: {e}")),
@@ -633,6 +662,111 @@ mod tests {
     use crate::psvr2::protocol::{IMU_RECORD_SIZE, SLAM_RECORD_SIZE, STATUS_HEADER_SIZE};
     use crate::recording::Writer;
 
+    fn generation_record(x: f32) -> SlamRecord {
+        SlamRecord {
+            vts_us: 0,
+            unknown1: 3,
+            position: [0., 1.6, x],
+            orientation: crate::math::Quat::IDENTITY,
+        }
+    }
+
+    #[test]
+    fn tracked_generation_is_atomic_with_pose_across_session_replacements() {
+        let shared = Arc::new(Shared::new(LinkState::Connected));
+        let expected = Arc::new(Mutex::new(std::collections::HashMap::new()));
+        let first_generation = {
+            let mut t = shared.tracker();
+            t.ingest_slam(&generation_record(0.), 0);
+            let sample = t.predict_tracked(0).unwrap();
+            expected
+                .lock()
+                .unwrap()
+                .insert(sample.tracking_generation, sample.motion);
+            sample.tracking_generation
+        };
+        let session = Session {
+            shared: shared.clone(),
+            thread: None,
+        };
+        thread::scope(|scope| {
+            let writer_shared = shared.clone();
+            let writer_expected = expected.clone();
+            scope.spawn(move || {
+                for i in 1..=1000 {
+                    let mut t = writer_shared.tracker();
+                    *t = HeadTracker::new(TrackerConfig::default());
+                    t.ingest_slam(&generation_record(i as f32 * 0.001), 0);
+                    let sample = t.predict_tracked(0).unwrap();
+                    writer_expected
+                        .lock()
+                        .unwrap()
+                        .insert(sample.tracking_generation, sample.motion);
+                    thread::yield_now();
+                }
+            });
+            for _ in 0..5000 {
+                let sample = session.predict_tracked(0).unwrap();
+                assert_eq!(
+                    expected.lock().unwrap().get(&sample.tracking_generation),
+                    Some(&sample.motion)
+                );
+                thread::yield_now();
+            }
+        });
+        let final_sample = session.predict_tracked(0).unwrap();
+        assert!(final_sample.tracking_generation > first_generation);
+        shared.reset_tracker();
+        assert!(session.predict_tracked(0).is_none());
+        shared.tracker().ingest_slam(&generation_record(3.), 0);
+        assert!(
+            session.predict_tracked(0).unwrap().tracking_generation
+                > final_sample.tracking_generation
+        );
+    }
+
+    #[test]
+    fn camera_profile_identity_is_cached_and_connected_only() {
+        let shared = Arc::new(Shared::new(LinkState::Connected));
+        let session = Session {
+            shared: shared.clone(),
+            thread: None,
+        };
+        assert_eq!(session.headset_identity(), None);
+        let firmware = |id: &str| FirmwareInfo {
+            version: 1,
+            commit_hash: String::new(),
+            pcb_id: id.into(),
+            recovery_version: 1,
+        };
+        *shared.firmware.lock().unwrap() = Some(firmware("TEST-PCB-1234567"));
+        assert_eq!(
+            session.headset_identity().as_deref(),
+            Some("TEST-PCB-1234567")
+        );
+        for link in [LinkState::Searching, LinkState::Replaying, LinkState::Error] {
+            shared.set_link(link);
+            assert_eq!(session.headset_identity(), None);
+        }
+        shared.set_link(LinkState::Connected);
+        for id in [
+            "",
+            " ",
+            "has space",
+            "bad\0id",
+            "bad\nid",
+            "abcdefghijklmnopq",
+            "nonasciié",
+        ] {
+            *shared.firmware.lock().unwrap() = Some(firmware(id));
+            assert_eq!(session.headset_identity(), None, "{id:?}");
+        }
+        *shared.firmware.lock().unwrap() = Some(firmware("OTHER-PCB"));
+        assert_eq!(session.headset_identity().as_deref(), Some("OTHER-PCB"));
+        *shared.firmware.lock().unwrap() = None;
+        assert_eq!(session.headset_identity(), None);
+    }
+
     fn recording(ms: u32) -> PathBuf {
         let mut w = Writer::new(Vec::new(), 0).unwrap();
         for i in 0..ms {
@@ -640,9 +774,11 @@ mod tests {
             let mut st = vec![0u8; STATUS_HEADER_SIZE];
             st[1] = 1;
             st[5] = 64;
-            for _ in 0..2 {
+            for half in 0..2 {
                 let mut rec = vec![0u8; IMU_RECORD_SIZE];
                 rec[0..4].copy_from_slice(&vts.to_le_bytes());
+                rec[20..22].copy_from_slice(&((vts + half * 500) as u16).to_le_bytes());
+                rec[22..24].copy_from_slice(&(if half == 0 { 1u16 } else { 0u16 }).to_le_bytes());
                 st.extend(rec);
             }
             w.write(Stream::Status, vts as u64 * 1000 + 1_000_000, &st)
