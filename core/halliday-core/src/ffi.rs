@@ -559,10 +559,8 @@ mod sense_timed_snapshot_contracts {
     #[test]
     fn null_and_empty_state_leave_both_outputs_unchanged() {
         unsafe {
-            let mut out = HallidaySenseState {
-                reports: 41,
-                ..Default::default()
-            };
+            let mut out = HallidaySenseState::default();
+            out.reports = 41;
             let mut time = 77;
             assert!(!halliday_sense_state_timed(
                 std::ptr::null(),
@@ -1771,7 +1769,7 @@ mod tests {
     #[test]
     fn hand_camera_alignment_c_api_validates_pointers_and_values() {
         let hand = halliday_hand_open(true);
-        let rotation = [-0.0041120713, 0.0033288613, -0.014_920_06];
+        let rotation = [-0.0041120713, 0.0033288613, -0.0149200596];
         // SAFETY: each non-null pointer below addresses three readable floats or
         // the exclusively owned live handle, which is released exactly once.
         unsafe {

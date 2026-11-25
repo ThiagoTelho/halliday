@@ -23,9 +23,12 @@ final class GameBridge {
     nonisolated static let folder: URL = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
         .appendingPathComponent("Halliday/OpenVR")
 
-    /// Per-eye size games are asked to render at (PS VR2 is 2000 × 2040; the frames are copied
-    /// through memory, so first light asks for less).
-    static let eyeSize = (width: UInt32(1440), height: UInt32(1468))
+    /// Full game-image target; a reduced render scale is an explicit user choice.
+    static let eyeSize = (width: UInt32(GameImagePlan.targetWidth), height: UInt32(GameImagePlan.targetHeight))
+    let imageRenderPercent: Int
+    let cropSettings: GameCropSettings
+    let viewGeometry: GameViewGeometry
+    private static var nextImageSequence: UInt64 = 0
 
     private let device: MTLDevice
     private let queue: MTLCommandQueue
@@ -203,18 +206,25 @@ final class GameBridge {
     private var loggedKeys: Set<UInt16> = []
 
     /// `displayHz`: the headset display's rate, told to games (90 without one).
-    init?(device: MTLDevice, queue: MTLCommandQueue, displayHz: Float = 90) {
+    init?(device: MTLDevice, queue: MTLCommandQueue, displayHz: Float = 90, crop: GameCropSettings = .init()) {
         self.device = device
         self.queue = queue
+        imageRenderPercent = Settings.shared.gameRenderPercent
+        cropSettings = crop
         guard Self.installRuntime() else { return nil }
         func tangents(_ eye: Eye) -> (Float, Float, Float, Float) {
             let f = Optics.fov(eye)
             return (tan(f.left), tan(f.right), tan(f.up), tan(f.down))
         }
         let l = tangents(.left), r = tangents(.right)
-        var config = HallidayBridgeConfig(eye_width: Self.eyeSize.width, eye_height: Self.eyeSize.height,
+        let render = GameImagePlan.renderSize(percent: imageRenderPercent)
+        viewGeometry = GameViewGeometry(renderSize: .init(width: render.width, height: render.height),
+            imageTarget: .init(width: GameImagePlan.targetWidth, height: GameImagePlan.targetHeight),
+            leftTangents: SIMD4(l.0, l.1, l.2, l.3), rightTangents: SIMD4(r.0, r.1, r.2, r.3), crop: crop)
+        let left = viewGeometry.leftTangents, right = viewGeometry.rightTangents
+        var config = HallidayBridgeConfig(eye_width: UInt32(viewGeometry.renderSize.width), eye_height: UInt32(viewGeometry.renderSize.height),
                                           display_hz: displayHz, ipd: 0.063,
-                                          tangents: ((l.0, l.1, l.2, l.3), (r.0, r.1, r.2, r.3)))
+                                          tangents: ((left.x, left.y, left.z, left.w), (right.x, right.y, right.z, right.w)))
         // The runtime appends to its log in every game process: start it afresh with Halliday,
         // after noting the games that tried to start while Halliday wasn't running.
         let runtimeLog = Self.folder.appendingPathComponent("vrclient.log")
@@ -235,8 +245,21 @@ final class GameBridge {
     }
 
     func close() {
+        stopCapture()
         if let b = bridge { halliday_bridge_close(b) }
         bridge = nil
+    }
+
+    /// Never replace a mapping while a client, capture or GPU read still uses it.
+    var canReconfigureImage: Bool {
+        guard !isPresenting, connectedExe == nil, !reading, !captureStarting,
+              overlaysReading.isEmpty, !skyboxReading else { return false }
+        if let bridge {
+            var client = HallidayBridgeClient()
+            halliday_bridge_client(bridge, &client)
+            if client.initialized != 0, lastBeatTime == 0 || CACurrentMediaTime() - lastBeatTime < 2 { return false }
+        }
+        return true
     }
 
     /// Puts the DLL from the app's bundle at `OpenVR/bin/` (OpenVR 1.0 loaders) and
@@ -1023,15 +1046,15 @@ final class GameBridge {
 
     private func projectionLayer(texture: MTLTexture, flipped: Bool, pose p: HallidayBridgePose) -> ProjectionLayer {
         notePoseAge(p)
-        func tangents(_ eye: Eye) -> SIMD4<Float> {
-            let fov = Optics.fov(eye)
-            return SIMD4(tan(fov.left), tan(fov.right), tan(fov.up), tan(fov.down))
-        }
-        return ProjectionLayer(texture: texture,
+        Self.nextImageSequence &+= 1
+        var projection = ProjectionLayer(texture: texture,
                                uvRect: flipped ? SIMD4(0, 1, 1, -1) : SIMD4(0, 0, 1, 1),
                                renderOrientation: originTurn * simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
-                               tangents: (tangents(.left), tangents(.right)))
+                               tangents: (viewGeometry.leftTangents, viewGeometry.rightTangents),
+                               gameImage: true, imageSequence: Self.nextImageSequence)
+        projection.gameImageTarget = viewGeometry.imageTarget
+        return projection
     }
 
     // MARK: - Pointing at the game's overlays

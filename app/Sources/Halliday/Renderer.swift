@@ -104,6 +104,15 @@ struct ProjectionLayer {
     var tangents: (left: SIMD4<Float>, right: SIMD4<Float>)
     /// Its alpha is meant (premultiplied): with passthrough on, the room shows where it is clear.
     var seeThrough = false
+    /// An sRGB view of the same storage, for correct hardware decoding before filtering.
+    var srgbTexture: MTLTexture? = nil
+    /// 0 legacy, 1 linear, 2 sRGB, separately for the two eyes.
+    var colourSpaces: SIMD2<UInt32> = .zero
+    /// Game frames share one optional pre-reprojection FSR pass. Other projections
+    /// (WebXR, videos and the interface) retain their original sampling.
+    var gameImage = false
+    var gameImageTarget: GameViewGeometry.Size? = nil
+    var imageSequence: UInt64 = 0
 }
 
 /// Must match `LayerData` in Shaders.swift.
@@ -376,6 +385,59 @@ final class Renderer {
     private let passthroughPipeline: MTLRenderPipelineState
     private let sampler: MTLSamplerState
     private let library: MTLLibrary
+    private var gameUpscaler: GameUpscaler?
+    private var gameUpscalerFailed = false
+    private struct GameImageKey: Equatable {
+        let source: ObjectIdentifier
+        let sequence: UInt64
+        let upscale: Bool
+        let sharpness: Float
+        let colourSpaces: SIMD2<UInt32>
+        let targetWidth: Int
+        let targetHeight: Int
+    }
+    private var processedGameKey: GameImageKey?
+    private var processedGameTexture: MTLTexture?
+    private var processedGameSRGB: MTLTexture?
+
+    private func gameProjection(_ original: ProjectionLayer, cb: MTLCommandBuffer) -> ProjectionLayer {
+        let settings = Settings.shared
+        let sharpness = settings.gameSharpeningEnabled ? settings.gameSharpness : 0
+        guard original.gameImage, settings.gameFSREnabled || sharpness > 0, !original.seeThrough,
+              original.uvRect.x == 0, original.uvRect.z == 1,
+              abs(original.uvRect.w) == 1,
+              min(original.uvRect.y, original.uvRect.y + original.uvRect.w) == 0 else { return original }
+        let key = GameImageKey(source: ObjectIdentifier(original.texture), sequence: original.imageSequence,
+                               upscale: settings.gameFSREnabled, sharpness: sharpness, colourSpaces: original.colourSpaces,
+                               targetWidth: original.gameImageTarget?.width ?? GameImagePlan.targetWidth,
+                               targetHeight: original.gameImageTarget?.height ?? GameImagePlan.targetHeight)
+        if processedGameKey != key {
+            if gameUpscaler == nil, !gameUpscalerFailed {
+                do { gameUpscaler = try GameUpscaler(device: device) }
+                catch {
+                    gameUpscalerFailed = true
+                    log("[game image] FSR unavailable: \(error.localizedDescription)")
+                }
+            }
+            guard let texture = gameUpscaler?.encode(source: original.texture,
+                targetWidth: key.upscale ? max(key.targetWidth, original.texture.width / 2) : original.texture.width / 2,
+                targetHeight: key.upscale ? max(key.targetHeight, original.texture.height) : original.texture.height,
+                sharpness: key.sharpness, colourSpaces: original.colourSpaces, commandBuffer: cb) else { return original }
+            // Same-size/no-sharpen and unsupported downscales preserve the original.
+            guard texture !== original.texture else { return original }
+            processedGameTexture = texture
+            processedGameSRGB = texture.makeTextureView(pixelFormat: .rgba8Unorm_srgb)
+            processedGameKey = key
+        }
+        guard let texture = processedGameTexture else { return original }
+        if original.colourSpaces != .zero, processedGameSRGB == nil { return original }
+        var result = original
+        result.texture = texture
+        result.srgbTexture = processedGameSRGB
+        result.colourSpaces = SIMD2(original.colourSpaces.x == 0 ? 0 : 2,
+                                    original.colourSpaces.y == 0 ? 0 : 2)
+        return result
+    }
 
     /// A pipeline drawing a fullscreen triangle with fragment function `fragment` (e.g. the video's
     /// YUV conversion).
@@ -677,7 +739,9 @@ final class Renderer {
                              Float(environment == 4 && environmentTexture == nil ? 0 : environment), environmentYaw),
             projShift: projection.map { SIMD4(head.position - $0.renderPosition, Self.reprojectionDepth) } ?? .zero,
             projTanOther: desktop != nil ? (projection?.tangents.right ?? .zero) : .zero,
-            gameFade: gameFade, gameBackgroundFade: gameBackgroundFade, gameAway: SIMD4(gameAway, projection?.seeThrough == true ? 1 : 0, 0, 0),
+            gameFade: gameFade, gameBackgroundFade: gameBackgroundFade,
+            gameAway: SIMD4(gameAway, projection?.seeThrough == true ? 1 : 0,
+                Float(projection?.colourSpaces.x ?? 0), Float(projection?.colourSpaces.y ?? 0)),
             seeFromWorld: simd_float4x4(SIMD4(seeFromWorld.columns.0, 0), SIMD4(seeFromWorld.columns.1, 0),
                                         SIMD4(seeFromWorld.columns.2, 0), SIMD4(0, 0, 0, 1)),
             seeParams: SIMD4(cameraPicture == nil ? 0 : seeThrough, Self.cameraFocal,
@@ -775,6 +839,11 @@ final class Renderer {
         -> (MTLTexture, (width: Int, height: Int)?) {
         updateMeshes(calibration: calibration)
         for hook in beforeFrame { hook(cb) }
+        // Runs on the same GPU queue before reprojection and lens correction;
+        // a repeated game frame reuses its already processed texture.
+        let sourceProjection = projection
+        if let sourceProjection { projection = gameProjection(sourceProjection, cb: cb) }
+        defer { projection = sourceProjection }
         bakeEnvironment(cb)
         // Eased values (design board 9, "quick": 120 ms): the hover glow of the highlighted layer,
         // the cross-fade of panels whose texture changed, the saber between its states.
@@ -857,6 +926,7 @@ final class Renderer {
             enc.setFragmentTexture(scene3D != nil ? meshTargets?.color ?? placeholder : placeholder, index: 2 * maxLayers + 3)
             enc.setFragmentTexture(scene3D != nil ? meshTargets?.distance ?? placeholder : placeholder, index: 2 * maxLayers + 4)
             enc.setFragmentTexture(cameraPicture ?? placeholder, index: 2 * maxLayers + 5)
+            enc.setFragmentTexture(projection?.srgbTexture ?? projection?.texture ?? placeholder, index: 2 * maxLayers + 6)
             let size = Double(eyeTexture.height)
             var lights = Self.fireflies(time: Float(CACurrentMediaTime() - startTime))
             enc.setFragmentBytes(&lights, length: lights.count * MemoryLayout<SIMD4<Float>>.stride, index: 2)

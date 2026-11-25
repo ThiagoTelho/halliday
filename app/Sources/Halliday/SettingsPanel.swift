@@ -20,9 +20,11 @@ final class SettingsPanel: VRPanel {
     static let below: Float = 4
 
     private static let margin: CGFloat = 24
-    private static let width: CGFloat = 620, height: CGFloat = 744
+    private static let width: CGFloat = 620, height: CGFloat = 800
     private var glass: CGRect { CGRect(x: Self.margin, y: Self.margin, width: Self.width, height: Self.height) }
     private var tracks: [String: CGRect] = [:]
+    private var showingGameImage = false
+    private var showingFOV = false
 
     init(renderer: Renderer) {
         let size = CGSize(width: Self.width + 2 * Self.margin, height: Self.height + 2 * Self.margin)
@@ -37,6 +39,12 @@ final class SettingsPanel: VRPanel {
     private func activate(_ id: String) {
         switch id {
         case "close": onClose?()
+        case "page:general": showingGameImage = false; showingFOV = false
+        case "page:gameImage": showingGameImage = true; showingFOV = false
+        case "page:fov": showingFOV = true; showingGameImage = false
+        case "game:crop": settings.gameCropEnabled.toggle()
+        case "game:fsr": settings.gameFSREnabled.toggle()
+        case "game:sharpening": settings.gameSharpeningEnabled.toggle()
         case "mode:seated": settings.mode = .seated
         case "mode:roomScale": settings.mode = .roomScale
         case "identity:vision": setIdentity(true)
@@ -82,6 +90,13 @@ final class SettingsPanel: VRPanel {
         case "distance": settings.panelDistance = (value(Settings.panelDistanceRange) * 10).rounded() / 10
         case "dimming": settings.dimming = (value(Settings.dimmingRange) * 20).rounded() / 20
         case "speed": settings.pointerSpeed = (value(Settings.pointerSpeedRange) * 10).rounded() / 10
+        case "game:cropHorizontal", "game:cropVertical":
+            guard settings.gameCropEnabled else { return }
+            let fraction = (0.5 + t * 0.5) * 100
+            if id == "game:cropHorizontal" { settings.gameCropHorizontal = fraction.rounded() / 100 }
+            else { settings.gameCropVertical = fraction.rounded() / 100 }
+        case "game:scale": settings.gameRenderPercent = Int((50 + t * 50) / 5 + 0.5) * 5
+        case "game:sharpness": settings.gameSharpness = (t * 20).rounded() / 20
         case "sound":
             let before = settings.soundVolume
             settings.soundVolume = (t * 10).rounded() / 10
@@ -104,6 +119,21 @@ final class SettingsPanel: VRPanel {
         let close = CGRect(x: g.maxX - 60, y: g.minY + 18, width: 40, height: 40)
         iconButton(ctx, "close", "xmark", close, symbolSize: 14, quiet: true)
         var y = g.minY + 86
+        tracks.removeAll(keepingCapacity: true)
+        y = segmented(ctx, [("page:general", "General", !showingGameImage && !showingFOV),
+                            ("page:gameImage", "Game image", showingGameImage), ("page:fov", "FOV", showingFOV)], x: x, y: y, width: w)
+        y += 4
+
+        if showingFOV {
+            drawFOV(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
+        if showingGameImage {
+            drawGameImage(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
 
         // The place: a row of places, five at a time.
         y = section(ctx, "Place", x: x, y: y)
@@ -172,8 +202,64 @@ final class SettingsPanel: VRPanel {
             self.toggle(ctx, "motion:reduce", self.settings.reduceMotion, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
         }
 
+        drawVersion(x: x)
+    }
+
+    private func drawFOV(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        var y = section(ctx, "Game field of view", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        y = row(ctx, "FOV crop", "crop", (0xF09283, 0xB02A45), ids: ["game:crop"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:crop", self.settings.gameCropEnabled, CGRect(x: r.maxX - 74, y: r.midY - 17, width: 60, height: 34))
+        }
+        y = sliderRow(ctx, "game:cropHorizontal", "Horizontal FOV", "arrow.left.and.right", (0x7FD3FF, 0x2A7FBF),
+                      "\(Int((settings.gameCropHorizontal * 100).rounded()))%", CGFloat((settings.gameCropHorizontal - 0.5) * 2),
+                      enabled: settings.gameCropEnabled, x: rx, y: y, width: rw)
+        y = sliderRow(ctx, "game:cropVertical", "Vertical FOV", "arrow.up.and.down", (0xB79BFF, 0x6A47D6),
+                      "\(Int((settings.gameCropVertical * 100).rounded()))%", CGFloat((settings.gameCropVertical - 0.5) * 2),
+                      enabled: settings.gameCropEnabled, x: rx, y: y, width: rw)
+        NightGlass.drawText("100% keeps the full field; lower values remove outer edges.", at: CGPoint(x: x, y: y + 8), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Pixel density stays the same. The inner eye edges are preserved.", at: CGPoint(x: x, y: y + 34), style: .caption, color: NightGlass.secondary, width: width)
+        let geometry = gameImageSettingsGeometry(settings)
+        NightGlass.drawText("\(geometry.renderSize.width)×\(geometry.renderSize.height) per eye at \(settings.gameRenderPercent)% render scale",
+                            at: CGPoint(x: x, y: y + 68), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Restart the game to apply FOV changes.", at: CGPoint(x: x, y: y + 102), style: .caption, color: NightGlass.secondary, width: width)
+    }
+
+    private func drawGameImage(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        var y = section(ctx, "Game image", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        y = row(ctx, "FSR 1", "sparkles", (0x8FE39B, 0x2E9E5C), ids: ["game:fsr"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:fsr", self.settings.gameFSREnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("Reconstructs lower-resolution game frames before display.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 42
+        y = sliderRow(ctx, "game:scale", "Game render scale", "square.resize", (0x7FD3FF, 0x2A7FBF), "\(settings.gameRenderPercent)%",
+                      CGFloat(settings.gameRenderPercent - 50) / 50, x: rx, y: y, width: rw)
+        let geometry = gameImageSettingsGeometry(settings)
+        NightGlass.drawText("\(geometry.renderSize.width)×\(geometry.renderSize.height) → \(geometry.imageTarget.width)×\(geometry.imageTarget.height) per eye",
+                            at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Lower is faster; higher keeps more detail.", at: CGPoint(x: x, y: y + 30), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Restart the game to apply render scale.", at: CGPoint(x: x, y: y + 56), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 100
+        y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:sharpening", self.settings.gameSharpeningEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        y = sliderRow(ctx, "game:sharpness", "Sharpness", "circle.lefthalf.filled", (0xB79BFF, 0x6A47D6), "\(Int((settings.gameSharpness * 100).rounded()))%",
+                      CGFloat(settings.gameSharpness), x: rx, y: y, width: rw)
+        NightGlass.drawText("Sharpening works with FSR on or off.", at: CGPoint(x: x, y: y + 8), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Both switches and sharpness apply immediately.", at: CGPoint(x: x, y: y + 34), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("100%, both off: the game image is shown unchanged.", at: CGPoint(x: x, y: y + 60), style: .caption,
+                            color: NightGlass.secondary, width: width)
+    }
+
+    private func drawVersion(x: CGFloat) {
         let version = "Halliday · core \(String(cString: halliday_core_version()))"
-        NightGlass.drawText(version, at: CGPoint(x: x, y: g.maxY - 30), style: .caption, color: NightGlass.tertiary)
+        NightGlass.drawText(version, at: CGPoint(x: x, y: glass.maxY - 30), style: .caption, color: NightGlass.tertiary)
     }
 
     private static let rowHeight: CGFloat = 56
@@ -197,13 +283,14 @@ final class SettingsPanel: VRPanel {
 
     /// A row with a slider and its value at the right end.
     private func sliderRow(_ ctx: CGContext, _ id: String, _ title: String, _ symbol: String, _ colors: (UInt32, UInt32), _ value: String,
-                           _ fraction: CGFloat, x: CGFloat, y: CGFloat, width: CGFloat) -> CGFloat {
-        row(ctx, title, symbol, colors, ids: [id], x: x, y: y, width: width) { r in
+                           _ fraction: CGFloat, enabled: Bool = true, x: CGFloat, y: CGFloat, width: CGFloat) -> CGFloat {
+        row(ctx, title, symbol, colors, ids: enabled ? [id] : [], x: x, y: y, width: width) { r in
             let valueSize = NightGlass.textSize(value, style: .label, tabular: true)
             NightGlass.drawText(value, at: CGPoint(x: r.maxX - 14 - valueSize.width, y: r.midY - valueSize.height / 2), style: .label,
                                 color: NightGlass.secondary, tabular: true)
             let start = r.minX + 230, end = r.maxX - 14 - 64
-            self.tracks[id] = self.slider(ctx, id, row: CGRect(x: start, y: r.midY - 20, width: end - start, height: 40), fraction: fraction)
+            let track = self.slider(ctx, id, row: CGRect(x: start, y: r.midY - 20, width: end - start, height: 40), fraction: fraction, enabled: enabled)
+            if enabled { self.tracks[id] = track }
         }
     }
 

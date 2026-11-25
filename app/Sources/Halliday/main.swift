@@ -4,6 +4,10 @@
 //   halliday --replay FILE      start with a replayed recording as the pose source
 //   halliday --snapshot FILE.png [--yaw DEG] [--pitch DEG] [--no-lens]
 //                               render one frame offscreen to a PNG (no window, no permissions)
+//   halliday --game-image-ui-snapshot PREFIX
+//                               save image settings offscreen, then exit
+//   halliday --game-image-render-snapshot FILE.png
+//                               save a synthetic game frame through the renderer, then exit
 //   halliday --probe [--replay FILE]
 //                               command-line check of the core (displays, USB, poses)
 //   halliday --install-openvr PREFIX|gamehub
@@ -17,6 +21,14 @@ import AppKit
 import CHallidayCore
 
 let arguments = CommandLine.arguments
+if let i = arguments.firstIndex(of: "--game-image-ui-snapshot"), i + 1 < arguments.count {
+    MainActor.assumeIsolated { runGameImageUISnapshot(prefix: arguments[i + 1]) }
+    exit(0)
+}
+if let i = arguments.firstIndex(of: "--game-image-render-snapshot"), i + 1 < arguments.count {
+    MainActor.assumeIsolated { runGameImageRenderSnapshot(path: arguments[i + 1], arguments: arguments) }
+    exit(0)
+}
 let replayArgument: String? = arguments.firstIndex(of: "--replay").flatMap { i in
     i + 1 < arguments.count ? arguments[i + 1] : nil
 }

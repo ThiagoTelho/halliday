@@ -184,10 +184,13 @@ extension VRPanel {
     /// A slider in `row` (its hit area, 40 dmm tall). Returns the track, for mapping the pointer to
     /// a value while it is dragged.
     @discardableResult
-    func slider(_ ctx: CGContext, _ id: String, row: CGRect, fraction: CGFloat) -> CGRect {
+    func slider(_ ctx: CGContext, _ id: String, row: CGRect, fraction: CGFloat, enabled: Bool = true) -> CGRect {
         let track = CGRect(x: row.minX + 12, y: row.midY - 3, width: row.width - 24, height: 6)
-        control(id, row)
-        let state = state(of: id)
+        control(id, row, enabled: enabled)
+        let state = state(of: id, enabled: enabled)
+        ctx.saveGState()
+        if !enabled { ctx.setAlpha(0.35) }
+        defer { ctx.restoreGState() }
         NightGlass.fill(ctx, track, radius: 3, color: NSColor(white: 1, alpha: state == .rest ? 0.12 : 0.18))
         let f = max(0, min(1, fraction))
         if f > 0.005 {

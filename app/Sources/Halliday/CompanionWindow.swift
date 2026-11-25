@@ -277,6 +277,11 @@ private struct CompanionView: View {
     @State private var quitting = false
     @ObservedObject private var setup = Setup.shared
 
+    init(model: CompanionModel, initialSection: Section? = nil) {
+        _model = ObservedObject(wrappedValue: model)
+        if let initialSection { _section = State(initialValue: initialSection) }
+    }
+
     var body: some View {
         Group {
             if setup.showing { SetupView(model: model) } else { sections }
@@ -367,6 +372,14 @@ private struct CompanionView: View {
             }
             .navigationTitle((section ?? .overview).rawValue)
         }
+    }
+}
+
+extension CompanionSnapshot {
+    /// Uses the real companion navigation and controls; no visible window or setup changes.
+    static func gameImage(to path: String) {
+        render(CompanionView(model: CompanionModel(), initialSection: .sound), to: path,
+               size: CGSize(width: 1060, height: 1060))
     }
 }
 
@@ -514,6 +527,37 @@ private struct SoundPane: View {
     @ObservedObject var model: CompanionModel
     var body: some View {
         let s = Settings.shared
+        CompanionCard(title: "Field of view") {
+            Toggle("FOV crop", isOn: model.setting(\.gameCropEnabled)).toggleStyle(.switch)
+            LevelRow(title: "Horizontal FOV", value: "\(Int((s.gameCropHorizontal * 100).rounded()))%",
+                     level: model.setting(\.gameCropHorizontal), range: Settings.gameCropRange, step: 0.01)
+                .disabled(!s.gameCropEnabled).accessibilityIdentifier("game.cropHorizontal")
+            LevelRow(title: "Vertical FOV", value: "\(Int((s.gameCropVertical * 100).rounded()))%",
+                     level: model.setting(\.gameCropVertical), range: Settings.gameCropRange, step: 0.01)
+                .disabled(!s.gameCropEnabled).accessibilityIdentifier("game.cropVertical")
+            Text("100% keeps the full field. Lower values remove the outer sides and top/bottom at the same pixel density; the inner eye edges are preserved. Restart the game to apply FOV changes.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
+        CompanionCard(title: "Game image") {
+            Toggle("FSR 1", isOn: model.setting(\.gameFSREnabled)).toggleStyle(.switch)
+            Text("Reconstructs a lower-resolution game image before showing it in the headset.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            LevelRow(title: "Game render scale", value: "\(s.gameRenderPercent)%",
+                     level: Binding(get: { Float(s.gameRenderPercent) }, set: { model.setting(\.gameRenderPercent).wrappedValue = Int($0.rounded()) }),
+                     range: Float(Settings.gameRenderPercentRange.lowerBound)...Float(Settings.gameRenderPercentRange.upperBound), step: 5)
+            let geometry = gameImageSettingsGeometry(s)
+            Text("\(geometry.renderSize.width)×\(geometry.renderSize.height) → \(geometry.imageTarget.width)×\(geometry.imageTarget.height) per eye")
+                .font(.callout).foregroundStyle(.secondary).monospacedDigit()
+            Text("Lower is faster; higher keeps more detail. Restart the game to apply render scale.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Toggle("RCAS sharpening", isOn: model.setting(\.gameSharpeningEnabled)).toggleStyle(.switch)
+            LevelRow(title: "Sharpness", value: "\(Int((s.gameSharpness * 100).rounded()))%",
+                     level: model.setting(\.gameSharpness), range: Settings.gameSharpnessRange, step: 0.05)
+            Text("Sharpening works with FSR on or off. Both switches and sharpness apply immediately.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Text("At 100% with both switches off, the game image is shown unchanged.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+        }
         CompanionCard(title: "Sound") {
             LevelRow(title: "Volume", value: s.volume < 0.01 ? "Off" : "\(Int((s.volume * 100).rounded()))%", level: model.setting(\.volume), range: 0...1)
             Text("Videos, apps and Halliday's own sounds all play at this level.").font(.callout).foregroundStyle(.secondary)

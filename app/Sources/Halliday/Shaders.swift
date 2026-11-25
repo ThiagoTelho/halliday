@@ -42,7 +42,7 @@ struct SceneUniforms {
     float4 projTanOther;     // desktop view: the other eye's FOV tangents, for what this eye's image doesn't cover (0: none)
     float4 gameFade;         // a game's fade over its frames (IVRCompositor::FadeToColor), premultiplied
     float4 gameBackgroundFade; // … over the place shown when it sends none (bBackground)
-    float4 gameAway;         // x: Halliday is up over the game (0..1): its frames dimmed and blurred; y: 1 = its picture's alpha is meant (the room may show where it is clear)
+    float4 gameAway;         // x: dashboard amount; y: premultiplied alpha; z/w: left/right transfer (0 legacy, 1 linear, 2 sRGB)
     // Passthrough (the room, through the headset's bottom cameras).
     float4x4 seeFromWorld;   // the cameras' frame (x right, y down, z forward) at the exposure, from world
     float4 seeParams;        // x: how much is shown (0..1), y: focal length (pixels), z: this eye's camera's centre x, w: centre y
@@ -105,15 +105,19 @@ static float3 see_through(float3 d, float eye, constant SceneUniforms &u, textur
     return float3(grey) * inside;
 }
 
+\(projectionColourShaderFunctions)
+
 // A game's frame while Halliday is over it (design board 14, A): blurred by `away` (a ring of taps
 // around `uv`, `texel` the size of one source pixel) and darkened, a little desaturated.
-static float3 game_away(texture2d<float> tex, sampler smp, float2 uv, float2 texel, float away, float3 sharp) {
+static float3 game_away(texture2d<float> tex, sampler smp, float2 uv, float2 texel, float away,
+                        float3 sharp, float4 rect, uint eye, uint colour) {
     float3 sum = sharp;
     float r = away * 9.0;
     for (int i = 0; i < 12; i++) {
         float a = float(i) * 0.5235988;
         float2 off = float2(cos(a), sin(a)) * texel * (i % 2 == 0 ? r : r * 0.5);
-        sum += tex.sample(smp, uv + off, level(0.0)).rgb;
+        float2 tap = projection_clamp_eye_uv(tex, uv + off, rect, eye, colour);
+        sum += tex.sample(smp, tap, level(0.0)).rgb;
     }
     float3 soft = sum / 13.0;
     float grey = dot(soft, float3(0.2126, 0.7152, 0.0722));
@@ -797,6 +801,7 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
                          texture2d<float> meshColor [[texture(51)]],
                          texture2d<float> meshDistance [[texture(52)]],
                          texture2d<float> cameraPicture [[texture(53)]],
+                         texture2d<float> projSRGBTexture [[texture(54)]],
                          sampler smp [[sampler(0)]]) {
     float tx = mix(u.tanLRUD.x, u.tanLRUD.y, in.uv.x);
     float ty = mix(u.tanLRUD.z, u.tanLRUD.w, in.uv.y);
@@ -823,13 +828,18 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
             if (all(eyeUV >= 0.0) && all(eyeUV <= 1.0)) {
                 float2 sbs = float2((u.projFlags.y + eyeUV.x) * 0.5, eyeUV.y);
                 float2 uv = u.projUV.xy + sbs * u.projUV.zw;
-                float4 drawn = projTexture.sample(smp, uv, level(0.0));
+                uint colour = uint(u.projFlags.y < 0.5 ? u.gameAway.z : u.gameAway.w);
+                uint sourceEye = uint(u.projFlags.y);
+                uv = projection_clamp_eye_uv(projTexture, uv, u.projUV, sourceEye, colour);
+                float4 drawn = projection_sample(projTexture, projSRGBTexture, smp, uv, colour);
                 page = drawn.rgb;
                 pageAlpha = drawn.a;
                 if (u.gameAway.x > 0.001) {
                     float2 texel = 1.0 / float2(projTexture.get_width(), projTexture.get_height());
-                    page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page);
+                    if (colour == 2) page = game_away(projSRGBTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, sourceEye, colour);
+                    else page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, sourceEye, colour);
                 }
+                page = projection_display_rgb(page, pageAlpha, colour, u.gameAway.y > 0.5);
             } else if (u.projTanOther.y > u.projTanOther.x) {
                 // The desktop view is wider than one eye's image on its inner side: the other eye
                 // (the right one) covers it.
@@ -838,11 +848,16 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
                 if (all(otherUV >= 0.0) && all(otherUV <= 1.0)) {
                     float2 sbs = float2((1.0 + otherUV.x) * 0.5, otherUV.y);
                     float2 uv = u.projUV.xy + sbs * u.projUV.zw;
-                    page = projTexture.sample(smp, uv, level(0.0)).rgb;
+                    uint colour = uint(u.gameAway.w);
+                    uv = projection_clamp_eye_uv(projTexture, uv, u.projUV, 1, colour);
+                    float4 drawn = projection_sample(projTexture, projSRGBTexture, smp, uv, colour);
+                    page = drawn.rgb;
                     if (u.gameAway.x > 0.001) {
                         float2 texel = 1.0 / float2(projTexture.get_width(), projTexture.get_height());
-                        page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page);
+                        if (colour == 2) page = game_away(projSRGBTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
+                        else page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
                     }
+                    page = projection_display_rgb(page, drawn.a, colour, u.gameAway.y > 0.5);
                 }
             }
         }
