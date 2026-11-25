@@ -37,7 +37,7 @@ final class NotesPanel: VRPanel {
     private var page: CGRect { CGRect(x: glass.minX + Self.sidebar + 16, y: glass.minY + 68, width: glass.width - Self.sidebar - 32, height: glass.height - 68 - 44) }
 
     static var folder: URL {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Halliday/Notes")
+        let dir = RuntimePaths.support.appendingPathComponent("Notes")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }

@@ -67,8 +67,7 @@ enum QuestError: Error, CustomStringConvertible {
 final class QuestApps: @unchecked Sendable {
     static let shared = QuestApps()
 
-    static let folder = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-        .appendingPathComponent("Halliday/Quest")
+    static let folder = RuntimePaths.support.appendingPathComponent("Quest")
 
     /// Klepton's runner, Halliday's OpenXR runtime and MoltenVK, side by side in the bundle.
     static var runtimeFolder: URL? {

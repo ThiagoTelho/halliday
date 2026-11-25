@@ -284,10 +284,12 @@ mod tests {
     fn status_bytes(vts_us: u32, gyro_y_raw: i16) -> Vec<u8> {
         let mut b = vec![0u8; STATUS_HEADER_SIZE];
         b[1] = 1;
-        for _ in 0..2 {
+        for half in 0..2 {
             let mut rec = vec![0u8; IMU_RECORD_SIZE];
             rec[0..4].copy_from_slice(&vts_us.to_le_bytes());
             rec[14..16].copy_from_slice(&gyro_y_raw.to_le_bytes()); // raw z -> tracking +y
+            rec[20..22].copy_from_slice(&((vts_us + half * 500) as u16).to_le_bytes());
+            rec[22..24].copy_from_slice(&(if half == 0 { 1u16 } else { 0u16 }).to_le_bytes());
             b.extend(rec);
         }
         b

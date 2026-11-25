@@ -15,14 +15,19 @@ final class SettingsPanel: VRPanel {
     /// The browser's current page, for "use the current page as home".
     var currentPage: (() -> String?)?
     var onNotice: ((String) -> Void)?
+    var onRefreshRate: ((Int) -> Void)?
+    var refreshState: (() -> (rates: [Int], current: Int, busy: Bool))?
 
     static let distance: Float = 1.2
     static let below: Float = 4
 
     private static let margin: CGFloat = 24
-    private static let width: CGFloat = 620, height: CGFloat = 744
+    private static let width: CGFloat = 620, height: CGFloat = 920
     private var glass: CGRect { CGRect(x: Self.margin, y: Self.margin, width: Self.width, height: Self.height) }
     private var tracks: [String: CGRect] = [:]
+    private var showingGameImage = false
+    private var showingTracking = false
+    private var showingFOV = false
 
     init(renderer: Renderer) {
         let size = CGSize(width: Self.width + 2 * Self.margin, height: Self.height + 2 * Self.margin)
@@ -37,6 +42,22 @@ final class SettingsPanel: VRPanel {
     private func activate(_ id: String) {
         switch id {
         case "close": onClose?()
+        case "page:general": showingGameImage = false; showingTracking = false; showingFOV = false
+        case "page:gameImage": showingGameImage = true; showingTracking = false; showingFOV = false
+        case "page:tracking": showingGameImage = false; showingTracking = true; showingFOV = false
+        case "page:fov": showingGameImage = false; showingTracking = false; showingFOV = true
+        case "tracking:led": settings.senseLEDFeedback.toggle()
+        case "game:hud": settings.gamePerformanceHUD.toggle()
+        case "game:fsr": settings.gameFSREnabled.toggle()
+        case "game:crop": settings.gameCropEnabled.toggle()
+        case "game:sharpening": settings.gameSharpeningEnabled.toggle()
+        case "game:half:off": settings.gameHalfFrameRateMode = .off
+        case "game:half:on": settings.gameHalfFrameRateMode = .on
+        case "game:half:auto": settings.gameHalfFrameRateMode = .auto
+        case "game:spacewarp": settings.setGameSpacewarp(!settings.gameSpacewarpEnabled)
+        case "game:systemAudio": settings.gameSystemAudio.toggle()
+        case "display:90": onRefreshRate?(90)
+        case "display:120": onRefreshRate?(120)
         case "mode:seated": settings.mode = .seated
         case "mode:roomScale": settings.mode = .roomScale
         case "identity:vision": setIdentity(true)
@@ -82,6 +103,13 @@ final class SettingsPanel: VRPanel {
         case "distance": settings.panelDistance = (value(Settings.panelDistanceRange) * 10).rounded() / 10
         case "dimming": settings.dimming = (value(Settings.dimmingRange) * 20).rounded() / 20
         case "speed": settings.pointerSpeed = (value(Settings.pointerSpeedRange) * 10).rounded() / 10
+        case "game:scale": settings.gameRenderPercent = Int((50 + t * 50) / 5 + 0.5) * 5
+        case "game:sharpness": settings.gameSharpness = (t * 20).rounded() / 20
+        case "game:cropHorizontal", "game:cropVertical":
+            guard settings.gameCropEnabled else { return }
+            let fraction = ((0.5 + t * 0.5) * 100).rounded() / 100
+            if id == "game:cropHorizontal" { settings.gameCropHorizontal = fraction }
+            else { settings.gameCropVertical = fraction }
         case "sound":
             let before = settings.soundVolume
             settings.soundVolume = (t * 10).rounded() / 10
@@ -100,10 +128,33 @@ final class SettingsPanel: VRPanel {
         let x = g.minX + 28, w = g.width - 56
         // The header (board 20): the title and whose settings these are.
         NightGlass.drawText("Settings", at: CGPoint(x: x, y: g.minY + 18), style: .title)
-        NightGlass.drawText("Halliday, on this Mac", at: CGPoint(x: x, y: g.minY + 50), style: .caption, color: NightGlass.secondary)
+        NightGlass.drawText("\(RuntimePaths.displayName), on this Mac", at: CGPoint(x: x, y: g.minY + 50), style: .caption, color: NightGlass.secondary)
         let close = CGRect(x: g.maxX - 60, y: g.minY + 18, width: 40, height: 40)
         iconButton(ctx, "close", "xmark", close, symbolSize: 14, quiet: true)
         var y = g.minY + 86
+        tracks.removeAll(keepingCapacity: true)
+        y = segmented(ctx, [("page:general", "General", !showingGameImage && !showingTracking && !showingFOV),
+                            ("page:gameImage", "Game image", showingGameImage),
+                            ("page:tracking", "Tracking", showingTracking),
+                            ("page:fov", "FOV", showingFOV)], x: x, y: y, width: w)
+        y += 4
+        animates = showingTracking
+        if showingFOV {
+            drawFOV(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
+        if showingTracking {
+            drawTracking(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
+
+        if showingGameImage {
+            drawGameImage(ctx, x: x, y: y, width: w)
+            drawVersion(x: x)
+            return
+        }
 
         // The place: a row of places, five at a time.
         y = section(ctx, "Place", x: x, y: y)
@@ -168,12 +219,107 @@ final class SettingsPanel: VRPanel {
         }
         y = sliderRow(ctx, "sound", "Sounds", "speaker.wave.2", (0xFF8FC2, 0xC9407F),
                       settings.soundVolume < 0.01 ? "Off" : "\(Int((settings.soundVolume * 100).rounded()))%", CGFloat(settings.soundVolume), x: rx, y: y, width: rw)
-        _ = row(ctx, "Reduce motion", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["motion:reduce"], x: rx, y: y, width: rw) { r in
+        y = row(ctx, "Reduce motion", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["motion:reduce"], x: rx, y: y, width: rw) { r in
             self.toggle(ctx, "motion:reduce", self.settings.reduceMotion, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
         }
 
-        let version = "Halliday · core \(String(cString: halliday_core_version()))"
-        NightGlass.drawText(version, at: CGPoint(x: x, y: g.maxY - 30), style: .caption, color: NightGlass.tertiary)
+        y = row(ctx, "Game audio in PS VR2", "headphones", (0x7FD3FF, 0x2A7FBF), ids: ["game:systemAudio"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:systemAudio", self.settings.gameSystemAudio, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        let refresh = refreshState?() ?? (rates: [], current: 0, busy: false)
+        _ = row(ctx, "Refresh rate", "display", (0xB79BFF, 0x6A47D6), ids: ["display:90", "display:120"], x: rx, y: y, width: rw) { r in
+            let left = CGRect(x: r.maxX - 14 - 224, y: r.midY - 20, width: 106, height: 40)
+            self.button(ctx, "display:90", "90 Hz", left, symbol: refresh.current == 90 ? "checkmark" : nil,
+                        enabled: !refresh.busy && refresh.rates.contains(90), selected: refresh.current == 90)
+            self.button(ctx, "display:120", "120 Hz", left.offsetBy(dx: 118, dy: 0), symbol: refresh.current == 120 ? "checkmark" : nil,
+                        enabled: !refresh.busy && refresh.rates.contains(120), selected: refresh.current == 120)
+        }
+
+        drawVersion(x: x)
+    }
+
+    private func drawTracking(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        let y = section(ctx, "PS VR2 tracking", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        _ = row(ctx, "LED sync feedback", "lightbulb", (0xFFBF77, 0xBA7430), ids: ["tracking:led"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "tracking:led", self.settings.senseLEDFeedback, CGRect(x: r.maxX - 74, y: r.midY - 17, width: 60, height: 34))
+        }
+    }
+
+    private func drawFOV(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        var y = section(ctx, "Game field of view", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        y = row(ctx, "FOV crop", "crop", (0xF09283, 0xB02A45), ids: ["game:crop"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:crop", self.settings.gameCropEnabled, CGRect(x: r.maxX - 74, y: r.midY - 17, width: 60, height: 34))
+        }
+        y = sliderRow(ctx, "game:cropHorizontal", "Horizontal FOV", "arrow.left.and.right", (0x7FD3FF, 0x2A7FBF),
+                      "\(Int((settings.gameCropHorizontal * 100).rounded()))%", CGFloat((settings.gameCropHorizontal - 0.5) * 2),
+                      enabled: settings.gameCropEnabled, x: rx, y: y, width: rw)
+        y = sliderRow(ctx, "game:cropVertical", "Vertical FOV", "arrow.up.and.down", (0xB79BFF, 0x6A47D6),
+                      "\(Int((settings.gameCropVertical * 100).rounded()))%", CGFloat((settings.gameCropVertical - 0.5) * 2),
+                      enabled: settings.gameCropEnabled, x: rx, y: y, width: rw)
+        NightGlass.drawText("100% keeps the full field; lower values remove outer edges.", at: CGPoint(x: x, y: y + 8), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Pixel density stays the same. The inner eye edges are preserved.", at: CGPoint(x: x, y: y + 34), style: .caption, color: NightGlass.secondary, width: width)
+        let geometry = gameImageSettingsGeometry(settings)
+        NightGlass.drawText("\(geometry.renderSize.width)×\(geometry.renderSize.height) per eye at \(settings.gameRenderPercent)% render scale",
+                            at: CGPoint(x: x, y: y + 68), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Restart the game to apply FOV changes.", at: CGPoint(x: x, y: y + 102), style: .caption, color: NightGlass.secondary, width: width)
+    }
+
+    private func drawGameImage(_ ctx: CGContext, x: CGFloat, y start: CGFloat, width: CGFloat) {
+        var y = section(ctx, "Game image", x: x, y: start)
+        let rx = glass.minX + 14, rw = glass.width - 28
+        y = row(ctx, "FSR 1", "sparkles", (0x8FE39B, 0x2E9E5C), ids: ["game:fsr"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:fsr", self.settings.gameFSREnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("Reconstructs lower-resolution game frames before display.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 42
+        y = sliderRow(ctx, "game:scale", "Game render scale", "square.resize", (0x7FD3FF, 0x2A7FBF), "\(settings.gameRenderPercent)%",
+                      CGFloat(settings.gameRenderPercent - 50) / 50, x: rx, y: y, width: rw)
+        let geometry = gameImageSettingsGeometry(settings)
+        NightGlass.drawText("\(geometry.renderSize.width)×\(geometry.renderSize.height) → \(geometry.imageTarget.width)×\(geometry.imageTarget.height) per eye",
+                            at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Lower is faster; higher keeps more detail.", at: CGPoint(x: x, y: y + 30), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 60
+        y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:half:off", "game:half:on", "game:half:auto"], x: rx, y: y, width: rw) { r in
+            _ = self.segmented(ctx, GameHalfFrameRateMode.allCases.map {
+                ("game:half:" + $0.rawValue, $0.title, self.settings.gameHalfFrameRateMode == $0)
+            }, x: r.maxX - 14 - 234, y: r.midY - 22, width: 234)
+        }
+        NightGlass.drawText("Every other refresh: 60 game FPS at 120 Hz; 45 at 90 Hz.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Auto follows game performance and checks for recovery.", at: CGPoint(x: x, y: y + 26), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 54
+        y = row(ctx, "Spacewarp 2×", "square.stack.3d.up", (0x7FD3FF, 0x2A7FBF), ids: ["game:spacewarp"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:spacewarp", self.settings.gameSpacewarpEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("At 120 Hz: 60 game frames + 60 generated frames per second.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Auto generates only at half rate; Off shows real frames.", at: CGPoint(x: x, y: y + 26), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 54
+        y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:sharpening", self.settings.gameSharpeningEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        y = sliderRow(ctx, "game:sharpness", "Sharpness", "circle.lefthalf.filled", (0xB79BFF, 0x6A47D6), "\(Int((settings.gameSharpness * 100).rounded()))%",
+                      CGFloat(settings.gameSharpness), x: rx, y: y, width: rw)
+        NightGlass.drawText("Sharpening works with FSR on or off.", at: CGPoint(x: x, y: y + 8), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Restart the game to apply crop or render scale.", at: CGPoint(x: x, y: y + 34), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 70
+        y = row(ctx, "Performance HUD", "chart.xyaxis.line", (0x7FE3AB, 0x2D9460), ids: ["game:hud"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:hud", self.settings.gamePerformanceHUD, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("Game FPS, display FPS and pose-to-display time. Applies live.", at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
+    }
+
+    private func drawVersion(x: CGFloat) {
+        let version = "\(RuntimePaths.displayName) · core \(String(cString: halliday_core_version()))"
+        NightGlass.drawText(version, at: CGPoint(x: x, y: glass.maxY - 30), style: .caption, color: NightGlass.tertiary)
     }
 
     private static let rowHeight: CGFloat = 56
@@ -197,13 +343,14 @@ final class SettingsPanel: VRPanel {
 
     /// A row with a slider and its value at the right end.
     private func sliderRow(_ ctx: CGContext, _ id: String, _ title: String, _ symbol: String, _ colors: (UInt32, UInt32), _ value: String,
-                           _ fraction: CGFloat, x: CGFloat, y: CGFloat, width: CGFloat) -> CGFloat {
-        row(ctx, title, symbol, colors, ids: [id], x: x, y: y, width: width) { r in
+                           _ fraction: CGFloat, enabled: Bool = true, x: CGFloat, y: CGFloat, width: CGFloat) -> CGFloat {
+        row(ctx, title, symbol, colors, ids: enabled ? [id] : [], x: x, y: y, width: width) { r in
             let valueSize = NightGlass.textSize(value, style: .label, tabular: true)
             NightGlass.drawText(value, at: CGPoint(x: r.maxX - 14 - valueSize.width, y: r.midY - valueSize.height / 2), style: .label,
                                 color: NightGlass.secondary, tabular: true)
             let start = r.minX + 230, end = r.maxX - 14 - 64
-            self.tracks[id] = self.slider(ctx, id, row: CGRect(x: start, y: r.midY - 20, width: end - start, height: 40), fraction: fraction)
+            let track = self.slider(ctx, id, row: CGRect(x: start, y: r.midY - 20, width: end - start, height: 40), fraction: fraction, enabled: enabled)
+            if enabled { self.tracks[id] = track }
         }
     }
 

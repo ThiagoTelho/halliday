@@ -28,6 +28,7 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var renderer: Renderer?
     /// A VR game under Wine, through Halliday's OpenVR runtime (nil if the runtime isn't in the app).
     private var game: GameBridge?
+    private var gameImageReconfiguration: DispatchWorkItem?
     /// A game is showing its frames (the mouse turns the head, clicks are its controller's).
     /// A game under Wine is presenting (its frames fill the view; W/A/S/D walk whatever the mode).
     /// A game presents and has the input (Halliday isn't up over it).
@@ -38,6 +39,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var games: GamesPanel?
     private var gamesOpen = false
     private var lastGamesRefresh = 0.0
+    private let crossOverLauncher = CrossOverLauncher()
+    private var pendingCrossOverLaunches: Set<String> = []
     private var lastAwayTick = 0.0
     private let mouse = MouseLook()
     private var replay: TrackedSource?
@@ -46,41 +49,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var windowManager: WindowManager?
     private let mouseOwner = MouseOwner()
     /// The PS VR2 Sense controllers (SenseControllers.swift): the one in use aims Halliday's
-    /// pointer, its trigger clicks, its grip right-clicks, its stick scrolls, PS says "this is
-    /// straight ahead".
+    /// pointer, its trigger clicks, its grip right-clicks and its stick scrolls.
+    /// Hold PS to recenter; a tap in a game opens or closes Halliday's dashboard.
     private let sense = SenseControllers()
+    private weak var performanceHUDGame: GameBridge?
+    private var performanceHUDCollecting = false
+    private let systemGameAudio = SystemGameAudio()
     private var senseHand = SenseControllers.Hand.right
     private var senseButtons: [SenseControllers.Hand: SenseControllers.Buttons] = [:]
     private var senseSeeded: Set<SenseControllers.Hand> = []
     /// When a controller last moved or was pressed: it has the pointer until the mouse moves.
     private var senseActivity: CFTimeInterval = 0
     /// What turns a controller's sensor axes into where it points, per hand: a tilt about its
-    /// own x (the sensor sits tilted in the grip, and people hold it differently) and a heading
-    /// about y (it has no compass). Both are set by pointing at the middle of the view and
-    /// pressing PS, Create or Options (`calibrateSense`); the tilt is remembered.
-    /// Until a hand has been calibrated the tilt is 42°: what suits a controller held as usual.
-    private static let defaultSenseTilt: Float = 42 * .pi / 180
-    private var senseTilt: [SenseControllers.Hand: Float] = [
-        .left: UserDefaults.standard.object(forKey: "senseTilt.left") as? Float ?? defaultSenseTilt,
-        .right: UserDefaults.standard.object(forKey: "senseTilt.right") as? Float ?? defaultSenseTilt,
-    ]
+    /// own x (the sensor sits tilted in the grip) and a heading about y (no compass).
+    /// The original 42° mount correction remains until the user deliberately
+    /// calibrates from the game panel; controller button taps never retune it.
+    private var senseTilt: [SenseControllers.Hand: Float] = {
+        let saved = SenseAimDefaults.load(from: .standard)
+        return [.left: saved.left, .right: saved.right]
+    }()
     private var senseHeading: [SenseControllers.Hand: Float] = [:]
     /// True while a controller, not the mouse, has the pointer: the saber then leaves from the hand.
     private var senseHasPointer = false
 
-    /// A controller's orientation when the frame being drawn is seen: carried forward from its
-    /// newest report (they come 60 times a second over Bluetooth, and a frame takes about 30 ms
-    /// to reach the eyes) by its own angular velocity. Unpredicted, the pointer trailed the hand.
-    private func sensePredicted(_ state: SenseControllers.State) -> simd_quatf {
-        let ahead = min(0.08, state.age + Float((view?.lookaheadMs ?? 30) / 1000))
-        let turn = state.angularVelocity * ahead
-        let angle = simd_length(turn)
-        guard angle > 1e-5 else { return state.orientation }
-        return state.orientation * simd_quatf(angle: angle, axis: turn / angle)
+    /// One sensor-time target shared by position, orientation and public motion.
+    /// Resolve the sensor first; fixed pointer/game mounts are applied afterwards.
+    private func sensePredicted(_ hand: SenseControllers.Hand, _ state: SenseControllers.State,
+                                now: Double) -> SensePoseTimeline.Sample? {
+        SensePoseTimeline.sample(orientation: state.orientation, bodyAngular: state.angularVelocity,
+            sampleHostNs: state.sampleHostNs, reportAge: state.age, now: now,
+            frameTarget: HeadsetView.frameTarget, fallbackLead: (view?.lookaheadMs ?? 30) / 1000,
+            historical: { sense.orientation(hand, atHostNs: $0) })
     }
 
-    private func senseAim(_ hand: SenseControllers.Hand, _ orientation: simd_quatf) -> simd_quatf {
-        seenLean(hand) * simd_quatf(angle: senseHeading[hand] ?? 0, axis: [0, 1, 0]) * orientation * simd_quatf(angle: senseTilt[hand] ?? 0, axis: [1, 0, 0])
+    private func senseAim(_ hand: SenseControllers.Hand, _ orientation: simd_quatf, atTime: Double? = nil) -> simd_quatf {
+        seenLean(hand, atTime: atTime) * simd_quatf(angle: senseHeading[hand] ?? 0, axis: [0, 1, 0]) * orientation * simd_quatf(angle: senseTilt[hand] ?? SenseAimDefaults.tilt, axis: [1, 0, 0])
     }
 
     /// The lean the cameras see between a controller's IMU and the room (`HallidayHandFix.tilt`),
@@ -89,9 +92,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// moves (its accelerometer, pulling "up" towards gravity, is pulled aside too), which its
     /// filter undoes within a second or so: so it is taken while the controller is seen, and
     /// fades out over 0.3 s once it is not.
-    private func seenLean(_ hand: SenseControllers.Hand) -> simd_quatf {
+    private func seenLean(_ hand: SenseControllers.Hand, atTime: Double? = nil) -> simd_quatf {
         guard let lean = leanSeen[hand] else { return simd_quatf(ix: 0, iy: 0, iz: 0, r: 1) }
-        let since = Float(max(0, CACurrentMediaTime() - lean.time - 0.1))
+        let since = Float(max(0, (atTime ?? CACurrentMediaTime()) - lean.time - 0.1))
         let v = lean.turn * exp(-since / 0.3)
         let angle = simd_length(v)
         return angle > 1e-5 ? simd_quatf(angle: angle, axis: v / angle) : simd_quatf(ix: 0, iy: 0, iz: 0, r: 1)
@@ -102,6 +105,9 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private func calibrateSense(_ hand: SenseControllers.Hand, _ orientation: simd_quatf, head: HeadPose, tilt: Bool) {
         let look = Self.angles(of: head.orientation.act(SIMD3<Float>(0, 0, -1)))
         if tilt {
+            // A deliberate new calibration replaces the previous manual offset,
+            // even when the cameras have no recent heading for this hand.
+            headingOffset[hand] = nil
             // The tilt whose aim is as high as the head looks (a scan: roll makes it no formula).
             var best: (tilt: Float, off: Float) = (0, .infinity)
             let leaned = seenLean(hand) * orientation
@@ -234,7 +240,14 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var keyboardOpen = false
     /// The full Settings panel, while open.
     private var settingsPanel: SettingsPanel?
-    private var settingsOpen = false
+    private var settingsOpen = false {
+        didSet {
+            // Covers Close, Esc, another overlay and All settings, including future routes.
+            if settingsOpen != oldValue, gameAway, game?.isPresenting == true { placeGameBar() }
+        }
+    }
+    private let automaticVRPolicy = AutomaticVRPolicy(url: GameBridge.folder.appendingPathComponent("runtime-policy.json"))
+    private var lastAutomaticVRPoll = -Double.infinity
     /// A window being resized by its bar's grip: where the pointer met the window's plane when it
     /// began (in the plane's own coordinates, meters), the size it had, and when it was last applied.
     private var resizing: (window: CGWindowID, origin: SIMD3<Float>, orientation: simd_quatf, start: SIMD2<Float>,
@@ -299,6 +312,41 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// The user captured the mouse for VR (by clicking in the scene) and hasn't released it. Only
     /// then is the lock re-applied when Halliday becomes active again.
     private var pointerEngaged = false
+    private var pendingExplicitDesktopCapture = false
+    private var gameResumeFocusTarget: GameResumeFocus.Target?
+    private var gameMenuFocusRevision: UInt64 = 0
+    private var controllerPointerPolicy: ControllerPointerPolicy {
+        ControllerPointerPolicy(physicalHeadset: onHeadset,
+            realControllersAvailable: !sense.connected.isEmpty, gamePresenting: game?.isPresenting == true)
+    }
+    /// Physical HMD output never participates in the desktop focus chain.
+    /// A running game includes its paused Halliday dashboard.
+    private func activateSceneApplication() {
+        guard game?.isPresenting != true, !(window is HeadsetWindow) else { return }
+        NSApp.activate()
+    }
+
+    private func raiseSceneWindowForDesktopInput() {
+        guard game?.isPresenting != true, let window else { return }
+        if window is HeadsetWindow { window.orderFront(nil) }
+        else { window.makeKeyAndOrderFront(nil) }
+    }
+
+    /// Retire desktop ownership before routing another controller report.
+    /// No per-frame native cursor motion or application activation is needed.
+    private func syncControllerDesktopOwnership() {
+        let policy = controllerPointerPolicy
+        let wasOwned = mouseOwner.isOn
+        mouseOwner.setControllerEventsAllowed(policy.allowsNativeControllerEvents)
+        if !policy.allowsNativeControllerEvents {
+            pointerEngaged = false
+            focusWasEngaged = false
+            pendingExplicitDesktopCapture = false
+            setPointerLock(false)
+            if wasOwned { mouseOwnershipChanged(false) }
+        }
+    }
+
     /// Halliday's output is the headset's display (its window is the borderless `HeadsetWindow`).
     private var onHeadset = false
     private var lastControlTap: CFTimeInterval = 0
@@ -307,6 +355,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     private var testHeadset: VirtualDisplay?
     /// The headset display's rate (90 without one), told to games.
     private var headsetHz: Float = 90
+    private var refreshSwitchTask: Task<Void, Never>?
+    private var preferredRefreshKey: String?
 
     init(replayPath: String?) {
         self.replayPath = replayPath
@@ -343,7 +393,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
         let headsetScreen = launchArgs.contains("--ignore-headset-at-launch") || launchArgs.contains("--ignore-headset") ? nil : NSScreen.screens.first { screen in
             screen.convertRectToBacking(screen.frame).size == headsetPanelPixels
         }
-        headsetHz = headsetScreen.map { Float($0.maximumFramesPerSecond) } ?? 90
+        let initialHz = headsetScreen.map(Self.physicalRefreshRate) ?? 90
+        headsetHz = initialHz > 0 ? initialHz : 90
         LateLatch.displayHz = headsetHz
         let renderer: Renderer
         do {
@@ -415,6 +466,15 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
             environments?.apply(CommandLine.arguments[i + 1])
         }
         Settings.shared.onChange = { [weak self] in self?.applySettings() }
+        Settings.shared.onGameCropChange = { [weak self] in
+            self?.settingsPanel?.setNeedsDisplay()
+            self?.scheduleGameImageReconfiguration()
+        }
+        Settings.shared.onGamePerformanceHUDChange = { [weak self] in
+            self?.settingsPanel?.setNeedsDisplay()
+            self?.updatePerformanceHUD()
+        }
+        systemGameAudio.onStatus = { status in log("[game audio] \(status.displayText)") }
         applySettings()
         video = try? VideoPlayer(renderer: renderer)
         applyVolume()
@@ -563,7 +623,10 @@ if !open, passthroughForVideo {
         }
         view.onFrame = { [weak self] head in self?.frameTick(head: head) }
         window.contentView = view
-        window.makeKeyAndOrderFront(nil)
+        if window is HeadsetWindow {
+            window.ignoresMouseEvents = true
+            window.orderFront(nil)
+        } else { window.makeKeyAndOrderFront(nil) }
         if headsetScreen != nil {
             log("[display] Halliday's window on \(window.screen?.localizedName ?? "no screen") at \(window.frame), \(window.screen?.maximumFramesPerSecond ?? 0) Hz")
         }
@@ -573,7 +636,19 @@ if !open, passthroughForVideo {
         // A headset plugged in later is taken on when its display appears (a display's mode
         // settles over a moment: looked at a second after macOS says the displays changed).
         screensObserver = NotificationCenter.default.addObserver(forName: NSApplication.didChangeScreenParametersNotification, object: nil, queue: .main) { [weak self] _ in
-            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated { _ = self?.lookForHeadset() } }
+            MainActor.assumeIsolated {
+                if self?.headsetDisplayNow == nil {
+                    self?.preferredRefreshKey = nil
+                    self?.refreshSwitchTask?.cancel()
+                }
+            }
+            DispatchQueue.main.asyncAfter(deadline: .now() + 1) { MainActor.assumeIsolated {
+                guard let self else { return }
+                if self.headsetWindow != nil, let screen = self.headsetDisplayNow {
+                    self.adoptHeadsetRefresh(Self.physicalRefreshRate(screen), screen: screen)
+                }
+                _ = self.lookForHeadset()
+            } }
         }
         updateTitle()
         log("[keys] video: O file browser (⇧O Mac dialog) · V watch the browser's video in VR · Space play/pause · ←/→ ±10 s · F projection · G stereo · C subtitles · R recenter · X close")
@@ -582,7 +657,7 @@ if !open, passthroughForVideo {
         log("[keys] click a VR window to use it; Control twice, Option+Esc or a click on empty space returns to Halliday")
         // Tests (`open -g … --args --no-activate`): stay in the background, so the user's typing in
         // another app never lands in Halliday.
-        if !CommandLine.arguments.contains("--no-activate") { NSApp.activate() }
+        if !CommandLine.arguments.contains("--no-activate") { activateSceneApplication() }
         // Moving windows onto the virtual display must always be the user's explicit choice (M),
         // and Halliday must never come back by itself after a restart or log-in.
         NSApp.disableRelaunchOnLogin()
@@ -865,6 +940,7 @@ if !open, passthroughForVideo {
     /// otherwise focus is only taken when the window had to be recovered, so activating Halliday
     /// through its browser window doesn't steal the keyboard from it.
     private func bringPreviewIntoView(front: Bool = false) {
+        guard game?.isPresenting != true else { return }
         guard let window, window.styleMask.contains(.titled) else { return } // headset output: not a preview
         var recovered = false
         if window.isMiniaturized {
@@ -883,18 +959,31 @@ if !open, passthroughForVideo {
             log("[display] brought the Halliday window back onto \(main.localizedName)")
             recovered = true
         }
-        if front || recovered { window.makeKeyAndOrderFront(nil) }
+        if front || recovered { raiseSceneWindowForDesktopInput() }
     }
 
     func applicationDidBecomeActive(_ notification: Notification) {
         bringPreviewIntoView()
+        let activationCapture = controllerPointerPolicy.activationCapture(explicitPending: pendingExplicitDesktopCapture)
+        pendingExplicitDesktopCapture = false
+        guard let activationCapture else {
+            pointerEngaged = false
+            setPointerLock(false)
+            return
+        }
+        if activationCapture == .explicitDesktopMouse {
+            pointerEngaged = true
+            setPointerLock(true, force: true, intent: activationCapture)
+            pendingExplicitDesktopCapture = false
+            return
+        }
         // On the headset nobody can click the scene to capture the mouse (its display can't be
         // seen from the Mac): being the active app is the capture. Control twice, or another app,
         // frees it.
         // (Not when the click that activated Halliday was on the companion: its mouse is the Mac's.)
         if onHeadset, !mouseOwner.isOn, !companionIsFront {
             pointerEngaged = true
-            window?.makeKeyAndOrderFront(nil)
+            raiseSceneWindowForDesktopInput()
             window?.makeFirstResponder(view)
         }
         // The lock only takes effect while Halliday is the active app, and activation happens a
@@ -915,9 +1004,18 @@ if !open, passthroughForVideo {
     /// moving, so there is a single cursor (the VR pointer) and no edges or warps to fight.
     /// `force` re-applies the lock even if it is already marked on (macOS drops it while another
     /// app is active).
-    private func setPointerLock(_ on: Bool, force: Bool = false) {
-        guard force || on != pointerLocked, let view else { return }
+    private func setPointerLock(_ requested: Bool, force: Bool = false,
+                                intent: ControllerPointerPolicy.CaptureIntent = .automatic) {
+        if !requested { pendingExplicitDesktopCapture = false }
+        else if intent == .explicitDesktopMouse { pendingExplicitDesktopCapture = true }
+        let on = requested && controllerPointerPolicy.allowsCapture(intent)
+        if requested && !on {
+            pointerEngaged = false; focusWasEngaged = false
+            pendingExplicitDesktopCapture = false
+        }
+        guard (force && on) || on != pointerLocked, let view else { return }
         pointerLocked = on
+        view.hidesDesktopCursor = on
         if on {
             if let center = view.globalCenter {
                 view.skipNextDelta = true
@@ -927,9 +1025,8 @@ if !open, passthroughForVideo {
         } else {
             CGAssociateMouseAndMouseCursorPosition(1)
             // Never leave the Mac's cursor on the headset's display, where it can't be seen.
-            if onHeadset, !mouseOwner.isOn {
-                let main = CGDisplayBounds(CGMainDisplayID())
-                CGWarpMouseCursorPosition(CGPoint(x: main.midX, y: main.midY))
+            if onHeadset, !mouseOwner.isOn, !controllerPointerPolicy.gamePresenting {
+                CGWarpMouseCursorPosition(MouseOwner.desktopParkingPoint)
             }
         }
         updateTitle()
@@ -954,6 +1051,12 @@ if !open, passthroughForVideo {
 
     func applicationWillTerminate(_ notification: Notification) {
         log("[app] quitting: releasing the mouse and putting windows back")
+        automaticVRPolicy.shutdown(now: Date())
+        systemGameAudio.stop()
+        refreshSwitchTask?.cancel()
+        discardHandTrackingWork()
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
         // A game in Halliday is asked to quit too (as SteamVR's do): it reads the request from the
         // bridge it still maps after Halliday closes it.
         game?.requestQuit()
@@ -979,7 +1082,7 @@ if !open, passthroughForVideo {
             path = p
         } else {
             // No recording given: generate a synthetic one in the caches folder.
-            let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent("Halliday")
+            let dir = FileManager.default.urls(for: .cachesDirectory, in: .userDomainMask)[0].appendingPathComponent(RuntimePaths.folderName)
             try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
             path = dir.appendingPathComponent("synthetic-look-around.hrec").path
             if !FileManager.default.fileExists(atPath: path) {
@@ -1235,7 +1338,16 @@ if !open, passthroughForVideo {
     /// it goes. On whenever Halliday runs on the headset; `--no-hands` turns it off (`--hands`, the
     /// switch it was behind at first, is still taken and changes nothing).
     private static let trackHands = !CommandLine.arguments.contains("--no-hands")
-    private var handTrackers: [SenseControllers.Hand: OpaquePointer] = [:]
+    private var handTrackingWorker: HandTrackingWorker?
+    private var handExposureStaging = HandExposureStaging()
+    private var handWorkerEpoch: UInt64 = 0
+    private var handTrackingSource: ObjectIdentifier?
+    private var lastHandResultExposure: Int64 = 0
+    private var handCameraSource: ObjectIdentifier?
+    private var handCameraIdentity: String?
+    private var handCameraProfile: CameraTrackingCalibration?
+    private var handCameraProfilePolled: CFTimeInterval = -.infinity
+    private var handFisheyeAlignment = SIMD3<Float>.zero
     /// Where each controller was last seen, in the room, when (`CACurrentMediaTime`: when it was
     /// found, and the exposure's own time in seconds), and how fast it was moving, m/s.
     private var handPlaces: [SenseControllers.Hand: (position: SIMD3<Float>, time: CFTimeInterval, exposed: Double, velocity: SIMD3<Float>)] = [:]
@@ -1308,6 +1420,12 @@ if !open, passthroughForVideo {
         }
         guard now - ledSyncTime >= 0.1 else { return }
         ledSyncTime = now
+        if Settings.shared.senseLEDFeedback {
+            sense.synchronizeLEDs(counter: Int64(v.counter), exposureHostNs: v.exposureHostNs,
+                periodNs: exposurePeriod, centreOffsetNs: Int64(ledOffsetMs * 1e6),
+                excluding: [])
+            return
+        }
         // A pulse at the newest exposure (already past, as Monado gives it), and one every period
         // after it. With a moment still to come, 50 ms ahead, the LEDs never lit at any offset.
         let target = v.exposureHostNs + Int64(ledOffsetMs * 1e6)
@@ -1320,14 +1438,14 @@ if !open, passthroughForVideo {
 
     /// A controller's place for drawing, while it was seen within the last three seconds.
     /// Called once a frame for the hand that points.
-    private func handPlace(_ hand: SenseControllers.Hand) -> SIMD3<Float>? {
+    private func handPlace(_ hand: SenseControllers.Hand, atNs targetNs: Int64? = nil) -> SIMD3<Float>? {
         // The cameras' fixes fused with the controller's accelerometer, for the moment this
         // frame is seen (`tracking/place.rs`): between fixes, through short losses, and ahead
         // across the 30 to 40 ms a fix is old by the time it is drawn. `--no-hand-fusion`
         // for what was done before (the newest fix carried along its velocity, and eased).
         if Self.fusesHands {
-            let seen = HeadsetView.frameTarget > 0 ? HeadsetView.frameTarget : CACurrentMediaTime()
-            return sense.place(hand, atNs: Int64(seen * 1e9))?.position
+            let seen = targetNs ?? Int64((HeadsetView.frameTarget > 0 ? HeadsetView.frameTarget : CACurrentMediaTime()) * 1e9)
+            return sense.place(hand, atNs: seen)?.position
         }
         let now = CACurrentMediaTime()
         guard let p = handPlaces[hand], now - p.time < 3 else { handShown[hand] = nil; return nil }
@@ -1336,7 +1454,7 @@ if !open, passthroughForVideo {
         // for a moment it would stand still in the air and then jump. The motion dies away
         // (in 120 ms it has gone two thirds of as far as it will): a hand that was moving
         // drifts on and comes to rest, not farther than 0.12 s of its speed.
-        let since = Float(max(0, now - p.exposed))
+        let since = Float(max(0, (targetNs.map { Double($0) * 1e-9 } ?? now) - p.exposed))
         let fade: Float = 0.12
         let target = p.position + p.velocity * (fade * (1 - exp(-since / fade)))
         // What is drawn eases to that (25 ms): a controller found again after a gap glides to
@@ -1349,54 +1467,175 @@ if !open, passthroughForVideo {
         handShown[hand] = (position, now)
         return position
     }
+
+    /// Motion uses the same sensor target and world calibration as the hand pose.
+    /// Fixed local mounts do not change the measured sensor gyro axes.
+    private func gameHandMotion(_ hand: SenseControllers.Hand, state: SenseControllers.State,
+                                now: Double, sample: SensePoseTimeline.Sample) -> GameControllerMotion {
+        let seen = sample.targetSeconds
+        let linear: SIMD3<Float>?
+        if Self.fusesHands {
+            linear = sense.place(hand, atNs: Int64(seen * 1e9))?.velocity
+        } else if let place = handPlaces[hand] {
+            // Derivative of the legacy display's existing decaying continuation.
+            linear = place.velocity * exp(-Float(max(0, seen - place.exposed)) / 0.12)
+        } else { linear = nil }
+        // Raw Sense gyro is in SENSOR axes. The final mount tilt changes the
+        // aim's local axes, so remove that fixed right-hand transform before
+        // rotating the gyro into the room. Keep all existing calibration values.
+        let mount = simd_quatf(angle: senseTilt[hand] ?? SenseAimDefaults.tilt, axis: [1, 0, 0])
+        let sensorInRoom = senseAim(hand, sample.orientation, atTime: seen) * mount.inverse
+        return GameControllerMotion.sample(linearWorld: linear, bodyAngular: state.angularVelocity,
+            sensorInRoom: sensorInRoom, reportAge: state.age,
+            opticalAge: handPlaces[hand].map { now - $0.exposed }, now: now)
+    }
     private var handShown: [SenseControllers.Hand: (position: SIMD3<Float>, time: CFTimeInterval)] = [:]
     private static let fusesHands = !CommandLine.arguments.contains("--no-hand-fusion")
-    /// What the cameras add to each controller's own heading, eased, and what the user's own
-    /// calibration (pointing and pressing PS) adds to that.
+    /// What the cameras add to each controller's own heading, eased, and what an
+    /// intentional calibration from the game panel adds to that.
     private var seenHeading: [SenseControllers.Hand: Float] = [:]
     private var headingOffset: [SenseControllers.Hand: Float] = [:]
     /// The cameras' lean for each controller (a rotation vector about the room's x and z), eased,
     /// and when it was last seen: `seenLean`.
     private var leanSeen: [SenseControllers.Hand: (turn: SIMD3<Float>, time: CFTimeInterval)] = [:]
 
-    /// One new exposure of both bottom cameras: each connected controller looked for.
-    private func trackHands(_ headset: Headset) {
-        guard let l = headset.cameraView(0), let r = headset.cameraView(1), l.counter == r.counter, l.counter != handExposure,
-              l.exposureHostNs != 0, let head = headset.predict(atHostNs: l.exposureHostNs) else { return }
-        handExposure = l.counter
-        handExposures += 1
-        sweepSeen.exposures += 1
-        sweepSeen.spots += l.spots.filter { $0.area >= 4 && $0.area <= 400 }.count
-        let spots = { (v: Headset.CameraView) in v.spots.map { HallidayCameraSpot(x: $0.x, y: $0.y, area: UInt32($0.area), peak: UInt32($0.peak)) } }
-        let (left, right) = (spots(l), spots(r))
-        // The top cameras' pictures of the same exposure, when they have arrived.
-        let top = [2, 3].map { view in headset.cameraView(view).flatMap { $0.counter == l.counter ? spots($0) : nil } ?? [] }
-        let headQ = [head.orientation.imag.x, head.orientation.imag.y, head.orientation.imag.z, head.orientation.real]
+    /// Identity is cached by Headset; only the tiny optional profile file is read here.
+    /// Applying another camera geometry retires every old optical result/history.
+    private func refreshHandCameraProfile(_ headset: Headset) {
+        let source = ObjectIdentifier(headset), now = CACurrentMediaTime()
+        let newSource = handCameraSource != source
+        guard newSource || now - handCameraProfilePolled >= 1 else { return }
+        handCameraProfilePolled = now
+        let identity = headset.hardwareIdentity
+        let profile = Self.bottomFisheyes ? CameraTrackingProfiles.load(for: identity,
+            from: RuntimePaths.support.appendingPathComponent("camera-tracking-calibration.json")) : nil
+        let alignment = profile?.rightFisheyeRotation ?? .zero
+        let changed = newSource || identity != handCameraIdentity || profile != handCameraProfile || alignment != handFisheyeAlignment
+        handCameraSource = source
+        handCameraIdentity = identity
+        handCameraProfile = profile
+        handFisheyeAlignment = alignment
+        if changed {
+            discardHandTrackingWork()
+            clearOpticalHandHistory()
+            log("[hands] camera geometry: \(profile == nil ? "default" : "calibrated")")
+        }
+    }
+
+    private func clearOpticalHandHistory() {
+        handExposureStaging.reset()
         for hand in SenseControllers.Hand.allCases {
-            guard let state = sense.state(hand), state.settled else { continue }
-            if handTrackers[hand] == nil {
-                handTrackers[hand] = halliday_hand_open(hand == .left)
-                halliday_hand_set_fisheyes(handTrackers[hand], Self.bottomFisheyes)
+            // Remove the previous camera correction, retaining the user's own
+            // heading/mount offsets until a new optical result is accepted.
+            if let seen = seenHeading[hand], let current = senseHeading[hand] {
+                senseHeading[hand] = current - seen
             }
-            let q = state.orientation
-            var fix = HallidayHandFix()
-            guard halliday_hand_update(handTrackers[hand], headQ, [q.imag.x, q.imag.y, q.imag.z, q.real],
-                                       left, UInt32(left.count), right, UInt32(right.count),
-                                       top[0], UInt32(top[0].count), top[1], UInt32(top[1].count), &fix) else { continue }
+            sense.clearOpticalPlace(hand)
+        }
+        handPlaces.removeAll()
+        handShown.removeAll()
+        seenHeading.removeAll()
+        leanSeen.removeAll()
+        handStats.removeAll()
+        handExposure = -1
+        handExposures = 0
+    }
+
+    /// Snapshot one exposure on the display actor; the optical solver never blocks it.
+    private func trackHands(_ headset: Headset) {
+        refreshHandCameraProfile(headset)
+        let source = ObjectIdentifier(headset)
+        if handTrackingSource != source {
+            if handTrackingWorker != nil { discardHandTrackingWork() }
+            handTrackingSource = source
+            handExposure = -1
+        }
+        let nowNs = hostTimeNs()
+        if let l = headset.cameraView(0), let r = headset.cameraView(1), l.counter == r.counter {
+            if l.counter < handExposure { discardHandTrackingWork() }
+            if l.counter != handExposure, l.exposureHostNs != 0,
+               let head = headset.predict(atHostNs: l.exposureHostNs) {
+                handExposure = l.counter
+                handExposures += 1
+                sweepSeen.exposures += 1
+                sweepSeen.spots += l.spots.filter { $0.area >= 4 && $0.area <= 400 }.count
+                let spots = { (v: Headset.CameraView) in v.spots.map { HandTrackingWorker.Spot(x: $0.x, y: $0.y, area: UInt32($0.area), peak: UInt32($0.peak)) } }
+                let (left, right) = (spots(l), spots(r))
+                let top = [2, 3].map { view in headset.cameraView(view).flatMap { $0.counter == l.counter ? spots($0) : nil } ?? [] }
+                var expected: Set<Int> = []
+                let orientations = SenseControllers.Hand.allCases.compactMap { hand -> HandTrackingWorker.HandOrientation? in
+                    guard let state = sense.state(hand), state.settled,
+                          state.age.isFinite, state.age >= 0, Double(state.age) <= GameControllerMotion.freshness else { return nil }
+                    expected.insert(hand.rawValue)
+                    guard let q = sense.orientation(hand, atHostNs: l.exposureHostNs) else { return nil }
+                    return HandTrackingWorker.HandOrientation(index: hand.rawValue, orientation: q.vector)
+                }
+                let frame = HandTrackingWorker.Frame(counter: l.counter, exposureHostNs: l.exposureHostNs,
+                    headOrientation: head.orientation.vector, headPosition: head.position, heightLift: usb?.heightLift ?? 0,
+                    handOrientations: orientations, views: [left, right, top[0], top[1]], fisheyes: Self.bottomFisheyes,
+                    fisheyeAlignment: handFisheyeAlignment, trackingGeneration: head.trackingGeneration)
+                handExposureStaging.insert(frame, expected: expected, nowNs: nowNs)
+            }
+        }
+        // Retry between camera arrivals too: a late Bluetooth bracket must be
+        // attached to its original exposure, not silently erase this hand.
+        guard let ready = handExposureStaging.ready(nowNs: nowNs, orientation: { index, exposure in
+            guard let hand = SenseControllers.Hand(rawValue: index) else { return nil }
+            return sense.orientation(hand, atHostNs: exposure)?.vector
+        }) else { return }
+        if handTrackingWorker == nil {
+            handWorkerEpoch &+= 1
+            let epoch = handWorkerEpoch
+            handTrackingWorker = HandTrackingWorker { [weak self] output in
+                Task { @MainActor [weak self] in
+                    guard let self, self.handWorkerEpoch == epoch,
+                          self.handTrackingWorker?.isCurrent(output) == true else { return }
+                    self.applyHandTracking(output)
+                }
+            }
+        }
+        handTrackingWorker?.submit(ready)
+    }
+
+    private func discardHandTrackingWork() {
+        handExposureStaging.reset()
+        handWorkerEpoch &+= 1
+        handTrackingWorker?.close()
+        handTrackingWorker = nil
+        lastHandResultExposure = 0
+    }
+
+    /// Keep the exposure's original head pose and time; only result delivery changes threads.
+    private func applyHandTracking(_ output: HandTrackingWorker.Output) {
+        guard let headset = usb?.headset, headset.linkState == .connected,
+              handTrackingSource == ObjectIdentifier(headset) else { return }
+        let frame = output.frame
+        if frame.trackingGeneration != 0, let current = lastHead?.trackingGeneration,
+           current != 0, current != frame.trackingGeneration { return }
+        guard frame.fisheyes == Self.bottomFisheyes, frame.fisheyeAlignment == handFisheyeAlignment else { return }
+        let age = hostTimeNs() - frame.exposureHostNs
+        guard frame.exposureHostNs > lastHandResultExposure, age >= -20_000_000, age <= 250_000_000 else { return }
+        lastHandResultExposure = frame.exposureHostNs
+        let headOrientation = simd_quatf(vector: frame.headOrientation)
+        for fix in output.fixes {
+            guard let hand = SenseControllers.Hand(rawValue: fix.index), sense.state(hand)?.settled == true else { continue }
             // From the head's frame at the exposure to the room, at the height Halliday shows.
-            var at = head.position + head.orientation.act(SIMD3(fix.position.0, fix.position.1, fix.position.2))
-            at.y += usb?.heightLift ?? 0
-            let exposed = Double(l.exposureHostNs) * 1e-9
+            var at = frame.headPosition + headOrientation.act(fix.position)
+            at.y += frame.heightLift
+            let exposed = Double(frame.exposureHostNs) * 1e-9
             var velocity = SIMD3<Float>.zero
             if let before = handPlaces[hand], exposed - before.exposed > 0, exposed - before.exposed < 0.06 {
                 // Half the newest step, half what it was: a place is steady to under a millimeter.
                 velocity = simd_mix(before.velocity, (at - before.position) / Float(exposed - before.exposed), SIMD3(repeating: 0.5))
             }
             handPlaces[hand] = (at, CACurrentMediaTime(), exposed, velocity)
-            sense.placeFix(hand, ns: l.exposureHostNs, at)
+            sense.placeFix(hand, ns: frame.exposureHostNs, at)
             // The controller has no compass, and its heading drifts (up to 12° a minute): the
             // cameras see where it really points. Eased, and taken the short way round.
             if fix.sightings >= 8 {
+                if Settings.shared.senseLEDFeedback {
+                    sense.confirmLEDVisibility(hand, counter: Int64(frame.counter), exposureHostNs: frame.exposureHostNs)
+                }
                 var heading = fix.heading
                 if let before = seenHeading[hand] {
                     let step = atan2(sin(heading - before), cos(heading - before))
@@ -1406,7 +1645,7 @@ if !open, passthroughForVideo {
                 sense.setRoomYaw(hand, heading)
                 senseHeading[hand] = heading + (headingOffset[hand] ?? 0)
                 // The lean too (solved from eight sightings on, held near its running value).
-                let lean = SIMD3<Float>(fix.tilt.0, 0, fix.tilt.1)
+                let lean = SIMD3<Float>(fix.tilt.x, 0, fix.tilt.y)
                 let before = leanSeen[hand].map { CACurrentMediaTime() - $0.time < 0.5 ? $0.turn : .zero } ?? .zero
                 leanSeen[hand] = (simd_mix(before, lean, SIMD3(repeating: 0.3)), CACurrentMediaTime())
             }
@@ -1421,6 +1660,8 @@ if !open, passthroughForVideo {
     private var ledsStarted = false
     private var cameraDump: FileHandle?
     private var cameraDumped = [Int](repeating: -1, count: 4)
+    private var cameraDumpStarted: CFTimeInterval?
+    private var cameraDumpFinished = false
 
     // --- Passthrough (ROADMAP W11 E.4): the room through the headset's bottom cameras ---
 
@@ -1491,7 +1732,19 @@ if !open, passthroughForVideo {
 
     private func updateCameras() {
         // (Passthrough needs the cameras too: with hand tracking off, mode 1, the bottom pair.)
-        guard let mode = Self.cameraMode ?? (passthrough ? (Self.wideCameras ? 0x10 : 1) : nil), let headset = usb?.headset, headset.linkState == .connected else { return }
+        guard let headset = usb?.headset, headset.linkState == .connected else {
+            if handTrackingWorker != nil { discardHandTrackingWork() }
+            if handTrackingSource != nil { clearOpticalHandHistory() }
+            handTrackingSource = nil
+            handCameraSource = nil
+            handCameraIdentity = nil
+            handCameraProfile = nil
+            handCameraProfilePolled = -.infinity
+            handFisheyeAlignment = .zero
+            handExposure = -1
+            return
+        }
+        guard let mode = Self.cameraMode ?? (passthrough ? (Self.wideCameras ? 0x10 : 1) : nil) else { return }
         let a = CommandLine.arguments
         if !cameraStarted {
             cameraStarted = true
@@ -1502,14 +1755,17 @@ if !open, passthroughForVideo {
         if let i = a.firstIndex(of: "--leds"), !ledsStarted, SenseControllers.Hand.allCases.allSatisfy({ sense.state($0) != nil }) {
             ledsStarted = true
             let cycle = (i + 1 < a.count ? Double(a[i + 1]) : nil) ?? 1000.0 / 60
-            log("[cameras] LEDs pulsing every \(String(format: "%.3f", cycle)) ms: \(sense.setLEDs(phase: 1, cycle: cycle / 1000)) controller(s) took it")
+            log("[cameras] LED pulse every \(String(format: "%.3f", cycle)) ms queued for \(sense.setLEDs(phase: 1, cycle: cycle / 1000)) controller(s)")
         }
         if Self.trackHands {
             // The LEDs are asked for again whenever a controller arrives (or comes back from sleep).
             let connected = Set(SenseControllers.Hand.allCases.filter { sense.state($0) != nil })
             if connected != ledHands {
+                handExposureStaging.reset()
+                handTrackingWorker?.reset()
+                lastHandResultExposure = 0
                 if !connected.subtracting(ledHands).isEmpty {
-                    log("[hands] LEDs pulsing: \(sense.setLEDs(phase: 1)) controller(s) took it")
+                    log("[hands] LED pulse queued for \(sense.setLEDs(phase: 1)) controller(s)")
                 }
                 ledHands = connected
             }
@@ -1518,16 +1774,28 @@ if !open, passthroughForVideo {
         }
         // `--camera-dump FILE`: every new frame's spots, with the controllers' orientations and
         // the head's pose, a line of text each, for working the geometry out afterwards.
-        if let i = a.firstIndex(of: "--camera-dump"), i + 1 < a.count {
+        if !cameraDumpFinished, let i = a.firstIndex(of: "--camera-dump"), i + 1 < a.count {
             if cameraDump == nil {
                 FileManager.default.createFile(atPath: a[i + 1], contents: nil)
                 cameraDump = FileHandle(forWritingAtPath: a[i + 1])
+                cameraDumpStarted = CACurrentMediaTime()
             }
-            for view in 0..<4 {
+            let duration = a.firstIndex(of: "--camera-dump-seconds").flatMap {
+                $0 + 1 < a.count ? Double(a[$0 + 1]) : nil
+            }.flatMap { $0.isFinite && $0 > 0 ? $0 : nil }
+            if let duration, let started = cameraDumpStarted, CACurrentMediaTime() - started >= duration {
+                try? cameraDump?.close()
+                cameraDump = nil
+                cameraDumpFinished = true
+                log("[hands diagnostic] camera capture completed")
+            }
+            for view in 0..<4 where !cameraDumpFinished {
                 guard let v = headset.cameraView(view), v.counter != cameraDumped[view] else { continue }
                 cameraDumped[view] = v.counter
                 var line = "frame \(v.counter) view \(view) t \(v.exposureHostNs) size \(v.width) \(v.height) spots"
-                for spot in v.spots.prefix(40) { line += String(format: " %.2f,%.2f,%d,%d", spot.x, spot.y, spot.area, spot.peak) }
+                for spot in v.spots.filter({ (4...450).contains($0.area) }).prefix(128) {
+                    line += String(format: " %.2f,%.2f,%d,%d", spot.x, spot.y, spot.area, spot.peak)
+                }
                 // Each controller's orientation is its newest report's: `…-at` is when that
                 // arrived (host ns) and `…-rate` how fast it was turning (rad/s), so the
                 // orientation at the exposure can be worked out afterwards.
@@ -1538,6 +1806,10 @@ if !open, passthroughForVideo {
                     line += String(format: " %@ %.5f,%.5f,%.5f,%.5f", hand.name, q.imag.x, q.imag.y, q.imag.z, q.real)
                     line += " \(hand.name)-at \(now - Int64(Double(st.age) * 1e9))"
                     line += String(format: " %@-rate %.4f,%.4f,%.4f", hand.name, st.angularVelocity.x, st.angularVelocity.y, st.angularVelocity.z)
+                    line += " \(hand.name)-settled \(st.settled ? 1 : 0) \(hand.name)-reports \(st.reports) \(hand.name)-ticks \(st.deviceTicks)"
+                    if let clock = handClocks[hand], let offset = clock.offsets.min() {
+                        line += " \(hand.name)-clock-offset \(offset) \(hand.name)-clock-samples \(clock.offsets.count)"
+                    }
                 }
                 // The head where it was at the exposure, not where the frame being drawn has it.
                 if let h = headset.predict(atHostNs: v.exposureHostNs) ?? lastHead {
@@ -1559,6 +1831,14 @@ if !open, passthroughForVideo {
             cameraFrames[view] = v.frames
         }
         log("[cameras] " + (parts.isEmpty ? "no frames yet" : parts.joined(separator: " · ")))
+        if a.contains("--hand-diagnostics") || a.contains("--camera-dump") {
+            for hand in SenseControllers.Hand.allCases {
+                guard let state = sense.state(hand) else { log("[hands diagnostic] \(hand.name) disconnected"); continue }
+                let offset = handClocks[hand]?.offsets.min().map { String($0) } ?? "unknown"
+                log(String(format: "[hands diagnostic] %@ settled=%d reports=%d missed=%d age=%.1fms ticks=%u clock-offset=%@",
+                           hand.name, state.settled ? 1 : 0, state.reports, state.missed, state.age * 1000, state.deviceTicks, offset))
+            }
+        }
         if Self.trackHands {
             let hands = SenseControllers.Hand.allCases.map { hand -> String in
                 guard let s = handStats[hand], s.fixes > 0 else { return "\(hand.name) not seen" }
@@ -1567,15 +1847,18 @@ if !open, passthroughForVideo {
                               Float(s.sightings) / Float(s.fixes), s.rms / Float(s.fixes), at.x, at.y, at.z)
             }
             log("[hands] \(handExposures) exposures: " + hands.joined(separator: " · "))
+            let timing = handExposureStaging.takeDiagnostics()
+            if timing.delayed.contains(where: { $0 > 0 }) || timing.expired.contains(where: { $0 > 0 }) || timing.overflowDropped > 0 {
+                log("[hands timing] bracket delayed L=\(timing.delayed[0]) R=\(timing.delayed[1]); recovered L=\(timing.recovered[0]) R=\(timing.recovered[1]); expired L=\(timing.expired[0]) R=\(timing.expired[1]); queue dropped=\(timing.overflowDropped)")
+            }
             handStats = [:]
             handExposures = 0
         }
     }
 
     /// The Sense controllers, once per frame: the one in use aims the pointer, and its buttons act.
-    /// A controller has no compass and no position yet: its heading starts as the head's, PS sets
-    /// it again (point at the middle of the view and press), and the pointer's ray still leaves
-    /// from the head, towards where the controller points.
+    /// Its heading starts as the head's and optical tracking refines its pose.
+    /// System/menu button taps never recalibrate the sensor-to-pointer alignment.
     private func updateSense(head: HeadPose) {
         let now = CACurrentMediaTime()
         defer { lastStickTime = now }
@@ -1593,44 +1876,48 @@ if !open, passthroughForVideo {
                 notify("\(hand == .left ? "Left" : "Right") controller connected · \(state.batteryPercent)%", symbol: "gamecontroller")
                 continue
             }
+            guard let predicted = sensePredicted(hand, state, now: now) else { game?.realHands[slot] = nil; continue }
             let before = senseButtons[hand] ?? []
             let pressed = state.buttons.subtracting(before), released = before.subtracting(state.buttons)
             senseButtons[hand] = state.buttons
             // A game (or a Quest app) has the input: the controller is its hand, where the
             // cameras see it (beside the body until they do), pointing as Halliday's pointer
-            // does, and its buttons are the game's. PS still sets where it points.
-            // PS held recenters, as R held does (the ring fills); a tap sets where the controller
-            // points. It is never a game's button.
+            // does, and its buttons are the game's. PS held recenters, as R held does
+            // (the ring fills). PS is never a game's button or an aim-calibration shortcut.
             if pressed.contains(.ps) { recenterHold(began: true) }
-            let tapped = released.contains(.ps) && !recenterHoldFired
+            let tapAction = SenseAimDefaults.tapAction(psReleased: released.contains(.ps),
+                recenterFired: recenterHoldFired, gamePresenting: game?.isPresenting == true)
             if released.contains(.ps) { recenterHold(began: false) }
             // PS tapped in a game (or a Quest app) brings Halliday up over it, as Esc does, and
-            // tapped again goes back; where the controller points is set with Create or Options
-            // while Halliday is up.
-            if tapped, game?.isPresenting == true {
+            // tapped again goes back. Create/Options remain the game's menu buttons.
+            if tapAction == .toggleGameDashboard {
                 setGameAway(!gameAway)
                 continue
             }
+            // The floor shortcut belongs to Halliday's explicit PS/Esc pause
+            // menu. A grip and stick remain ordinary game inputs while playing.
+            let floorStick = GameFloorGesture.heightStick(gamePresenting: game?.isPresenting == true,
+                pauseMenuOpen: gameAway, gamePaused: game?.paused == true,
+                rightGripHeld: sense.state(.right)?.buttons.contains(.grip) == true,
+                stick: state.stick)
+            if let floorStick { game?.raise(by: floorStick) }
             if gameActive, let game {
                 let forward = head.orientation.act(SIMD3<Float>(0, 0, -1))
                 let heading = simd_quatf(angle: atan2(-forward.x, -forward.z), axis: [0, 1, 0])
                 let guess = head.position + heading.act(SIMD3(hand == .left ? -0.20 : 0.20, -0.30, -0.42))
-                // R1 held: a stick pushed up or down raises or lowers the user in the game's
-                // world (its floor is not always the room's), and the game doesn't get the sticks.
-                let adjusting = sense.state(.right)?.buttons.contains(.grip) == true
-                if adjusting, abs(state.stick.y) > 0.25 { game.raise(by: state.stick.y) }
                 game.realHands[slot] = GameBridge.RealHand(
-                    position: handPlace(hand) ?? guess, orientation: senseAim(hand, sensePredicted(state)),
-                    trigger: max(state.trigger, state.buttons.contains(.trigger) ? 1 : 0), grip: state.buttons.contains(.grip),
-                    stick: adjusting ? .zero : state.stick, stickClick: state.buttons.contains(.stick), stickTouch: state.buttons.contains(.stickTouch),
-                    lower: state.buttons.contains(.lower), upper: state.buttons.contains(.upper), menu: state.buttons.contains(.menu))
+                    position: handPlace(hand, atNs: predicted.targetHostNs) ?? guess,
+                    orientation: GameControllerAlignment.senseOrientation(senseAim(hand, predicted.orientation, atTime: predicted.targetSeconds),
+                        pointerMountRadians: senseTilt[hand] ?? SenseAimDefaults.tilt),
+                    trigger: state.trigger, triggerPressed: state.buttons.contains(.trigger), grip: state.buttons.contains(.grip),
+                    stick: state.stick, stickClick: state.buttons.contains(.stick), stickTouch: state.buttons.contains(.stickTouch),
+                    lower: state.buttons.contains(.lower), upper: state.buttons.contains(.upper), menu: state.buttons.contains(.menu),
+                    motion: gameHandMotion(hand, state: state, now: now, sample: predicted), poseFrame: .senseAim,
+                    touch: GameControllerTouch(buttons: state.buttons.rawValue,
+                        triggerProximity: state.triggerProximity, gripProximity: state.gripProximity))
                 continue
             }
             game?.realHands[slot] = nil
-            if tapped || pressed.contains(.menu) {
-                calibrateSense(hand, state.orientation, head: head, tilt: true)
-                notify(String(format: "%@ controller points where you look · tilt %.0f°", hand == .left ? "Left" : "Right", (senseTilt[hand] ?? 0) * 180 / .pi), symbol: "scope")
-            }
             // The hand that pulls a trigger or a grip is the hand that points.
             if pressed.contains(.trigger) || pressed.contains(.grip) { senseHand = hand }
             if sense.state(senseHand) == nil { senseHand = hand }
@@ -1656,12 +1943,12 @@ if !open, passthroughForVideo {
             if pressed.contains(.lower), video?.isOpen == true {
                 if chromeShown { dismissChrome() } else { chromeDismissed = false; lastPointerActivity = now }
             }
-            var aim = senseAim(hand, sensePredicted(state)).act(SIMD3<Float>(0, 0, -1))
+            var aim = senseAim(hand, predicted.orientation, atTime: predicted.targetSeconds).act(SIMD3<Float>(0, 0, -1))
             // The pointer is a ray from the head; the hand is somewhere else. Where the cameras
             // see the hand, the pointer goes to what the hand's own ray meets (4 m out when it
             // meets nothing): taken from the head, a controller aimed at something near, the
             // dock under the hands, pointed past it, and only far things could be picked.
-            if let from = handPlace(hand), let renderer {
+            if let from = handPlace(hand, atNs: predicted.targetHostNs), let renderer {
                 let reach = renderer.nearestHit(origin: from, direction: aim) ?? 4
                 let target = from + aim * reach - head.position
                 if simd_length(target) > 0.05 { aim = simd_normalize(target) }
@@ -1671,12 +1958,12 @@ if !open, passthroughForVideo {
             // On a Mac window in use, the controller does what the mouse does through the tap:
             // the page sees it move, and each press gets its release.
             mouseOwner.controllerMoved()
-            if pressed.contains(.trigger) { _ = clickedInView(rightButton: false) }
+            if pressed.contains(.trigger) { _ = clickedInView(rightButton: false, source: .sense) }
             if released.contains(.trigger) { releasedInView(rightButton: false); mouseOwner.controllerRelease(rightButton: false) }
-            if pressed.contains(.grip) { _ = clickedInView(rightButton: true) }
+            if pressed.contains(.grip) { _ = clickedInView(rightButton: true, source: .sense) }
             if released.contains(.grip) { releasedInView(rightButton: true); mouseOwner.controllerRelease(rightButton: true) }
             // The stick scrolls what the pointer is on: one of Halliday's lists, or a window's page.
-            if abs(state.stick.y) > 0.15 || abs(state.stick.x) > 0.15 {
+            if floorStick == nil, abs(state.stick.y) > 0.15 || abs(state.stick.x) > 0.15 {
                 let onPanel = panels.contains { $0.isOnSurface(origin: head.position, direction: head.orientation.act(InputState.shared.pointerDirection)) }
                 if !onPanel, drag == nil, let video, video.isOpen, renderer?.videoSphere != nil, photos?.isOpen != true {
                     // A video around the viewer: the stick turns where "straight ahead" looks
@@ -1758,11 +2045,12 @@ if !open, passthroughForVideo {
         if mouseOwner.isOn {
             mouseOwner.stop(reason: "typing in Halliday")
             mouseOwnershipChanged(false)
-        } else {
-            NSApp.activate()
-            window?.makeKeyAndOrderFront(nil)
-            window?.makeFirstResponder(view)
         }
+        // Typing is an explicit keyboard request; it does not capture the OS
+        // mouse when a controller operates the VR field.
+        activateSceneApplication()
+        raiseSceneWindowForDesktopInput()
+        window?.makeFirstResponder(view)
     }
 
     /// The click that ended a window interaction landed outside every window: if it is on one of
@@ -1829,6 +2117,14 @@ if !open, passthroughForVideo {
                 p.onClose = { [weak self] in self?.settingsOpen = false; self?.lastDockClock = 0 }
                 p.onNotice = { [weak self] text in self?.notify(text) }
                 p.currentPage = { [weak self] in self?.browser?.displayURL }
+                p.onRefreshRate = { [weak self] hz in self?.requestHeadsetRefresh(hz) }
+                p.refreshState = { [weak self] in
+                    guard let self else { return ([], 0, false) }
+                    let current = Self.selectedHeadsetRefreshRate(onHeadset: self.onHeadset,
+                        screenPresent: self.headsetDisplayNow != nil, appliedHz: self.headsetHz,
+                        switching: self.refreshSwitchTask != nil)
+                    return (self.availableHeadsetRefreshRates, current, self.refreshSwitchTask != nil)
+                }
                 settingsPanel = p
                 return p
             }()
@@ -2034,6 +2330,7 @@ if !open, passthroughForVideo {
     /// Brings the whole interface to where the user is looking: the arc of panels, the ones placed
     /// by hand, the dock, video and any open overlay. It moves the interface, not the user.
     func recenterUI() {
+        renderer?.retirePresentation()
         // A running game's world comes back in front of the user too.
         game?.recenter(head: currentHead)
         // The controllers too: each points straight ahead now, as far as Halliday knows.
@@ -2065,7 +2362,9 @@ if !open, passthroughForVideo {
         if launcherOpen, let p = launcher {
             p.glide(around: head.position) { p.place(head: head, distance: overlayDistance(AppLauncher.distance), below: AppLauncher.below) }
         }
-        if settingsOpen, let p = settingsPanel {
+        if gameAway, game?.isPresenting == true {
+            placeGameBar(head: head)
+        } else if settingsOpen, let p = settingsPanel {
             p.glide(around: head.position) { p.place(head: head, distance: overlayDistance(SettingsPanel.distance), below: SettingsPanel.below) }
         }
         if keyboardOpen, let p = keyboard {
@@ -2369,9 +2668,15 @@ if !open, passthroughForVideo {
     /// another Space), Halliday becomes the active app again and keeps the mouse if it had it.
     private func takeFocusBack() {
         guard !mouseOwner.isOn else { return }
+        guard controllerPointerPolicy.allowsAutomaticReclaim else {
+            pointerEngaged = false
+            focusWasEngaged = false
+            setPointerLock(false)
+            return
+        }
         let engaged = pointerEngaged || pointerLocked || focusWasEngaged
-        NSApp.activate()
-        window?.makeKeyAndOrderFront(nil)
+        activateSceneApplication()
+        raiseSceneWindowForDesktopInput()
         window?.makeFirstResponder(view)
         if engaged {
             pointerEngaged = true
@@ -2415,6 +2720,7 @@ if !open, passthroughForVideo {
         video?.volume = level
         QuestApps.setVolume(level)
         Sounds.volume = Settings.shared.soundVolume * level
+        updateGameAudio()
         quickSettings?.setNeedsDisplay()
     }
 
@@ -2527,9 +2833,16 @@ if !open, passthroughForVideo {
         lastDockClock = 0
     }
 
+
+
+
     /// Applies the settings that take effect at once (the rest are read where they are used).
     private func applySettings() {
         let s = Settings.shared
+        updatePerformanceHUD()
+        sense.setLEDFeedbackEnabled(s.senseLEDFeedback)
+        sense.setHapticsFocused(game?.isPresenting != true || game?.controllerHapticsFocused == true)
+        renderer?.prepareSpacewarpIfEnabled()
         Motion.reduced = s.reduceMotion
         windowManager?.remembersLayouts = s.rememberLayouts
         let ipd = renderer?.ipd ?? 0.064
@@ -2555,6 +2868,82 @@ if !open, passthroughForVideo {
             lastMode = s.mode
             recenterUI()
         }
+        scheduleGameImageReconfiguration()
+    }
+
+    /// HUD settings never change input ownership, the game camera or menu placement.
+    private func updatePerformanceHUD() {
+        guard let renderer else { return }
+        let visible = Settings.shared.gamePerformanceHUD && game?.isPresenting == true
+        // Retire callbacks when switching away from the physical headset. A
+        // retained old scene must never report a Mac preview as headset latency.
+        let enabled = visible && onHeadset && !desktopMode && headsetDisplayNow != nil
+        if performanceHUDGame !== game {
+            performanceHUDGame?.setPerformanceHUDEnabled(false)
+            performanceHUDGame = game
+            performanceHUDCollecting = false
+        }
+        if performanceHUDCollecting != enabled {
+            game?.setPerformanceHUDEnabled(enabled)
+            performanceHUDCollecting = enabled
+        }
+        guard visible, let game else {
+            renderer.onPerformancePresented = nil
+            renderer.updatePerformanceHUD(enabled: false, snapshot: .empty)
+            return
+        }
+        let metrics = game.performanceMetrics
+        if onHeadset, !desktopMode, headsetDisplayNow != nil,
+           let context = metrics.presentationContext() {
+            // Bind producer/pause generation before admitting a scene. The renderer
+            // copies this closure with that scene; late GPU callbacks never query
+            // whichever game happens to be current when they finish.
+            renderer.onPerformancePresented = { sequence, generated, seen, epoch in
+                metrics.presented(imageSequence: sequence, generated: generated,
+                                  at: seen, epoch: epoch, context: context)
+            }
+        } else { renderer.onPerformancePresented = nil }
+        renderer.updatePerformanceHUD(enabled: true,
+            snapshot: enabled ? game.performanceHUDSnapshot(now: CACurrentMediaTime()) : .empty)
+    }
+
+    /// Apply the independent host's cadence in place, including during loading.
+    /// Dimensions, physical display rate and closed-runtime host configuration
+    /// still wait until all current clients have left.
+    private func scheduleGameImageReconfiguration() {
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
+        if let game { game.setHalfFrameRateMode(Settings.shared.gameHalfFrameRateMode) }
+        guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
+            || game.cropSettings != GameCropSettings(enabled: Settings.shared.gameCropEnabled,
+                horizontal: Settings.shared.gameCropHorizontal, vertical: Settings.shared.gameCropVertical)
+            || game.halfFrameRate != game.requestedHalfFrameRate
+            || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return }
+        let work = DispatchWorkItem { [weak self] in
+            guard let self else { return }
+            if !self.applyGameImageReconfiguration() { self.scheduleGameImageReconfiguration() }
+        }
+        gameImageReconfiguration = work
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.5, execute: work)
+    }
+
+    @discardableResult
+    private func applyGameImageReconfiguration() -> Bool {
+        guard let game, game.imageRenderPercent != Settings.shared.gameRenderPercent
+            || game.cropSettings != GameCropSettings(enabled: Settings.shared.gameCropEnabled,
+                horizontal: Settings.shared.gameCropHorizontal, vertical: Settings.shared.gameCropVertical)
+            || game.halfFrameRate != game.requestedHalfFrameRate
+            || abs(game.physicalDisplayHz - headsetHz) > 0.1 else { return true }
+        guard pendingCrossOverLaunches.isEmpty, !GameLibrary.shared.hasPendingLaunch else { return false }
+        guard game.canReconfigureImage, let renderer else { return false }
+        gameImageReconfiguration?.cancel()
+        gameImageReconfiguration = nil
+        game.onChange = nil
+        game.close()
+        self.game = nil
+        renderer.projection = nil
+        startGameBridge(renderer, honorLaunchArguments: false)
+        return true
     }
 
     /// Seated mode: the arc is centered on the user and faces where they face (at launch and on
@@ -2957,8 +3346,8 @@ if !open, passthroughForVideo {
                 mouseOwner.stop(reason: "address bar")
                 mouseOwnershipChanged(false)
             } else {
-                NSApp.activate()
-                window?.makeKeyAndOrderFront(nil)
+                activateSceneApplication()
+                raiseSceneWindowForDesktopInput()
                 window?.makeFirstResponder(view)
             }
             updateBrowserBar()
@@ -2968,7 +3357,7 @@ if !open, passthroughForVideo {
             b?.configureXR(ipd: ipd, fovLeft: Optics.fov(.left), fovRight: Optics.fov(.right), eyeSize: Settings.shared.vrPageEye)
         }
         b.window.orderFront(nil) // on screen so it gets a window number, then moved onto the virtual display
-        window?.makeKeyAndOrderFront(nil)
+        raiseSceneWindowForDesktopInput()
         browserOpening = true
         lastDockClock = 0 // the dock shows it as open right away
         Task { @MainActor in
@@ -2991,13 +3380,19 @@ if !open, passthroughForVideo {
 
     /// Returns true if the click went into a VR window (false: empty space, or it only locked the mouse).
     @discardableResult
-    func clickedInView(rightButton: Bool, at spot: CGPoint? = nil) -> Bool {
+    func clickedInView(rightButton: Bool, at spot: CGPoint? = nil,
+                       source: ControllerPointerPolicy.ClickSource = .desktopMouse) -> Bool {
         // A free mouse: the click captures it. In the desktop view the picture is undistorted, so the
         // spot that was clicked is a known direction: the pointer goes there and the click counts,
         // as the user expects. In the headset view the first click only captures.
-        if !pointerLocked {
+        if source == .sense {
+            syncControllerDesktopOwnership()
+            pointerEngaged = false
+            setPointerLock(false)
+        }
+        if !pointerLocked, controllerPointerPolicy.capturesMouse(for: source) {
             pointerEngaged = true
-            setPointerLock(true)
+            setPointerLock(true, intent: .explicitDesktopMouse)
             log("[mouse] captured for VR (Control twice releases it)")
             guard let spot, renderer?.desktopView == true else { return true }
             InputState.shared.aim(desktopDirection(spot))
@@ -3036,6 +3431,9 @@ if !open, passthroughForVideo {
             blockedClick()
             return true
         }
+        // In-game dashboard panels were already handled above. A ray that
+        // misses them must not fall through to a captured Mac window.
+        guard controllerPointerPolicy.allowsNativeControllerEvents else { return false }
         guard let wm = windowManager, wm.checkInputPermission(), mouseOwner.start() else { return true }
         mouseOwnershipChanged(true)
         mouseOwner.press(hit, rightButton: rightButton)
@@ -3045,13 +3443,60 @@ if !open, passthroughForVideo {
 
     /// Halliday's OpenVR runtime for games under Wine (`halliday --install-openvr` points a Wine
     /// prefix at it: main.swift).
-    private func startGameBridge(_ renderer: Renderer) {
-        game = GameBridge(device: renderer.device, queue: renderer.commandQueue, displayHz: headsetHz)
+    private func startGameBridge(_ renderer: Renderer, honorLaunchArguments: Bool = true) {
+        game = GameBridge(device: renderer.device, queue: renderer.commandQueue, displayHz: headsetHz, ipd: renderer.ipd,
+                          crop: GameCropSettings(enabled: Settings.shared.gameCropEnabled,
+                              horizontal: Settings.shared.gameCropHorizontal, vertical: Settings.shared.gameCropVertical))
+        game?.onStaleProducer = { [weak self] expired in
+            DispatchQueue.main.async { [weak self, weak expired] in
+                guard let self, let expired, self.game === expired,
+                      let renderer = self.renderer, expired.confirmStaleProducerRecovery() else { return }
+                // Retire the old inode now; submitted GPU work retains its
+                // original GameBridgeLease until completion. New games open a
+                // fresh, unowned mapping through the normal creation path.
+                self.systemGameAudio.stop()
+                expired.onChange = nil
+                expired.close()
+                self.game = nil
+                renderer.projection = nil
+                self.startGameBridge(renderer, honorLaunchArguments: false)
+            }
+        }
+        do { try WindowsOpenXRSupport.refreshStagedRuntimes() }
+        catch { log("[games] couldn't refresh Windows VR modules: \(error.localizedDescription)") }
+        let senseOutput = sense
+        game?.setHapticOutput(connected: {
+            let hands = senseOutput.connected
+            return (hands.contains(.left) ? 1 : 0) | (hands.contains(.right) ? 2 : 0)
+        }, output: { event in
+            let hand: SenseControllers.Hand = event.hand == 0 ? .left : .right
+            if event.stop { senseOutput.stopVibration(hand) }
+            else {
+                _ = senseOutput.vibrate(hand, amplitude: event.amplitude,
+                    frequencyHz: event.frequencyHz, durationNanoseconds: event.durationNanoseconds)
+            }
+        })
         GameLibrary.shared.onNotice = { [weak self] text in self?.notify(text, symbol: "gamecontroller") }
         GameLibrary.shared.onChange = { [weak self] in self?.games?.setNeedsDisplay() }
         GameLibrary.shared.refresh()
         game?.onChange = { [weak self] presenting in
             guard let self, let game = self.game else { return }
+            self.updateGameAudio()
+            self.syncControllerDesktopOwnership()
+            self.gameResumeFocusTarget = nil
+            self.gameMenuFocusRevision &+= 1
+            if presenting, let producer = game.focusProducer {
+                // Cache a real game identity early, before a VR menu or a
+                // later same-name game in another bottle could confuse it.
+                Task { @MainActor [weak self, weak game] in
+                    let candidate = await GameResumeFocus.discover(producer: producer)
+                    guard let self, let game, self.game === game,
+                          game.focusProducer == producer else { return }
+                    self.gameResumeFocusTarget = GameResumeFocus.preferRemembered(
+                        self.gameResumeFocusTarget, discovered: candidate, producer: producer)
+                }
+            }
+            self.sense.setHapticsFocused(!presenting || game.controllerHapticsFocused)
             let name = GameLibrary.shared.displayName(forExecutable: game.appName)
             if presenting {
                 // How to get out, the first three times a game starts (design board 14, moment 1).
@@ -3070,6 +3515,7 @@ if !open, passthroughForVideo {
             if !presenting { self.renderer?.projection = nil }
             // Seated: the walk the game needed ends with it (room-scale keeps where the user went).
             if !presenting, Settings.shared.mode == .seated { self.mouse.position = MouseLook().position }
+            if !presenting { self.scheduleGameImageReconfiguration() }
             if presenting { self.scheduleGameKeys() }
         }
     }
@@ -3111,7 +3557,9 @@ if !open, passthroughForVideo {
                         switch name {
                         case "trigger": game.trigger[leftHand ? 1 : 0] = down
                         case "grip": game.grip[leftHand ? 1 : 0] = down
-                        case "dashboard": game.setDashboard(down) // Halliday's interface over the game
+                        case "dashboard":
+                            game.setDashboard(down) // Halliday's interface over the game
+                            self?.sense.setHapticsFocused(game.controllerHapticsFocused)
                         case "quit": if down { game.requestQuit() }
                         // Halliday up over the game (Esc), and the bar's Quit game pressed.
                         case "away": self?.setGameAway(down)
@@ -3141,13 +3589,28 @@ if !open, passthroughForVideo {
     /// is told and keeps running; the mouse, clicks and keys are Halliday's until it goes back.
     private func setGameAway(_ on: Bool) {
         guard let game, on != gameAway, !on || game.isPresenting else { return }
+        gameMenuFocusRevision &+= 1
+        let focusRevision = gameMenuFocusRevision
+        if on, let producer = game.focusProducer, gameResumeFocusTarget?.producer != producer {
+            // Discover away from the compositor; opening the dashboard never
+            // activates an app. A newer menu/game transition retires this result.
+            Task { @MainActor [weak self, weak game] in
+                let candidate = await GameResumeFocus.discover(producer: producer)
+                guard let self, let game, self.game === game, self.gameAway,
+                      self.gameMenuFocusRevision == focusRevision,
+                      game.focusProducer == producer else { return }
+                self.gameResumeFocusTarget = GameResumeFocus.preferRemembered(
+                    self.gameResumeFocusTarget, discovered: candidate, producer: producer)
+            }
+        }
         gameAway = on
         game.setPaused(on)
+        sense.setHapticsFocused(game.controllerHapticsFocused)
         if on {
             let bar = gameBar ?? {
                 let p = GameBar(renderer: renderer!)
                 p.onBack = { [weak self] in self?.setGameAway(false) }
-                p.onRecenter = { [weak self] in self?.recenterUI(); self?.placeGameBar() }
+                p.onRecenter = { [weak self] in self?.recenterUI() }
                 p.onFloor = { [weak self] step in self?.game?.raise(meters: step) }
                 p.floorLift = { [weak self] in self?.game?.floorLift ?? 0 }
                 p.onPassthrough = { [weak self] in self?.togglePassthrough() }
@@ -3160,7 +3623,13 @@ if !open, passthroughForVideo {
                 }
                 p.onCalibrate = { [weak self] in self?.calibratePointerSoon() }
                 p.passthrough = { [weak self] in self?.usb?.headset == nil ? nil : self?.passthrough }
-                p.onQuit = { [weak self] in self?.game?.requestQuit() }
+                p.onQuit = { [weak self] in
+                    guard let self, let game = self.game else { return }
+                    if !game.requestQuit() {
+                        self.gameBar?.reset()
+                        self.notify("Use the game's Exit menu to close it", symbol: "gamecontroller")
+                    }
+                }
                 p.onForceQuit = { [weak self] in
                     guard let self, let game = self.game else { return }
                     if !game.forceQuit() { self.notify("Couldn't find the game's process: quit it from GameHub", kind: .warning) }
@@ -3182,6 +3651,39 @@ if !open, passthroughForVideo {
             launcherOpen = false
         }
         Sounds.play(on ? .open : .close)
+        if !on, game.isPresenting { restoreGameFocusAfterResume() }
+    }
+
+    /// Explicit Resume (button, PS tap or final Esc), once. A correctly focused
+    /// game is left alone; controllers never continuously reclaim desktop focus.
+    private func restoreGameFocusAfterResume() {
+        guard let game, !gameAway, let producer = game.focusProducer else { return }
+        let request = GameResumeFocus.Request(producer: producer, revision: gameMenuFocusRevision,
+            originalFrontmostPID: NSWorkspace.shared.frontmostApplication?.processIdentifier)
+        Task { @MainActor [weak self, weak game] in
+            guard let self, let game else { return }
+            var target = self.gameResumeFocusTarget
+            if target?.producer != producer {
+                let candidate = await GameResumeFocus.discover(producer: producer)
+                target = GameResumeFocus.preferRemembered(self.gameResumeFocusTarget,
+                    discovered: candidate, producer: producer)
+            }
+            guard self.game === game, let currentProducer = game.focusProducer,
+                  let target else { return }
+            let frontmost = NSWorkspace.shared.frontmostApplication?.processIdentifier
+            // A user-selected Mac app while discovery was running wins over
+            // this older Resume request; there is no recurring focus reclaim.
+            guard request.accepts(producer: currentProducer, revision: self.gameMenuFocusRevision,
+                presenting: game.isPresenting, dashboard: self.gameAway,
+                frontmostPID: frontmost, targetPID: target.identity.pid) else { return }
+            self.gameResumeFocusTarget = target
+            let current = NativeProcessIdentity.capture(pid: target.identity.pid,
+                expectedBasename: URL(fileURLWithPath: target.identity.executable).lastPathComponent)
+            guard GameResumeFocus.shouldActivate(target, producer: producer,
+                frontmostPID: frontmost, currentIdentity: current) else { return }
+            let restored = NSRunningApplication(processIdentifier: target.identity.pid)?.activate() ?? false
+            log("[input] explicit Resume game focus \(restored ? "restored" : "unavailable") for native process \(target.identity.pid)")
+        }
     }
 
     /// Sets where the controllers point without a button on them: a button on a panel is
@@ -3277,8 +3779,8 @@ if !open, passthroughForVideo {
             self.window = window
             // (Test runs stay in the background: `--no-activate`.)
             if CommandLine.arguments.contains("--no-activate") { window.orderFront(nil) } else {
-                window.makeKeyAndOrderFront(nil)
-                NSApp.activate()
+                raiseSceneWindowForDesktopInput()
+                activateSceneApplication()
             }
             window.makeFirstResponder(view)
             log("[display] desktop mode: Halliday on the Mac's screen, the headset's display left black")
@@ -3291,7 +3793,7 @@ if !open, passthroughForVideo {
             self.window = headsetWindow
             desktopWindow?.orderOut(nil)
             headsetWindow.setFrame(screen.frame, display: true)
-            headsetWindow.makeKeyAndOrderFront(nil)
+            headsetWindow.orderFront(nil)
             headsetWindow.makeFirstResponder(view)
             log("[display] back on the headset")
         }
@@ -3321,6 +3823,104 @@ if !open, passthroughForVideo {
     /// The headset's display, if macOS shows one now.
     private var headsetDisplayNow: NSScreen? {
         NSScreen.screens.first { $0.convertRectToBacking($0.frame).size == headsetPanelPixels }
+    }
+
+    private static func displayID(_ screen: NSScreen) -> CGDirectDisplayID? {
+        (screen.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? NSNumber)?.uint32Value
+    }
+
+    private static func physicalRefreshRate(_ screen: NSScreen) -> Float {
+        if let id = displayID(screen), let hz = PSVR2RefreshModes.currentRate(for: id) { return Float(hz) }
+        let reported = Float(screen.maximumFramesPerSecond)
+        return reported > 0 ? reported : 90
+    }
+
+    private var availableHeadsetRefreshRates: [Int] {
+        guard onHeadset, let screen = headsetDisplayNow, let id = Self.displayID(screen) else { return [] }
+        return PSVR2RefreshModes.rates(for: id)
+    }
+
+    /// The confirmed/detected display mode, never the requested saved preference.
+    /// A missing/inactive headset has no selected physical mode in either UI.
+    nonisolated private static func selectedHeadsetRefreshRate(onHeadset: Bool, screenPresent: Bool, appliedHz: Float, switching: Bool = false) -> Int {
+        // Keep the last confirmed mode during our own mode-change reenumeration.
+        guard onHeadset, screenPresent || switching, appliedHz.isFinite else { return 0 }
+        let nominal = appliedHz.rounded()
+        return nominal == 90 ? 90 : nominal == 120 ? 120 : 0
+    }
+
+    private func adoptHeadsetRefresh(_ hz: Float, screen: NSScreen) {
+        guard hz.isFinite, hz > 0 else { return }
+        let changed = abs(headsetHz - hz) > 0.1
+        headsetHz = hz
+        LateLatch.displayHz = hz
+        if let game, !game.setPhysicalDisplayHz(hz) { scheduleGameImageReconfiguration() }
+        if let id = Self.displayID(screen) { view?.refreshHeadsetTiming(display: id, hz: Double(hz)) }
+        if changed {
+            // A display-backed SCK stream can retire during a physical mode switch.
+            systemGameAudio.stop()
+            updateGameAudio()
+            log("[display] live headset refresh \(Int(hz.rounded())) Hz")
+            settingsPanel?.setNeedsDisplay()
+            companion?.model.refresh()
+        }
+    }
+
+    private func requestHeadsetRefresh(_ hz: Int) {
+        guard [90, 120].contains(hz), let screen = headsetDisplayNow,
+              let id = Self.displayID(screen), availableHeadsetRefreshRates.contains(hz) else { return }
+        guard refreshSwitchTask == nil else { return }
+        if PSVR2RefreshModes.currentRate(for: id) == hz {
+            adoptHeadsetRefresh(Float(hz), screen: screen)
+            Settings.shared.headsetRefreshHz = hz
+            return
+        }
+        guard game?.isPresenting != true || game?.supportsLiveDisplayRate == true else {
+            notify("Live refresh switching needs Halliday's game runtime. Close this legacy session first.", kind: .warning)
+            return
+        }
+        refreshSwitchTask = Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer {
+                self.refreshSwitchTask = nil
+                self.settingsPanel?.setNeedsDisplay()
+                self.companion?.model.refresh()
+            }
+            do {
+                try PSVR2RefreshModes.request(hz, for: id)
+                for _ in 0..<20 {
+                    try Task.checkCancellation()
+                    if let current = self.headsetDisplayNow, Self.displayID(current) == id,
+                       PSVR2RefreshModes.currentRate(for: id) == hz {
+                        self.adoptHeadsetRefresh(Float(hz), screen: current)
+                        Settings.shared.headsetRefreshHz = hz
+                        self.notify("Headset: \(hz) Hz", symbol: "display", seconds: 2)
+                        return
+                    }
+                    try await Task.sleep(for: .milliseconds(100))
+                }
+                throw NSError(domain: "HallidayDisplay", code: 2,
+                    userInfo: [NSLocalizedDescriptionKey: "macOS did not confirm the requested refresh rate"])
+            } catch is CancellationError { }
+              catch { self.notify(error.localizedDescription, kind: .warning) }
+        }
+        settingsPanel?.setNeedsDisplay()
+        companion?.model.refresh()
+    }
+
+    /// Restore a deliberately chosen mode once per display connection, after
+    /// the real headset view and game bridge exist. No repeated failed requests.
+    private func applyPreferredHeadsetRefresh() {
+        guard onHeadset, let screen = headsetDisplayNow, let id = Self.displayID(screen) else {
+            preferredRefreshKey = nil
+            return
+        }
+        let wanted = Settings.shared.headsetRefreshHz
+        let key = "\(id):\(wanted)"
+        guard refreshSwitchTask == nil, key != preferredRefreshKey else { return }
+        preferredRefreshKey = key
+        if wanted == 90 || wanted == 120 { requestHeadsetRefresh(wanted) }
+        else { adoptHeadsetRefresh(Self.physicalRefreshRate(screen), screen: screen) }
     }
 
     /// Looks for the headset (at every change of the Mac's displays, and when the companion's
@@ -3354,7 +3954,9 @@ if !open, passthroughForVideo {
         w.level = .screenSaver
         w.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
         headsetWindow = w
-        headsetHz = Float(screen.maximumFramesPerSecond)
+        let detectedHz = Self.physicalRefreshRate(screen)
+        headsetHz = detectedHz > 0 ? detectedHz : 90
+        scheduleGameImageReconfiguration()
         LateLatch.displayHz = headsetHz
         renderer.setEyeSize(Headsets.current.renderEyeSize)
         if usb == nil { usb = TrackedSource(name: "headset", headset: Headsets.current.openSession()) }
@@ -3367,7 +3969,8 @@ if !open, passthroughForVideo {
         w.contentView = view
         onHeadset = true
         self.window = w
-        w.makeKeyAndOrderFront(nil)
+        w.ignoresMouseEvents = true
+        w.orderFront(nil)
         w.makeFirstResponder(view)
         // The preview window goes: the companion is Halliday's window on the Mac now.
         preview?.orderOut(nil)
@@ -3391,6 +3994,8 @@ if !open, passthroughForVideo {
                 self.setPointerLock(false)
             }
             let m = c.model
+            m.windowsOpenXRPreview = WindowsOpenXRSupport.enabled
+            m.windowsOpenXRBackend = WindowsOpenXRSupport.backend
             m.readStatus = { [weak self] in self?.companionStatus() ?? CompanionStatus() }
             m.onRecenter = { [weak self] in self?.recenterUI() }
             m.onPassthrough = { [weak self] in self?.togglePassthrough() }
@@ -3405,56 +4010,7 @@ if !open, passthroughForVideo {
             m.onBackToHeadset = { [weak self] in self?.backToHeadset() }
             m.onDesktopMode = { [weak self] on in self?.setDesktopMode(on) }
             m.onLookForHeadset = { [weak self] in self?.lookForHeadset(asked: true) ?? "" }
-            // The app's ordinary quit: a running game is asked to quit, windows go back.
-            m.onQuit = { NSApp.terminate(nil) }
-            m.readFrame = { [weak self] in self?.frameFacts ?? CompanionFrame() }
-            m.readGames = {
-                let library = GameLibrary.shared
-                let games = library.games.filter { $0.quest == nil }.map { g -> CompanionGame in
-                    var status = g.status.label
-                    if case .stopped(let why) = g.status { status += ": \(why)" }
-                    let setUp: Bool? = switch g.status {
-                    case .ready, .stopped: true
-                    case .notSetUp, .changed, .update: false
-                    case .firstLaunch: nil
-                    }
-                    return CompanionGame(id: g.appID, name: g.name, status: status, setUp: setUp)
-                }
-                return (games, library.hasGameHub)
-            }
-            m.onGame = { [weak self] id, setUp in
-                let library = GameLibrary.shared
-                guard let game = library.games.first(where: { $0.appID == id }) else { return }
-                let done = setUp ? library.setUp(game) : library.undo(game)
-                self?.companion?.model.notice = done ? (setUp ? "\(game.name) is set up for Halliday" : "\(game.name) is back as it was")
-                    : "Couldn't change \(game.name): start it once from GameHub first"
-                library.refresh()
-            }
-            m.onOpenGameHub = {
-                let url = NSWorkspace.shared.urlForApplication(withBundleIdentifier: "com.gamemac.www") ?? URL(fileURLWithPath: "/Applications/GameHub.app")
-                NSWorkspace.shared.open(url)
-            }
-            m.readWindows = { [weak self] in
-                guard let self, let wm = self.windowManager, let found = await wm.candidates() else { return [] }
-                self.companionCandidates = Dictionary(found.map { (UInt32($0.window.windowID), $0) }, uniquingKeysWith: { a, _ in a })
-                return found.map { c in
-                    let hint: String? = switch c.state {
-                    case .minimized: "minimized"
-                    case .fullScreen: "full screen"
-                    case .otherSpace: "in another Space: it can't be brought in from there"
-                    case .inVR, .ready: nil
-                    }
-                    return CompanionMacWindow(id: UInt32(c.window.windowID), app: c.appName, title: c.title, inVR: c.state == .inVR, hint: hint)
-                }
-            }
-            m.onWindow = { [weak self] id, bring in
-                guard let self, let wm = self.windowManager else { return }
-                if !bring {
-                    wm.sendBack(CGWindowID(id))
-                } else if let c = self.companionCandidates[id], await wm.bring(c) == false {
-                    self.companion?.model.notice = "Couldn't bring \(c.appName)'s window into VR"
-                }
-            }
+            m.onRefreshRate = { [weak self] hz in self?.requestHeadsetRefresh(hz) }
             m.onPrediction = { [weak self] ms in
                 self?.view?.lookaheadTrimNs = Int64(ms) * 1_000_000
                 self?.companion?.model.refresh()
@@ -3462,32 +4018,31 @@ if !open, passthroughForVideo {
             companion = c
             return c
         }()
-        c.show(activating: activating)
+        c.show(activating: activating && game?.isPresenting != true)
     }
 
     /// The mouse and the keyboard back to Halliday in the headset (the companion's button).
     private func backToHeadset() {
         guard onHeadset, !mouseOwner.isOn else { return }
+        guard game?.isPresenting != true else { setGameAway(true); return }
         pointerEngaged = true
-        window?.makeKeyAndOrderFront(nil)
+        raiseSceneWindowForDesktopInput()
         window?.makeFirstResponder(view)
-        setPointerLock(true, force: true)
+        setPointerLock(true, force: true, intent: .explicitDesktopMouse)
     }
 
     private func companionStatus() -> CompanionStatus {
         var s = CompanionStatus()
         s.onHeadset = onHeadset
+        s.displayHz = Self.selectedHeadsetRefreshRate(onHeadset: onHeadset,
+            screenPresent: headsetDisplayNow != nil, appliedHz: headsetHz,
+            switching: refreshSwitchTask != nil)
         s.desktopMode = desktopMode
         s.canSwitchOutput = headsetWindow != nil
-        if let headset = usb?.headset {
-            switch headset.linkState {
-            case .connected: s.headset = onHeadset ? "Connected" : "Connected (no display)"
-            case .fullSpeedLink: s.headset = "On a USB 2 link: no tracking"
-            case .searching: s.headset = "Looking for it"
-            default: s.headset = headset.linkState.description
-            }
-        }
-        s.displayHz = onHeadset ? Int(headsetHz.rounded()) : 0
+        s.gameAudio = !Settings.shared.gameSystemAudio ? "Game audio is off"
+            : game?.isPresenting != true ? "Ready for a VR game" : systemGameAudio.status.displayText
+        s.refreshRates = availableHeadsetRefreshRates
+        s.refreshSwitching = refreshSwitchTask != nil
         s.framesPerSecond = shownFramesPerSecond
         for (hand, name) in [(SenseControllers.Hand.left, "Left"), (.right, "Right")] {
             if let state = sense.state(hand) { s.controllers.append("\(name) · \(state.batteryPercent)%\(state.charging ? ", charging" : "")") }
@@ -3504,9 +4059,23 @@ if !open, passthroughForVideo {
         return s
     }
 
-    private func placeGameBar() {
+    private func placeGameBar(head: HeadPose? = nil) {
         guard let gameBar else { return }
-        gameBar.place(head: currentHead, distance: GameBar.distance, below: GameBar.below)
+        let head = head ?? currentHead
+        if settingsOpen, let settingsPanel {
+            // Keep the two whole panels (including shadows) beside each other on one arc,
+            // rather than letting the nearer pause menu cover the full settings panel.
+            // Their sizes are angular, so this gap also holds at a nearer overlay distance.
+            let halfGap: Float = 2 * .pi / 180
+            let gameHalfWidth = atan(Float(gameBar.size.width) / 2000)
+            let settingsHalfWidth = atan(Float(settingsPanel.size.width) / 2000)
+            gameBar.place(head: head, distance: GameBar.distance, below: GameBar.below,
+                          yawOffset: settingsHalfWidth + halfGap)
+            settingsPanel.place(head: head, distance: overlayDistance(SettingsPanel.distance), below: SettingsPanel.below,
+                                yawOffset: -(gameHalfWidth + halfGap))
+        } else {
+            gameBar.place(head: head, distance: GameBar.distance, below: GameBar.below)
+        }
     }
 
     // --- Games (design board 15) ---
@@ -3518,6 +4087,8 @@ if !open, passthroughForVideo {
             p.onClose = { [weak self] in self?.gamesOpen = false }
             p.onNotice = { [weak self] text, problem in self?.notify(text, kind: problem ? .warning : .info) }
             p.onPlay = { [weak self] g in self?.play(g) }
+            p.onSetUp = { [weak self] g in self?.setUpWindowsGame(g) }
+            p.onUndo = { [weak self] g in self?.undoWindowsGame(g) }
             p.onOpenGameHub = { [weak self] in self?.openGameHub() }
             p.onInstall = { [weak self] in self?.toggleFileBrowser(mode: .apps, keepOpen: true) }
             p.onRemove = { [weak self] g in self?.removeQuestApp(g) }
@@ -3530,16 +4101,179 @@ if !open, passthroughForVideo {
         gamesOpen = true
     }
 
-    /// Starts a game through GameHub's own launch link (what its desktop shortcuts open).
+    /// Uses the game's existing Wine application and bottle.
+    private func setUpWindowsGame(_ entry: GameEntry) {
+        let library = GameLibrary.shared
+        guard let imported = entry.crossOver, WindowsOpenXRSupport.enabled else {
+            let done = library.setUp(entry)
+            companion?.model.notice = done ? "\(entry.name) is set up" : "Couldn't set up \(entry.name)"
+            return
+        }
+        guard let installation = library.selectedCrossOverInstallation else {
+            notify("Choose a CrossOver version in Games", kind: .warning); return
+        }
+        let backend = WindowsOpenXRSupport.backend
+        guard pendingCrossOverLaunches.insert(imported.bottle.path).inserted else { return }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { self.pendingCrossOverLaunches.remove(imported.bottle.path); library.refresh() }
+            do {
+                try self.game?.prepareWindowsOpenXR(backend)
+                try await Task.detached(priority: .userInitiated) {
+                    try WindowsOpenXRSupport.configure(prefix: imported.bottle, installation: installation, enabled: true, backend: backend)
+                }.value
+                if backend == .external {
+                    try OpenVRRegistration.uninstall(prefix: imported.bottle, runtime: GameBridge.folder)
+                } else {
+                    let root = backend == .automatic
+                        ? OpenVRRegistration.automaticRuntimeRoot(prefix: imported.bottle, baseRuntime: GameBridge.folder) : GameBridge.folder
+                    guard library.setUp(entry, runtime: root) else { throw LaunchFailure("Couldn't register the OpenVR runtime for this bottle.") }
+                }
+                self.notify("\(entry.name) is ready · launch from Steam or CrossOver", symbol: "gamecontroller")
+            } catch { self.notify(error.localizedDescription, kind: .warning) }
+        }
+    }
+
+    /// Changing the selector applies to bottles the user has already configured; merely
+    /// discovering another bottle never authorizes changing its runtime.
+    private func refreshConfiguredWindowsRuntimes() {
+        let library = GameLibrary.shared
+        guard let installation = library.selectedCrossOverInstallation else { return }
+        let enabled = WindowsOpenXRSupport.enabled, backend = WindowsOpenXRSupport.backend
+        let prefixes = Set(library.games.compactMap { $0.crossOver?.bottle })
+            .filter { WineOpenXRRegistration.hasSetupReceipt(prefix: $0) }
+        for prefix in prefixes where pendingCrossOverLaunches.insert(prefix.path).inserted {
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.pendingCrossOverLaunches.remove(prefix.path); library.refresh() }
+                do {
+                    if enabled { try self.game?.prepareWindowsOpenXR(backend) }
+                    try await Task.detached(priority: .userInitiated) {
+                        try WindowsOpenXRSupport.configure(prefix: prefix, installation: installation, enabled: enabled, backend: backend)
+                    }.value
+                    if enabled && backend == .external {
+                        try OpenVRRegistration.uninstall(prefix: prefix, runtime: GameBridge.folder)
+                    } else {
+                        let root = enabled && backend == .automatic
+                            ? OpenVRRegistration.automaticRuntimeRoot(prefix: prefix, baseRuntime: GameBridge.folder) : GameBridge.folder
+                        _ = try OpenVRRegistration.install(prefix: prefix, runtime: root)
+                    }
+                } catch { self.notify(error.localizedDescription, kind: .warning) }
+            }
+        }
+    }
+
     private func play(_ g: GameEntry) {
         if let package = g.quest {
             playQuestApp(package)
             return
         }
+        applyGameImageReconfiguration()
+        if let game = g.crossOver {
+            guard let installation = GameLibrary.shared.selectedCrossOverInstallation else {
+                notify("Choose a CrossOver version in Games", kind: .warning)
+                return
+            }
+            do { _ = try CrossOverLaunchCommand.steam(installation: installation, game: game) }
+            catch { notify(error.localizedDescription, kind: .warning); return }
+            let windowsOpenXR = WindowsOpenXRSupport.enabled
+            let windowsBackend = WindowsOpenXRSupport.backend
+            guard pendingCrossOverLaunches.insert(game.bottle.path).inserted else { return }
+            Task { @MainActor [weak self] in
+                guard let self else { return }
+                defer { self.pendingCrossOverLaunches.remove(game.bottle.path) }
+                do {
+                    if windowsOpenXR {
+                        guard let bridge = self.game else { throw LaunchFailure("Open Halliday's VR view before starting an OpenXR game.") }
+                        try bridge.prepareWindowsOpenXR(windowsBackend)
+                    }
+                    try await Task.detached(priority: .userInitiated) {
+                        try WindowsOpenXRSupport.configure(prefix: game.bottle, installation: installation, enabled: windowsOpenXR, backend: windowsBackend)
+                    }.value
+                    if windowsOpenXR {
+                        if windowsBackend == .external {
+                            try OpenVRRegistration.uninstall(prefix: game.bottle, runtime: GameBridge.folder)
+                        } else {
+                            let root = windowsBackend == .automatic
+                                ? OpenVRRegistration.automaticRuntimeRoot(prefix: game.bottle, baseRuntime: GameBridge.folder) : GameBridge.folder
+                            _ = try OpenVRRegistration.install(prefix: game.bottle, runtime: root)
+                        }
+                    }
+                    try self.crossOverLauncher.launch(game, using: installation) { [weak self] reason in
+                        GameLibrary.shared.expectLaunch(nil)
+                        self?.notify(reason, kind: .warning)
+                    }
+                    GameLibrary.shared.expectLaunch(g)
+                    log("[games] starting \(g.name) through \(installation.name) in \(game.bottle.lastPathComponent)")
+                    self.notify("Starting \(g.name)", symbol: "gamecontroller", kind: .progress, seconds: 20)
+                } catch {
+                    self.notify(error.localizedDescription, kind: .warning)
+                }
+            }
+            return
+        }
         guard let url = GameLibrary.playURL(g) else { return }
+        GameLibrary.shared.expectLaunch(g)
         log("[games] starting \(g.name) through GameHub")
         notify("Starting \(g.name)", symbol: "gamecontroller", kind: .progress, seconds: 20)
         NSWorkspace.shared.open(url)
+    }
+
+    private func undoWindowsGame(_ game: GameEntry) {
+        let installation = GameLibrary.shared.selectedCrossOverInstallation
+        let operationKey = game.crossOver?.bottle.path
+        if let operationKey, !pendingCrossOverLaunches.insert(operationKey).inserted {
+            notify("This bottle's VR settings are already being changed", kind: .warning)
+            return
+        }
+        Task { @MainActor [weak self] in
+            guard let self else { return }
+            defer { if let operationKey { self.pendingCrossOverLaunches.remove(operationKey) } }
+            var problems: [String] = []
+            if let imported = game.crossOver, FileManager.default.fileExists(atPath: WineOpenXRRegistration.receiptURL(prefix: imported.bottle).path) {
+                do {
+                    guard let installation else { throw LaunchFailure("Choose the CrossOver version for this bottle before Undo.") }
+                    try await Task.detached(priority: .userInitiated) {
+                        try WindowsOpenXRSupport.configure(prefix: imported.bottle, installation: installation, enabled: false)
+                    }.value
+                } catch { problems.append(error.localizedDescription) }
+            }
+            // Each API has its own receipt: a foreign OpenXR change must not prevent OpenVR Undo.
+            if !GameLibrary.shared.undo(game) {
+                problems.append("OpenVR settings changed elsewhere and were left untouched.")
+            }
+            if problems.isEmpty {
+                self.companion?.model.notice = "\(game.name)'s bottle uses its previous VR settings again"
+                self.notify("VR settings restored", symbol: "arrow.uturn.backward")
+            } else {
+                let message = "Some VR settings were left unchanged. " + problems.joined(separator: " ")
+                self.companion?.model.notice = message
+                self.notify(message, kind: .warning)
+            }
+        }
+    }
+
+    private func importWindowsGame() {
+        let bottlePicker = NSOpenPanel()
+        bottlePicker.title = "Choose the game's existing CrossOver bottle"
+        bottlePicker.message = "Choose the bottle folder containing drive_c. Its games and settings stay in place."
+        bottlePicker.canChooseDirectories = true
+        bottlePicker.canChooseFiles = false
+        bottlePicker.directoryURL = FileManager.default.homeDirectoryForCurrentUser
+            .appendingPathComponent("Library/Application Support/CrossOver/Bottles")
+        guard bottlePicker.runModal() == .OK, let bottle = bottlePicker.url,
+              FileManager.default.fileExists(atPath: bottle.appendingPathComponent("drive_c").path) else { return }
+        let executablePicker = NSOpenPanel()
+        executablePicker.title = "Choose the Windows game's executable"
+        executablePicker.canChooseDirectories = false
+        executablePicker.canChooseFiles = true
+        guard executablePicker.runModal() == .OK, let executable = executablePicker.url,
+              executable.pathExtension.lowercased() == "exe" else { return }
+        guard GameLibrary.shared.addCrossOverExecutable(executable, bottle: bottle) else {
+            companion?.model.notice = "Couldn't add this executable. Choose an existing CrossOver bottle and a Windows .exe file."
+            return
+        }
+        companion?.model.notice = "Added \(executable.deletingPathExtension().lastPathComponent). Set up selects Halliday for its bottle."
     }
 
     // --- Quest apps (ROADMAP W15.3; `QuestApps.swift`) ---
@@ -3639,11 +4373,35 @@ if !open, passthroughForVideo {
 
     private var lastTitleUpdate = CACurrentMediaTime()
 
+    private func updateAutomaticVRPolicy() {
+        let tick = CACurrentMediaTime()
+        guard tick < lastAutomaticVRPoll || tick - lastAutomaticVRPoll >= 0.5 else { return }
+        lastAutomaticVRPoll = tick
+        updateGameAudio()
+        applyPreferredHeadsetRefresh()
+        let now = Date()
+        let ready = onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected && game != nil
+        automaticVRPolicy.update(hallidayReady: ready, worn: ready && usb?.headset.status?.worn == true,
+                                 externalActive: WindowsOpenXRSupport.externalIsActive(now: now), now: now)
+        if let error = automaticVRPolicy.takeError() { log("[games] \(error)") }
+    }
+
+    /// Renderer-independent system mix; output is pinned to the headset.
+    /// Polling notices unplug/reconnect and a manually changed Mac output.
+    private func updateGameAudio() {
+        systemGameAudio.setState(enabled: Settings.shared.gameSystemAudio,
+            gameActive: game?.isPresenting == true,
+            psvrConnected: onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected,
+            volume: playerMuted ? 0 : Settings.shared.volume)
+    }
+
     private func frameTick(head: HeadPose) {
         guard let view, let renderer else { return }
         lastHead = head
+        syncControllerDesktopOwnership()
         updateSense(head: head)
         updateCameras()
+        updateAutomaticVRPolicy()
         updatePassthrough()
         // The eyes are as far apart as the headset's dial says (it was a fixed 64 mm).
         if view.source.name == "headset", let mm = usb?.headset.status?.ipdMm, (50...80).contains(mm), abs(renderer.ipd * 1000 - Float(mm)) > 0.5 {
@@ -3654,7 +4412,6 @@ if !open, passthroughForVideo {
         let input = InputState.shared
         input.publish(headPosition: head.position, headOrientation: head.orientation, windows: windowManager?.snapshots ?? [],
                       blockers: panels.map(\.snapshot))
-        renderer.cursorDirection = head.orientation.act(input.pointerDirection)
         // WebXR pages follow the head: every frame during an immersive session, ~10 Hz otherwise so
         // reference spaces created on entering VR already start from the real pose.
         windowManager?.capturesEveryFrame = browser?.xrActive == true
@@ -3683,7 +4440,8 @@ if !open, passthroughForVideo {
         // A Quest app (an OpenXR application) draws with the pose as given: it gets the head as
         // predicted for when its frame is seen. (Windows games' runtime predicts by itself.)
         let gameLead = QuestApps.shared.runningPackage != nil && Self.predictsForApps ? min(game?.lead ?? 0, 0.08) : 0
-        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead)) {
+        if let shown = game?.tick(head: head, ahead: headAhead(head, by: gameLead), allowImageAcquisition: renderer.sceneImageAcquisitionAllowed,
+            autoCadenceEligible: onHeadset && headsetDisplayNow != nil && usb?.headset.linkState == .connected && usb?.headset.status?.worn == true) {
             renderer.projection = shown.projection
             // Its overlays, and Halliday's notices (the hint at its start, "set up" messages).
             renderer.gameLayers = shown.layers + (notice.map { $0.isVisible ? [$0.layer] : [] } ?? [])
@@ -3697,6 +4455,8 @@ if !open, passthroughForVideo {
             renderer.gameBackgroundFade = .zero
         }
         if browser?.xrActive != true, game?.isPresenting != true, renderer.projection != nil { renderer.projection = nil }
+        updatePerformanceHUD()
+        renderer.presentationContent(game: game?.isPresenting == true, producer: game?.focusProducer?.lease)
         // Halliday over the game: its world dims and blurs in (420 ms) and out.
         let awayTarget: Float = gameAway && game?.isPresenting == true ? 1 : 0
         let awayNow = CACurrentMediaTime()
@@ -3764,7 +4524,7 @@ if !open, passthroughForVideo {
         let side: Float = senseHand == .left ? -1 : 1
         // With `--hands`, from where the cameras saw that controller.
         let seen = senseHasPointer ? handPlace(senseHand) : nil
-        renderer.saber = Saber(start: seen ?? head.position + heading.act(senseHasPointer ? SIMD3(side * 0.20, -0.30, -0.42) : SIMD3(0.10, -0.30, -0.12)),
+        var menuPointer: Saber? = Saber(start: seen ?? head.position + heading.act(senseHasPointer ? SIMD3(side * 0.20, -0.30, -0.42) : SIMD3(0.10, -0.30, -0.12)),
                                end: head.position + pointerWorld * (landing ?? (senseHasPointer ? 4 : 1.6)),
                                landsOnSurface: landing != nil,
                                mode: pointerDown || drag != nil ? .pressed : (overTarget ? .overTarget : .idle),
@@ -3772,12 +4532,13 @@ if !open, passthroughForVideo {
         // Watching a video with its controls put away: no beam and no hilt either. They come back
         // with the controls, on a pull of the trigger or the grip (never the controller moving)
         // or the mouse.
-        if video?.isOpen == true, !chromeShown, !gameActive { renderer.saber = nil }
+        if video?.isOpen == true, !chromeShown, !gameActive { menuPointer = nil }
         // A hand pointing at one of the game's overlays that takes the mouse: the saber from it.
-        if gameActive, let p = game?.pointing {
-            renderer.saber = Saber(start: p.from, end: p.to, landsOnSurface: true, mode: p.pressed ? .pressed : .overTarget, fromHand: true)
+        let overlayPointer = game?.pointing.map { p in
+            Saber(start: p.from, end: p.to, landsOnSurface: true, mode: p.pressed ? .pressed : .overTarget, fromHand: true)
         }
-        updateAppCursor(on: hitLayer, at: head.position + pointerWorld * (landing ?? 1.6))
+        renderer.setInterfacePointer(menuPointer, direction: pointerWorld, gameActive: gameActive, gameOverlay: overlayPointer)
+        updateAppCursor(on: gameActive ? nil : hitLayer, at: head.position + pointerWorld * (landing ?? 1.6))
         // Follow the real windows and their menus/popovers (~15 Hz; only asks the window server).
         if CACurrentMediaTime() - lastFrameRefresh > 1.0 / 15 {
             lastFrameRefresh = CACurrentMediaTime()
@@ -3914,7 +4675,7 @@ if !open, passthroughForVideo {
 
     /// Places the dock when needed and keeps what it shows current (it redraws only on changes).
     private func updateDock(head: HeadPose) {
-        guard let dock, let view else { return }
+        guard let dock, view != nil else { return }
         let now0 = CACurrentMediaTime()
         let dt = Float(min(0.1, now0 - lastFollowTime))
         lastFollowTime = now0
@@ -3953,12 +4714,15 @@ if !open, passthroughForVideo {
     /// The virtual displays are invisible: outside an interaction, a cursor that wanders onto one
     /// (it sits next to the real displays) is brought back to the main display.
     private func keepCursorOffVirtualDisplay() {
-        guard !mouseOwner.isOn, !pointerLocked, let location = CGEvent(source: nil)?.location,
-              [windowManager?.virtualDisplayBounds, game?.framesDisplayBounds].contains(where: { $0?.contains(location) == true })
-        else { return }
-        let main = CGDisplayBounds(CGMainDisplayID())
+        guard let location = CGEvent(source: nil)?.location else { return }
+        let headsetBounds = headsetDisplayNow.flatMap(Self.displayID).map { CGDisplayBounds($0) }
+        let unavailable = [windowManager?.virtualDisplayBounds, game?.framesDisplayBounds, headsetBounds]
+            .contains(where: { $0?.contains(location) == true })
+        guard ControllerPointerPolicy.shouldParkCursor(locked: pointerLocked,
+            macWindowInteraction: mouseOwner.isOn, inUnavailableDisplay: unavailable,
+            gamePresenting: game?.isPresenting == true) else { return }
         view?.skipNextDelta = true
-        CGWarpMouseCursorPosition(CGPoint(x: main.midX, y: main.midY))
+        CGWarpMouseCursorPosition(MouseOwner.desktopParkingPoint)
     }
 
     // --- MouseOwnerDelegate ---
@@ -3979,14 +4743,21 @@ if !open, passthroughForVideo {
     func mouseOwnershipChanged(_ owned: Bool) {
         // While Halliday owns the mouse, the preview window lets clicks through to the windows
         // behind it (the redirected events land on the real windows' positions).
-        window?.ignoresMouseEvents = owned
+        window?.ignoresMouseEvents = owned || window is HeadsetWindow
         view?.pointerFromTap = owned
         // The tap positions the real cursor itself while a window is in use.
         if owned { setPointerLock(false) }
         if !owned {
+            guard controllerPointerPolicy.allowsAutomaticReclaim else {
+                pointerEngaged = false
+                focusWasEngaged = false
+                setPointerLock(false)
+                updateTitle()
+                return
+            }
             // Back to Halliday: take the keyboard back from the window's app too.
-            NSApp.activate()
-            window?.makeKeyAndOrderFront(nil)
+            activateSceneApplication()
+            raiseSceneWindowForDesktopInput()
             window?.makeFirstResponder(view)
             pointerEngaged = true
             setPointerLock(true)
@@ -4001,15 +4772,15 @@ if !open, passthroughForVideo {
             : !pointerLocked ? "mouse free · click inside to control VR"
             : (windowManager?.windows.isEmpty != false ? "press M to pick windows · Control twice frees the mouse"
                                                        : "click a window to use it · Control twice frees the mouse")
-        window.title = "Halliday — \(view.source.name): \(view.source.state) — \(lens) — \(mouseState)"
+        window.title = "\(RuntimePaths.displayName) — \(view.source.name): \(view.source.state) — \(lens) — \(mouseState)"
     }
 }
 
-/// The window on the headset's display. A borderless window refuses the keyboard unless it says
-/// otherwise: without it, no key or click reached Halliday.
+/// A physical headset is an output surface. Controller UI is dispatched locally;
+/// it must never become the Mac's key/main window or hide its desktop cursor.
 final class HeadsetWindow: NSWindow {
-    override var canBecomeKey: Bool { true }
-    override var canBecomeMain: Bool { true }
+    override var canBecomeKey: Bool { false }
+    override var canBecomeMain: Bool { false }
 }
 
 /// The preview window. It can cover the whole screen, menu bar included, without being a macOS

@@ -42,7 +42,7 @@ struct SceneUniforms {
     float4 projTanOther;     // desktop view: the other eye's FOV tangents, for what this eye's image doesn't cover (0: none)
     float4 gameFade;         // a game's fade over its frames (IVRCompositor::FadeToColor), premultiplied
     float4 gameBackgroundFade; // … over the place shown when it sends none (bBackground)
-    float4 gameAway;         // x: Halliday is up over the game (0..1): its frames dimmed and blurred; y: 1 = its picture's alpha is meant (the room may show where it is clear)
+    float4 gameAway;         // x: dashboard amount; y: premultiplied alpha; z/w: left/right transfer (0 legacy, 1 linear, 2 sRGB)
     // Passthrough (the room, through the headset's bottom cameras).
     float4x4 seeFromWorld;   // the cameras' frame (x right, y down, z forward) at the exposure, from world
     float4 seeParams;        // x: how much is shown (0..1), y: focal length (pixels), z: this eye's camera's centre x, w: centre y
@@ -51,6 +51,8 @@ struct SceneUniforms {
     float4x4 seeFishLeft;
     float4x4 seeFishRight;
     float4 seeFish;          // x: 1 = the picture is the two fisheyes one above the other (BC4); y, z: k2 left, right
+    float4x4 projFromWorldOther;
+    float4 projShiftOther;   // w < 0: legacy desktop fallback uses the common camera
 };
 
 // The room as this eye's own bottom camera saw it, for the ray `d`: the picture holds the left
@@ -105,15 +107,20 @@ static float3 see_through(float3 d, float eye, constant SceneUniforms &u, textur
     return float3(grey) * inside;
 }
 
+\(projectionColourShaderFunctions)
+\(openXRCompositionShaderFunctions)
+
 // A game's frame while Halliday is over it (design board 14, A): blurred by `away` (a ring of taps
 // around `uv`, `texel` the size of one source pixel) and darkened, a little desaturated.
-static float3 game_away(texture2d<float> tex, sampler smp, float2 uv, float2 texel, float away, float3 sharp) {
+static float3 game_away(texture2d<float> tex, sampler smp, float2 uv, float2 texel, float away,
+                        float3 sharp, float4 rect, uint eye, uint colour) {
     float3 sum = sharp;
     float r = away * 9.0;
     for (int i = 0; i < 12; i++) {
         float a = float(i) * 0.5235988;
         float2 off = float2(cos(a), sin(a)) * texel * (i % 2 == 0 ? r : r * 0.5);
-        sum += tex.sample(smp, uv + off, level(0.0)).rgb;
+        float2 tap = projection_clamp_eye_uv(tex, uv + off, rect, eye, colour);
+        sum += tex.sample(smp, tap, level(0.0)).rgb;
     }
     float3 soft = sum / 13.0;
     float grey = dot(soft, float3(0.2126, 0.7152, 0.0722));
@@ -789,6 +796,8 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
                          constant SceneUniforms &u [[buffer(0)]],
                          constant LayerData *layers [[buffer(1)]],
                          constant float4 *fireflies [[buffer(2)]],
+                         constant OpenXRCompositionHeader &xrComposition [[buffer(3)]],
+                         constant OpenXRCompositionPlane *xrPlanes [[buffer(4)]],
                          array<texture2d<float>, MAX_LAYERS> textures [[texture(0)]],
                          texture2d<float> projTexture [[texture(24)]],
                          texture2d<float> videoTexture [[texture(25)]],
@@ -797,6 +806,9 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
                          texture2d<float> meshColor [[texture(51)]],
                          texture2d<float> meshDistance [[texture(52)]],
                          texture2d<float> cameraPicture [[texture(53)]],
+                         texture2d<float> projSRGBTexture [[texture(54)]],
+                         array<texture2d<float>, OPENXR_MAX_PANELS> xrTextures [[texture(55)]],
+                         array<texture2d<float>, OPENXR_MAX_PANELS> xrSRGBTextures [[texture(63)]],
                          sampler smp [[sampler(0)]]) {
     float tx = mix(u.tanLRUD.x, u.tanLRUD.y, in.uv.x);
     float ty = mix(u.tanLRUD.z, u.tanLRUD.w, in.uv.y);
@@ -810,6 +822,8 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
     bool immersive = u.projFlags.x > 0.5;
     float3 page = float3(0.0);
     float pageAlpha = 1.0;
+    bool pageCovered = false;
+    bool projectionPremultiplied = xrComposition.values.w != 0 ? xrComposition.values.z == 1 : u.gameAway.y > 0.5;
     float videoKeep = 1.0; // how much of a passthrough video's pixel is its own (the rest is the room's)
     if (immersive) {
         // Positional reprojection: the point this ray meets at the assumed depth, seen from where
@@ -823,14 +837,20 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
             if (all(eyeUV >= 0.0) && all(eyeUV <= 1.0)) {
                 float2 sbs = float2((u.projFlags.y + eyeUV.x) * 0.5, eyeUV.y);
                 float2 uv = u.projUV.xy + sbs * u.projUV.zw;
-                float4 drawn = projTexture.sample(smp, uv, level(0.0));
+                uint colour = uint(u.projFlags.y < 0.5 ? u.gameAway.z : u.gameAway.w);
+                uint sourceEye = uint(u.projFlags.y);
+                uv = projection_clamp_eye_uv(projTexture, uv, u.projUV, sourceEye, colour);
+                float4 drawn = projection_sample(projTexture, projSRGBTexture, smp, uv, colour);
+                pageCovered = true;
                 page = drawn.rgb;
                 pageAlpha = drawn.a;
                 if (u.gameAway.x > 0.001) {
                     float2 texel = 1.0 / float2(projTexture.get_width(), projTexture.get_height());
-                    page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page);
+                    if (colour == 2) page = game_away(projSRGBTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, sourceEye, colour);
+                    else page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, sourceEye, colour);
                 }
-            } else if (u.projTanOther.y > u.projTanOther.x) {
+                page = projection_display_rgb(page, pageAlpha, colour, projectionPremultiplied);
+            } else if (u.projTanOther.y > u.projTanOther.x && u.projShiftOther.w < 0) {
                 // The desktop view is wider than one eye's image on its inner side: the other eye
                 // (the right one) covers it.
                 float2 otherUV = float2((tanXY.x - u.projTanOther.x) / (u.projTanOther.y - u.projTanOther.x),
@@ -838,16 +858,56 @@ fragment float4 scene_fs(FullscreenOut in [[stage_in]],
                 if (all(otherUV >= 0.0) && all(otherUV <= 1.0)) {
                     float2 sbs = float2((1.0 + otherUV.x) * 0.5, otherUV.y);
                     float2 uv = u.projUV.xy + sbs * u.projUV.zw;
-                    page = projTexture.sample(smp, uv, level(0.0)).rgb;
+                    uint colour = uint(u.gameAway.w);
+                    uv = projection_clamp_eye_uv(projTexture, uv, u.projUV, 1, colour);
+                    float4 drawn = projection_sample(projTexture, projSRGBTexture, smp, uv, colour);
+                    pageCovered = true;
+                    if (xrComposition.values.w != 0) pageAlpha = drawn.a;
+                    page = drawn.rgb;
                     if (u.gameAway.x > 0.001) {
                         float2 texel = 1.0 / float2(projTexture.get_width(), projTexture.get_height());
-                        page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page);
+                        if (colour == 2) page = game_away(projSRGBTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
+                        else page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
                     }
+                    page = projection_display_rgb(page, drawn.a, colour, projectionPremultiplied);
+                }
+            }
+        }
+        // A desktop ray may be outside the left camera (or behind it) while an
+        // independently rendered right eye covers it. Keep the legacy branch
+        // above unchanged when there is no submitted per-eye geometry.
+        if (!pageCovered && u.projShiftOther.w >= 0 && u.projTanOther.y > u.projTanOther.x) {
+            float3 otherDirection = u.projShiftOther.w > 0
+                ? normalize(d * u.projShiftOther.w + u.projShiftOther.xyz) : d;
+            float3 otherRay = (u.projFromWorldOther * float4(otherDirection, 0)).xyz;
+            if (otherRay.z < -1e-4) {
+                float2 t = otherRay.xy / -otherRay.z;
+                float2 otherUV((t.x - u.projTanOther.x) / (u.projTanOther.y - u.projTanOther.x),
+                               (u.projTanOther.z - t.y) / (u.projTanOther.z - u.projTanOther.w));
+                if (all(otherUV >= 0) && all(otherUV <= 1)) {
+                    float2 uv = u.projUV.xy + float2((1 + otherUV.x) * 0.5, otherUV.y) * u.projUV.zw;
+                    uint colour = uint(u.gameAway.w);
+                    uv = projection_clamp_eye_uv(projTexture, uv, u.projUV, 1, colour);
+                    float4 drawn = projection_sample(projTexture, projSRGBTexture, smp, uv, colour);
+                    pageCovered = true; page = drawn.rgb; pageAlpha = drawn.a;
+                    if (u.gameAway.x > 0.001) {
+                        float2 texel = 1.0 / float2(projTexture.get_width(), projTexture.get_height());
+                        if (colour == 2) page = game_away(projSRGBTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
+                        else page = game_away(projTexture, smp, uv, texel, u.gameAway.x, page, u.projUV, 1, colour);
+                    }
+                    page = projection_display_rgb(page, pageAlpha, colour, projectionPremultiplied);
                 }
             }
         }
     }
 
+    if (immersive && xrComposition.values.w != 0) {
+        float4 combined = openxr_compose(o, d, uint(u.projFlags.y), float4(page, pageAlpha),
+            pageCovered, projectionPremultiplied, xrComposition, xrPlanes, xrTextures, xrSRGBTextures, smp);
+        // Independent OpenXR currently advertises OPAQUE environment blending:
+        // transparency between its layers resolves over black, not Halliday's room.
+        page = combined.rgb; pageAlpha = 1.0;
+    }
     float eye = u.projFlags.y;
 
     // Video sphere: the whole surroundings are the video.
@@ -1366,6 +1426,7 @@ struct DistortOut {
     float2 lensG;
     float2 lensB;
     float eye [[flat]];
+    float4 tangents [[flat]];
 };
 
 // Late latching (LateLatch.swift): the turn from the view shown to the view the eye texture was
@@ -1404,25 +1465,54 @@ vertex DistortOut distort_vs(uint vid [[vertex_id]],
     o.uvG = warped(v.uvG, warp.rotation, t, turn);
     o.uvB = warped(v.uvB, warp.rotation, t, turn);
     o.lensR = v.uvR; o.lensG = v.uvG; o.lensB = v.uvB;
-    o.eye = eye;
+    o.eye = eye; o.tangents = t;
     return o;
 }
 
-static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, float eye, int c) {
-    if (any(lens < 0.0) || any(lens > 1.0)) return 0.0;
-    // A turned point just past the eye texture's edge takes the edge (a late turn is a fraction
-    // of a degree); the lens's own edge stays where it was.
-    uv = clamp(uv, 0.0, 1.0);
+// A finite-distance head-locked plane, sampled through ORIGINAL calibrated
+// lens coordinates. It does not inherit scene rotation, rolling scan or game crop.
+static float4 performanceHUD(texture2d<float> hud, sampler s, float2 lens, float eye,
+                             float4 tangents, constant float4 *overlay) {
+    if (overlay[1].z < 0.5) return float4(0.0);
+    float2 ray = float2(mix(tangents.x, tangents.y, lens.x), mix(tangents.z, tangents.w, lens.y));
+    float2 hit = ray * overlay[1].x + float2((eye < 0.5 ? -0.5 : 0.5) * overlay[1].y, 0.0);
+    float2 uv = float2((hit.x - overlay[0].x) / overlay[0].z, (overlay[0].y - hit.y) / overlay[0].w);
+    if (any(uv < 0.0) || any(uv > 1.0)) return float4(0.0);
+    return hud.sample(s, uv, level(0.0));
+}
+
+static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, float eye, int c,
+                     texture2d<float> hud, float4 tangents, constant float4 *overlay) {
+    // Keep the sample centre inside this eye's texel centres. Gradient sampling
+    // is evaluated before the lens mask; implicit derivatives after a divergent
+    // early return are undefined for partially covered fragment quads.
+    float2 halfTexel = float2(1.0 / float(tex.get_width()), 0.5 / float(tex.get_height()));
+    uv = clamp(uv, halfTexel, 1.0 - halfTexel);
     float2 sbs = float2((eye + uv.x) * 0.5, uv.y);
-    return tex.sample(s, sbs)[c];
+    float2 dx = dfdx(sbs), dy = dfdy(sbs);
+    // A valid centre alone does not bound an anisotropic footprint at the SBS
+    // seam. Keep anisotropy in the interior; the seam's footprint falls back to
+    // a single bilinear sample without borrowing the other eye's texels.
+    float radius = 0.5 * (abs(dx.x) + abs(dy.x)) + 0.5 / float(tex.get_width());
+    float distance = eye < 0.5 ? 0.5 - sbs.x : sbs.x - 0.5;
+    bool atSeam = distance <= radius;
+    float2 gx = atSeam ? float2(0.0) : dx, gy = atSeam ? float2(0.0) : dy;
+    float value = tex.sample(s, sbs, gradient2d(gx, gy))[c];
+    if (overlay[1].z > 0.5) {
+        float4 instrument = performanceHUD(hud, s, lens, eye, tangents, overlay);
+        value = instrument[c] + value * (1.0 - instrument.a); // premultiplied display bytes
+    }
+    return (any(lens < 0.0) || any(lens > 1.0)) ? 0.0 : value;
 }
 
 fragment float4 distort_fs(DistortOut in [[stage_in]],
                            texture2d<float> eyes [[texture(0)]],
+                           texture2d<float> hud [[texture(1)]],
+                           constant float4 *overlay [[buffer(0)]],
                            sampler smp [[sampler(0)]]) {
-    return float4(channel(eyes, smp, in.uvR, in.lensR, in.eye, 0),
-                  channel(eyes, smp, in.uvG, in.lensG, in.eye, 1),
-                  channel(eyes, smp, in.uvB, in.lensB, in.eye, 2), 1.0);
+    return float4(channel(eyes, smp, in.uvR, in.lensR, in.eye, 0, hud, in.tangents, overlay),
+                  channel(eyes, smp, in.uvG, in.lensG, in.eye, 1, hud, in.tangents, overlay),
+                  channel(eyes, smp, in.uvB, in.lensB, in.eye, 2, hud, in.tangents, overlay), 1.0);
 }
 
 // --- Video: YUV (biplanar 4:2:0) to RGB, into a texture the scene samples ---
@@ -1471,7 +1561,17 @@ fragment float4 yuv_fs(FullscreenOut in [[stage_in]],
 // Undistorted view (distortion off): the side-by-side eye texture stretched over the output.
 fragment float4 passthrough_fs(FullscreenOut in [[stage_in]],
                                texture2d<float> eyes [[texture(0)]],
+                               texture2d<float> hud [[texture(1)]],
+                               constant float4 *overlay [[buffer(0)]],
+                               constant float4 *tangents [[buffer(1)]],
                                sampler smp [[sampler(0)]]) {
-    return eyes.sample(smp, in.uv);
+    float4 scene = eyes.sample(smp, in.uv);
+    if (overlay[1].z > 0.5) {
+        float eye = in.uv.x < 0.5 ? 0.0 : 1.0;
+        float2 lens = float2(in.uv.x * 2.0 - eye, in.uv.y);
+        float4 instrument = performanceHUD(hud, smp, lens, eye, tangents[uint(eye)], overlay);
+        scene.rgb = instrument.rgb + scene.rgb * (1.0 - instrument.a);
+    }
+    return scene;
 }
 """

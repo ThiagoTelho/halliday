@@ -13,6 +13,7 @@
 //! to its fusion unchanged); the orientation turns that frame into the tracking space's.
 
 use crate::math::{Quat, Vec3};
+pub use crate::sense_orientation_history::OrientationHistory;
 
 pub const VENDOR_ID: u16 = 0x054C;
 pub const PRODUCT_ID_LEFT: u16 = 0x0E45;
@@ -240,6 +241,78 @@ pub fn led_report(
     r
 }
 
+/// A Bluetooth vibration-only output report, from Monado's pssense driver
+/// ae43b1893e4544189bb6333c79e19dc3ecfee673 (BSL-1.0; THIRD-PARTY.md).
+/// This standalone builder has no previous tracking-LED settings. Once LEDs
+/// are programmed, use [`vibration_report_retaining_led`] so an unrelated
+/// vibration report cannot latch phase INIT with a zero LED sequence. The actuator
+/// offers 60/120 Hz and classic-rumble modes, rather than arbitrary PCM frequency.
+/// Zero amplitude explicitly stops it. Duration/resend policy belongs to the
+/// caller: Monado documents a five-second device timeout and two-second refresh.
+pub fn vibration_report(
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+) -> [u8; OUTPUT_REPORT_LEN] {
+    let mut report = [0; OUTPUT_REPORT_LEN];
+    report[0] = 0x31;
+    report[1] = (sequence & 0x0f) << 4;
+    report[2] = 0x10;
+    let mode = if frequency_hz.is_finite() && frequency_hz > 0.0 && frequency_hz <= 70.0 {
+        0x20
+    } else if frequency_hz.is_finite() && frequency_hz >= 110.0 {
+        0x00
+    } else {
+        0x40
+    };
+    report[3] = 0x03 | mode;
+    report[5] = if amplitude.is_finite() {
+        (amplitude.clamp(0.0, 1.0) * 255.0) as u8
+    } else {
+        0
+    };
+    report[18..22].copy_from_slice(&host_us.to_le_bytes());
+    report[41] = counter;
+    let crc = crc32(&[0xa2], &report[..OUTPUT_REPORT_LEN - 4]);
+    report[OUTPUT_REPORT_LEN - 4..].copy_from_slice(&crc.to_le_bytes());
+    report
+}
+
+/// Compose vibration and the same connection's most recently programmed LED
+/// settings. LED settings have their own latch sequence: zeroing them in an
+/// otherwise valid haptic packet is a new LED command, not an omitted field.
+/// Match Monado's per-device output composition without advancing that latch.
+/// `None` retains the standalone, not-yet-programmed output format.
+pub fn vibration_report_retaining_led(
+    sequence: u8,
+    counter: u8,
+    amplitude: f32,
+    frequency_hz: f32,
+    host_us: u32,
+    programmed: Option<&[u8; OUTPUT_REPORT_LEN]>,
+) -> Option<[u8; OUTPUT_REPORT_LEN]> {
+    let mut report = vibration_report(sequence, counter, amplitude, frequency_hz, host_us);
+    if let Some(programmed) = programmed {
+        let checksum = u32::from_le_bytes(programmed[74..78].try_into().unwrap());
+        if programmed[0] != 0x31
+            || programmed[1] & 0x0f != 0
+            || programmed[2] != 0x10
+            || crc32(&[0xa2], &programmed[..74]) != checksum
+        {
+            return None;
+        }
+        // Only pssense_led_settings: phase, latch, duration, absolute/delta
+        // position, cycle and four LED selectors. Keep fresh haptic flags,
+        // amplitude, transport IDs and host timestamp from this output.
+        report[22..37].copy_from_slice(&programmed[22..37]);
+        let checksum = crc32(&[0xa2], &report[..74]);
+        report[74..78].copy_from_slice(&checksum.to_le_bytes());
+    }
+    Some(report)
+}
+
 /// CRC-32 (the common reflected one) over `seed` then `data`, as the controller computes it.
 fn crc32(seed: &[u8], data: &[u8]) -> u32 {
     let mut crc = 0xFFFF_FFFFu32;
@@ -380,6 +453,7 @@ pub struct Controller {
     /// doesn't count as taken late.
     device_s: f64,
     clock_offset: Option<f64>,
+    orientation_history: OrientationHistory,
 }
 
 impl Controller {
@@ -401,11 +475,13 @@ impl Controller {
             room_yaw: None,
             device_s: 0.0,
             clock_offset: None,
+            orientation_history: OrientationHistory::new(),
         }
     }
 
     pub fn set_calibration(&mut self, calibration: Calibration) {
         self.calibration = calibration;
+        self.orientation_history.reset();
     }
 
     /// Takes one input report (report id first). Returns the parsed report.
@@ -444,13 +520,15 @@ impl Controller {
     /// The accelerometer's sample to the place filter: in the room's frame, gravity taken off,
     /// at the host's time for the moment it was taken.
     fn feed_place(&mut self, accel: Vec3, dt: f32) {
-        if dt <= 0.0 || dt > 0.25 {
+        if dt > 0.25 {
             // A gap: the clocks are matched again, and nothing is carried across it.
             self.clock_offset = None;
-            if dt > 0.25 {
-                self.place.reset();
-            }
+            self.orientation_history.reset();
+            self.place.reset();
         }
+        // A duplicate timestamp is not a new clock epoch. Keeping the existing
+        // minimum offset also makes the position filter ignore that repeated
+        // sample, rather than moving its clock forward by transport delay.
         self.device_s += f64::from(dt.max(0.0));
         let arrived = crate::time::host_time_ns() as f64 * 1e-9;
         let offset = arrived - self.device_s;
@@ -460,6 +538,10 @@ impl Controller {
             .clock_offset
             .map_or(offset, |o| (o + 0.0002 * f64::from(dt)).min(offset));
         self.clock_offset = Some(kept);
+        if self.settled {
+            self.orientation_history
+                .push_device_time((self.device_s * 1e9).round() as i64, self.orientation);
+        }
         let (Some(yaw), true) = (self.room_yaw, self.settled) else {
             return;
         };
@@ -525,9 +607,20 @@ impl Controller {
         Quat::from_axis_angle([0.0, 1.0, 0.0], self.heading) * self.orientation
     }
 
+    /// A bracketed sensor orientation at a camera exposure in the existing
+    /// common host clock. No latest-pose fallback and no extra prediction/wait.
+    pub fn orientation_at_host_ns(&self, exposure_ns: i64) -> Option<Quat> {
+        let offset = (self.clock_offset? * 1e9).round() as i64;
+        let q = self
+            .orientation_history
+            .sample_host_time(exposure_ns, offset)?;
+        Some(Quat::from_axis_angle([0., 1., 0.], self.heading) * q)
+    }
+
     /// Makes the direction the controller points now (its −z, flattened) the heading `yaw`
     /// (radians about y; 0 is the tracking space's forward).
     pub fn recenter(&mut self, yaw: f32) {
+        self.orientation_history.reset();
         self.heading = yaw - self.orientation.yaw();
     }
 
@@ -539,6 +632,15 @@ impl Controller {
     /// Seconds since the newest report was taken (to carry the orientation forward from it).
     pub fn age(&self) -> f32 {
         self.taken.map_or(0.0, |t| t.elapsed().as_secs_f32())
+    }
+
+    /// Sensor sample time on the same monotonic host clock as camera exposures.
+    /// Unlike `age`, this includes the existing minimum-transport clock mapping.
+    /// It is not the time the Bluetooth callback happened to deliver the report.
+    pub fn sample_host_ns(&self) -> Option<i64> {
+        self.newest?;
+        let time = (self.device_s + self.clock_offset?) * 1e9;
+        (time.is_finite() && time > 0. && time < i64::MAX as f64).then(|| time.round() as i64)
     }
 
     pub fn newest(&self) -> Option<InputReport> {
@@ -633,6 +735,61 @@ mod tests {
     }
 
     #[test]
+    fn documented_vibration_modes_and_golden_bluetooth_report() {
+        let report = vibration_report(0x13, 7, 0.5, 60.0, 0x0403_0201);
+        assert_eq!(&report[..8], &[0x31, 0x30, 0x10, 0x23, 0, 127, 0, 0]);
+        assert_eq!(&report[18..22], &[1, 2, 3, 4]);
+        assert_eq!(report[41], 7);
+        // Independent standard CRC-32/zlib vector over A2 followed by the
+        // documented report bytes, rather than calling the encoder's CRC.
+        assert_eq!(&report[74..], &[0x37, 0x08, 0xe1, 0x44]);
+        assert!(report[22..41].iter().all(|b| *b == 0)); // standalone, no retained LED configuration
+        assert_eq!(vibration_report(0, 0, 1.0, 120.0, 0)[3], 0x03);
+        assert_eq!(vibration_report(0, 0, 1.0, 90.0, 0)[3], 0x43);
+        assert_eq!(vibration_report(0, 0, 1.0, 0.0, 0)[3], 0x43);
+        assert_eq!(vibration_report(0, 0, 0.0, 160.0, 0)[5], 0);
+        assert_eq!(vibration_report(0, 0, f32::NAN, 160.0, 0)[5], 0);
+    }
+
+    #[test]
+    fn vibration_retains_led_latch_without_replacing_haptic_transport() {
+        let blink = LedBlink {
+            phase: led_phase::PRESCAN,
+            sequence: 255,
+            period_id: 42,
+            cycle_position: 0xfedc_ba98,
+            cycle_length: 50_050_000,
+        };
+        let led = led_report(3, 7, blink, 123);
+        let standalone = vibration_report(4, 8, 0.5, 60.0, 456);
+        assert_eq!(standalone[23], 0); // This would change the device's LED latch.
+        let kept = vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&led)).unwrap();
+        assert_eq!(&kept[22..37], &led[22..37]);
+        for i in (0..22).chain(37..74) {
+            assert_eq!(kept[i], standalone[i]);
+        }
+        assert_eq!(
+            u32::from_le_bytes(kept[74..78].try_into().unwrap()),
+            crc32(&[0xa2], &kept[..74])
+        );
+        let stopped = vibration_report_retaining_led(5, 9, 0.0, 0.0, 789, Some(&led)).unwrap();
+        assert_eq!(stopped[5], 0);
+        assert_eq!(&stopped[22..37], &led[22..37]);
+        assert_eq!(
+            vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, None),
+            Some(standalone)
+        );
+        let mut damaged = led;
+        damaged[22] ^= 1;
+        assert!(vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&damaged)).is_none());
+        let mut wrong_mode = led;
+        wrong_mode[1] |= 1;
+        let checksum = crc32(&[0xa2], &wrong_mode[..74]);
+        wrong_mode[74..78].copy_from_slice(&checksum.to_le_bytes());
+        assert!(vibration_report_retaining_led(4, 8, 0.5, 60.0, 456, Some(&wrong_mode)).is_none());
+    }
+
+    #[test]
     fn a_damaged_report_is_refused() {
         let mut bytes = hex(RIGHT);
         bytes[4] = 0xFF; // a trigger pull the CRC doesn't cover
@@ -671,6 +828,34 @@ mod tests {
         let crc = crc32(&[0xA1], &b[..74]);
         b[74..78].copy_from_slice(&crc.to_le_bytes());
         b
+    }
+
+    #[test]
+    fn analog_trigger_travel_is_independent_of_digital_click_for_both_hands() {
+        for (hand, click_bit) in [(Hand::Left, 0x40), (Hand::Right, 0x80)] {
+            for pressure in [0u8, 64, 153, 191, 255] {
+                for clicked in [false, true] {
+                    let input = InputReport::parse(
+                        hand,
+                        &report(
+                            [if clicked { click_bit } else { 0 }, 0, 0],
+                            pressure,
+                            [0; 3],
+                            [0; 3],
+                            0,
+                            0,
+                        ),
+                    )
+                    .unwrap();
+                    assert_eq!(input.trigger, f32::from(pressure) / 255.0);
+                    assert_eq!(
+                        input.buttons & buttons::TRIGGER != 0,
+                        clicked,
+                        "digital contact must not overwrite the independent HID travel byte"
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -760,6 +945,152 @@ mod tests {
     const ONE_G: i16 = 4080;
 
     #[test]
+    fn exposure_orientation_history_uses_current_clock_offset_without_changing_live_pose() {
+        for hand in [Hand::Left, Hand::Right] {
+            let mut c = Controller::new(hand);
+            c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], 0, 0))
+                .unwrap();
+            let first = c.orientation;
+            c.ingest(&report(
+                [0; 3],
+                0,
+                [0, counts(1.), 0],
+                [0, ONE_G, 0],
+                50_000,
+                1,
+            ))
+            .unwrap();
+            let current = c.orientation();
+            let device = (c.device_s * 1e9).round() as i64 / 2;
+            let offset = (c.clock_offset.unwrap() * 1e9).round() as i64;
+            let expected = crate::sense_orientation_history::between(
+                (0, first),
+                ((c.device_s * 1e9).round() as i64, c.orientation),
+                device,
+            )
+            .unwrap();
+            let sampled = c.orientation_at_host_ns(device + offset).unwrap();
+            assert!(sampled.angle_to(expected) < 1e-5);
+            assert_eq!(
+                c.orientation(),
+                current,
+                "Historical lookup cannot change the current game pose"
+            );
+            // A lower transport estimate must rebase every sample consistently.
+            c.clock_offset = Some(c.clock_offset.unwrap() - 0.01);
+            let shifted = (c.clock_offset.unwrap() * 1e9).round() as i64;
+            assert!(
+                c.orientation_at_host_ns(device + shifted)
+                    .unwrap()
+                    .angle_to(expected)
+                    < 1e-5
+            );
+            c.recenter(0.4);
+            assert!(c.orientation_at_host_ns(device + shifted).is_none());
+            c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], 100_000, 2))
+                .unwrap();
+            let now =
+                (c.device_s * 1e9).round() as i64 + (c.clock_offset.unwrap() * 1e9).round() as i64;
+            assert_eq!(c.orientation_at_host_ns(now), Some(c.orientation()));
+            let unchanged = c.orientation();
+            c.set_calibration(Calibration::default());
+            assert!(c.orientation_at_host_ns(now).is_none());
+            assert_eq!(c.orientation(), unchanged);
+        }
+    }
+
+    #[test]
+    fn exposure_orientation_history_retires_device_clock_gaps_and_resets() {
+        let mut c = Controller::new(Hand::Left);
+        for i in 0..4 {
+            c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], i * 50_000, i))
+                .unwrap();
+        }
+        let old_device = (c.device_s * 1e9).round() as i64;
+        c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], 1, 5))
+            .unwrap(); // device clock reset
+        let offset = (c.clock_offset.unwrap() * 1e9).round() as i64;
+        assert!(
+            c.orientation_history
+                .sample_host_time(old_device + offset, offset)
+                .is_none()
+        );
+        let current = (c.device_s * 1e9).round() as i64;
+        assert!(
+            c.orientation_history
+                .sample_host_time(current + offset, offset)
+                .is_some()
+        );
+        c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], 3_000_001, 6))
+            .unwrap(); // >250ms gap
+        let offset = (c.clock_offset.unwrap() * 1e9).round() as i64;
+        assert!(
+            c.orientation_history
+                .sample_host_time(current + offset, offset)
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn exposure_orientation_duplicate_report_keeps_the_clock_and_existing_bracket() {
+        let mut c = Controller::new(Hand::Right);
+        c.ingest(&report([0; 3], 0, [0; 3], [0, ONE_G, 0], 0, 0))
+            .unwrap();
+        c.ingest(&report(
+            [0; 3],
+            0,
+            [0, counts(1.), 0],
+            [0, ONE_G, 0],
+            50_000,
+            1,
+        ))
+        .unwrap();
+        let offset = c.clock_offset;
+        let offset_ns = (offset.unwrap() * 1e9).round() as i64;
+        let device = (c.device_s * 1e9).round() as i64 / 2;
+        let expected = c.orientation_at_host_ns(device + offset_ns).unwrap();
+        c.ingest(&report(
+            [0; 3],
+            0,
+            [0, counts(1.), 0],
+            [0, ONE_G, 0],
+            50_000,
+            1,
+        ))
+        .unwrap();
+        assert_eq!(
+            c.clock_offset, offset,
+            "Duplicate device time cannot become a transport-offset reset"
+        );
+        assert_eq!(c.orientation_at_host_ns(device + offset_ns), Some(expected));
+    }
+
+    #[test]
+    fn exposure_orientation_device_tick_wrap_keeps_one_unwrapped_history() {
+        let mut c = Controller::new(Hand::Left);
+        c.ingest(&report(
+            [0; 3],
+            0,
+            [0; 3],
+            [0, ONE_G, 0],
+            u32::MAX - 50_000,
+            0,
+        ))
+        .unwrap();
+        c.ingest(&report([0; 3], 0, [0, counts(1.), 0], [0, ONE_G, 0], 1, 1))
+            .unwrap();
+        assert!(c.device_s > 0. && c.device_s < 0.02);
+        let device = (c.device_s * 1e9).round() as i64 / 2;
+        let offset = (c.clock_offset.unwrap() * 1e9).round() as i64;
+        assert!(
+            c.orientation_history
+                .sample_host_time(device + offset, offset)
+                .is_some(),
+            "A normal wrapping hardware counter is not a reconnect/reset epoch"
+        );
+    }
+
+    #[test]
     fn at_rest_up_is_found_and_kept() {
         let mut c = Controller::new(Hand::Right);
         // Lying tilted: gravity's reaction along y and −z, as in the captured report.
@@ -846,5 +1177,18 @@ mod tests {
         assert_eq!(c.counts(), (3, 3));
         let forward = c.orientation().rotate([0.0, 0.0, -1.0]);
         assert!((forward[2] + 1.0).abs() < 1e-3, "{forward:?}");
+    }
+    #[test]
+    fn mapped_sample_timestamp_is_sensor_time_not_callback_age() {
+        let mut c = Controller::new(Hand::Right);
+        assert_eq!(c.sample_host_ns(), None);
+        c.ingest(&hex(RIGHT)).unwrap();
+        c.device_s = 12.25;
+        c.clock_offset = Some(1000.5);
+        assert_eq!(c.sample_host_ns(), Some(1_012_750_000_000));
+        c.clock_offset = Some(f64::NAN);
+        assert_eq!(c.sample_host_ns(), None);
+        c.clock_offset = None;
+        assert_eq!(c.sample_host_ns(), None);
     }
 }

@@ -1,0 +1,31 @@
+{
+  "scope": "Fresh final HUD source compile and known-clock CPU fixtures; previous integrated offscreen UI check separately recorded",
+  "passed": true,
+  "checks": [
+    {
+      "test": "host-typecheck",
+      "exit_code": 0
+    },
+    {
+      "test": "metrics",
+      "exit_code": 0
+    },
+    {
+      "test": "image-settings",
+      "exit_code": 0
+    }
+  ],
+  "source_sha256": {
+    "app/Sources/Halliday/GamePerformanceMetrics.swift": "a231637a231cf288a81c306d90c116901037c0ec09d19773fdc9295927d7a3cb",
+    "app/Sources/Halliday/PerformanceHUD.swift": "1fd770766ed92feb1cfc62857978576e343f12d81dc6bbbb7aa4cd6e65717ba6",
+    "app/Sources/Halliday/PerformanceHUDSnapshot.swift": "e1af677f07526614dee944c99334dc731607262a190fd62e2aad730110eec1f9",
+    "app/Sources/Halliday/Renderer.swift": "79758c82fefa4f8c8d8d7ba6ee6cd186c048679f25974e1b9f8e5eee6536220b",
+    "app/Sources/Halliday/GameBridge.swift": "fc729de240eefaf64d1c3286b47eaa1018c0e57a744deb8496b300236f304494",
+    "app/Sources/Halliday/AppDelegate.swift": "76bf5041672bb2a66be3ba7c09335e4dda8a1f7daf9d3d5e1d5bbab9a1a8d5a5",
+    "app/Sources/Halliday/IndependentLensPresenter.swift": "de1591668b6acbc4bbeb6b31fa816738a8baa983384962e539699e7440bc5d21"
+  },
+  "limits": [
+    "Software pose-to-presentation interval, not photons",
+    "No game/physical headset session launched"
+  ]
+}

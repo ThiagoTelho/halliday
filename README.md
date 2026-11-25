@@ -334,6 +334,28 @@ Halliday asks for **Screen Recording** (to show Mac windows in VR) and **Accessi
 them and send them the mouse and keyboard). [PRIVACY.md](PRIVACY.md) says why each permission is
 needed.
 
+### Desktop VR additions
+
+CrossOver libraries and manually imported executables can use Halliday's Windows
+OpenXR runtime (D3D11/D3D12/Vulkan) or its OpenVR runtime. Native OpenXR clients
+can use Metal or Vulkan. `make vr-modules` builds the optional public-source
+modules; `make vr-package` adds them to the ordinary app without installing it.
+
+Game image settings provide FSR 1 render scaling, independent RCAS sharpening,
+and separate horizontal/vertical outer FOV crop. Crop changes apply to the next
+game session and preserve retained source-pixel density. Display settings offer
+live 90/120 Hz and Off/Half/Auto game cadence. Image-only Spacewarp and the
+performance HUD are optional; system game audio uses ScreenCaptureKit.
+
+See [runtime contracts](docs/native-runtime.md),
+[launch and routing](docs/host-launch-and-routing.md),
+[game image](docs/game-image.md), [FOV crop](docs/game-view-geometry.md),
+[cadence](docs/automatic-half-rate.md),
+[frame reconstruction](docs/game-spacewarp.md),
+[controller tracking](docs/sense-tracking.md),
+[LED synchronization and contacts](docs/sense-led-feedback-and-touch.md),
+[audio](docs/system-game-audio.md), and [HUD metrics](docs/performance-hud.md).
+
 ### Without a headset
 
 With no headset connected, Halliday opens in a window on the Mac's screen: the mouse is your head,
@@ -358,6 +380,13 @@ tap of PS brings Halliday up over a game. In a game without controllers, the mou
 left and right click are the trigger and grip, and **Option** + mouse places the hands. In a video:
 Space play/pause, ←/→ ±10 s, **F** projection, **G** stereo, **C** subtitles, **X** close. The full
 list is in Halliday itself (the **/** key) and in the companion.
+
+Sense tracking uses a bounded optical worker, optional per-headset camera alignment and
+a separate game-hand mounting frame. See [tracking and validation](docs/sense-tracking.md)
+for the controls, source references and remaining physical acceptance.
+
+Optional [game-image controls](docs/game-image.md) offer render scale, FSR 1 and
+independent RCAS sharpening before headset reprojection.
 
 ## Repository layout
 

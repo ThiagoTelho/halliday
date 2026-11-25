@@ -69,6 +69,7 @@ impl LookAround {
                 rec[6..8].copy_from_slice(&8192i16.to_le_bytes()); // 1 g
                 rec[14..16].copy_from_slice(&raw_z.to_le_bytes());
                 rec[20..22].copy_from_slice(&((vts + half * 500) as u16).to_le_bytes());
+                rec[22..24].copy_from_slice(&(if half == 0 { 1u16 } else { 0u16 }).to_le_bytes());
                 b.extend(rec);
             }
             events.push((host0 + vts as u64 * 1000 + 1_500_000, Stream::Status, b));

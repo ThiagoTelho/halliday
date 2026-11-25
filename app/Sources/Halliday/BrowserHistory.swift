@@ -32,7 +32,7 @@ final class BrowserHistory {
     private var saveScheduled = false
 
     private init() {
-        let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0].appendingPathComponent("Halliday")
+        let dir = RuntimePaths.support
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         file = dir.appendingPathComponent("browser.json")
         if let data = try? Data(contentsOf: file), let saved = try? JSONDecoder().decode(Store.self, from: data) { store = saved }

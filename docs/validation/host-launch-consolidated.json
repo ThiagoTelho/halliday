@@ -1,0 +1,33 @@
+{
+  "scope": "Consolidated CrossOver launch, reversible runtime routing, focus, dashboard and pause-only floor controls",
+  "swift6_application_typecheck": "PASS",
+  "core_and_native_runtime_release_build": "PASS, macOS deployment target14.0",
+  "cpu_suites": [
+    "CrossOver library discovery and literal launch arguments",
+    "Game-library fixture discovery",
+    "Producer-bound Resume focus",
+    "Desktop pointer ownership and source wiring",
+    "Pause-only floor gesture",
+    "Reversible Wine OpenXR registration",
+    "Native OpenXR routing",
+    "Packaging:10cases",
+    "Independent haptic feed",
+    "Deferred bridge lifetime",
+    "C++/Rust/Swift colour protocol",
+    "Native loader dispatch:19checks"
+  ],
+  "metal_suites": [
+    "Actual scene/quad composition and per-eye colour/geometry",
+    "Deferred resource lifetime through actual GPU completion"
+  ],
+  "excluded": [
+    "System-audio relay (next contribution)",
+    "Frame generation/independent compositor (later contribution)",
+    "Performance HUD (later contribution)",
+    "Eye tracking/calibration and native guest adapters"
+  ],
+  "limits": [
+    "No installed app, game, headset, system registration or user profile changed",
+    "Synthetic GPU/CPU results do not establish gameFPS or photon latency"
+  ]
+}

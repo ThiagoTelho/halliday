@@ -179,8 +179,7 @@ struct InstalledExtension: Sendable, Identifiable {
 
 enum Extensions {
     static var folder: URL {
-        FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Halliday/Extensions", isDirectory: true)
+        RuntimePaths.support.appendingPathComponent("Extensions", isDirectory: true)
     }
 
     private static let disabledKey = "disabledExtensions"

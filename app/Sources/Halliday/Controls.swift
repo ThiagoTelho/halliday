@@ -76,7 +76,7 @@ extension VRPanel {
     /// A pill button with a title, and a symbol before it if given. `busy`: a spinner takes the
     /// symbol's place and the button doesn't take clicks; its size stays.
     func button(_ ctx: CGContext, _ id: String, _ title: String, _ rect: CGRect, symbol: String? = nil, kind: ButtonKind = .plain,
-                enabled: Bool = true, busy: Bool = false) {
+                enabled: Bool = true, busy: Bool = false, selected: Bool = false) {
         control(id, rect, enabled: enabled && !busy)
         let state = busy ? ControlState.rest : state(of: id, enabled: enabled)
         let shape = shaped(rect, state, lift: 0.03)
@@ -101,7 +101,9 @@ extension VRPanel {
         case (_, .pressed): (fill, baseText) = (NSColor(white: 1, alpha: 0.28), .white)
         }
         var text = baseText
-        if kind == .main, state != .disabled {
+        // A confirmed selection remains visible even while changing modes or
+        // when this display currently offers only one supported rate.
+        if (kind == .main && state != .disabled) || selected {
             // Lit (board 20): the blue's gradient, white label, light along the top.
             let up = state == .hover ? 0.16 : (state == .pressed ? -0.12 : 0)
             let top = up >= 0 ? NightGlass.litTop.blended(withFraction: up, of: .white) : NightGlass.litTop.blended(withFraction: -up, of: .black)
@@ -113,7 +115,13 @@ extension VRPanel {
             NightGlass.fill(ctx, shape, radius: shape.height / 2, color: fill)
             if fill.alphaComponent > 0.02, state != .disabled { NightGlass.topLight(ctx, shape, radius: shape.height / 2, alpha: 0.16) }
         }
-        let weight: NSFont.Weight = kind == .main || kind == .dangerMain ? .semibold : .medium
+        if selected {
+            ctx.addPath(CGPath(roundedRect: shape.insetBy(dx: 0.75, dy: 0.75), cornerWidth: shape.height / 2, cornerHeight: shape.height / 2, transform: nil))
+            ctx.setStrokeColor(NightGlass.accent.cgColor)
+            ctx.setLineWidth(1.5)
+            ctx.strokePath()
+        }
+        let weight: NSFont.Weight = selected || kind == .main || kind == .dangerMain ? .semibold : .medium
         let lead: CGFloat = symbol != nil || busy ? 26 : 0
         let size = NightGlass.textSize(title, style: .label, weight: weight)
         let width = min(size.width, rect.width - 20 - lead)
@@ -184,10 +192,13 @@ extension VRPanel {
     /// A slider in `row` (its hit area, 40 dmm tall). Returns the track, for mapping the pointer to
     /// a value while it is dragged.
     @discardableResult
-    func slider(_ ctx: CGContext, _ id: String, row: CGRect, fraction: CGFloat) -> CGRect {
+    func slider(_ ctx: CGContext, _ id: String, row: CGRect, fraction: CGFloat, enabled: Bool = true) -> CGRect {
         let track = CGRect(x: row.minX + 12, y: row.midY - 3, width: row.width - 24, height: 6)
-        control(id, row)
-        let state = state(of: id)
+        control(id, row, enabled: enabled)
+        let state = state(of: id, enabled: enabled)
+        ctx.saveGState()
+        if !enabled { ctx.setAlpha(0.35) }
+        defer { ctx.restoreGState() }
         NightGlass.fill(ctx, track, radius: 3, color: NSColor(white: 1, alpha: state == .rest ? 0.12 : 0.18))
         let f = max(0, min(1, fraction))
         if f > 0.005 {

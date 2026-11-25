@@ -52,6 +52,9 @@ struct SceneUniforms {
     var seeFishLeft: simd_float4x4
     var seeFishRight: simd_float4x4
     var seeFish: SIMD4<Float>
+    var projFromWorldOther: simd_float4x4
+    /// w < 0 retains the common-camera desktop fallback.
+    var projShiftOther: SIMD4<Float>
 }
 
 /// Halliday's pointer beam (Night Glass "saber"): from `start` to `end`, landing on a surface or
@@ -104,6 +107,32 @@ struct ProjectionLayer {
     var tangents: (left: SIMD4<Float>, right: SIMD4<Float>)
     /// Its alpha is meant (premultiplied): with passthrough on, the room shows where it is clear.
     var seeThrough = false
+    /// An sRGB view of the same storage, for correct hardware decoding before filtering.
+    var srgbTexture: MTLTexture? = nil
+    /// 0 legacy, 1 linear, 2 sRGB, separately for the two eyes.
+    var colourSpaces: SIMD2<UInt32> = .zero
+    /// Game frames share one optional pre-reprojection FSR pass. Other projections
+    /// (WebXR, videos and the interface) retain their original sampling.
+    var gameImage = false
+    /// Optional negotiated cropped image budget; nil retains the legacy FSR target.
+    var gameImageTarget: GameViewGeometry.Size? = nil
+    var imageSequence: UInt64 = 0
+    /// Reception time of this real game image, separate from its predicted head pose.
+    var imageTime: Double = 0
+    /// Optional producer timestamp bound to this exact image. Nil means legacy;
+    /// an invalid advertised record keeps real pixels but disables prediction.
+    var imageTiming: GameSourceImageTime? = nil
+    var gameHalfRate = false
+    var sourceFrameInterval: Double = 0
+    /// Changes when cadence changes even if no new real image has arrived.
+    var gameCadenceEpoch: UInt64 = 0
+    /// Runtime-submitted quads in declaration order, drawn after game-image processing.
+    var composition: OpenXRComposition? = nil
+    var eyeViews: ProjectionEyeViews? = nil
+    /// Explicit diagnostics only. Immutable source identity survives FSR copies.
+    var renderedTangents: (left: SIMD4<Float>, right: SIMD4<Float>) {
+        eyeViews.map { ($0.left.tangents, $0.right.tangents) } ?? tangents
+    }
 }
 
 /// Must match `LayerData` in Shaders.swift.
@@ -342,6 +371,10 @@ final class FrameStats: @unchecked Sendable {
         gpuTotal += seconds; gpuMax = max(gpuMax, seconds)
     }
 
+    func cpuWork(_ seconds: Double) {
+        lock.lock(); defer { lock.unlock() }; cpuTotal += seconds; cpuMax = max(cpuMax, seconds)
+    }
+
     func cpu(_ seconds: Double) {
         lock.lock(); defer { lock.unlock() }
         frames += 1; cpuTotal += seconds; cpuMax = max(cpuMax, seconds)
@@ -376,6 +409,219 @@ final class Renderer {
     private let passthroughPipeline: MTLRenderPipelineState
     private let sampler: MTLSamplerState
     private let library: MTLLibrary
+    private var gameUpscaler: GameUpscaler?
+    private var gameUpscalerFailed = false
+    private let spacewarpPreparation = GameSpacewarpPreparation()
+    private var spacewarpCadence = GameSpacewarpCadence()
+    private var spacewarpEligible = false
+    private var spacewarpFailureReported = false
+    private struct SpacewarpGeometry: Equatable {
+        var size: SIMD2<Int>
+        var format: UInt
+        var uv: SIMD4<Float>
+        var colours: SIMD2<UInt32>
+        var left: SIMD4<Float>
+        var right: SIMD4<Float>
+        var sourceInterval: Double
+        var cadenceEpoch: UInt64
+    }
+    private var spacewarpGeometry: SpacewarpGeometry?
+    private var spacewarpSourcePose: (sequence: UInt64, orientation: SIMD4<Float>, position: SIMD3<Float>, eyes: ProjectionEyeViews?)?
+    private var spacewarpPredictionKey: SIMD2<UInt64>?
+    /// Owned until its ordered preparation command buffer has been submitted.
+    /// The bridge uploads the next real image on this same queue, so it cannot
+    /// overwrite this source before canonicalization has consumed its pixels.
+    private struct PendingSpacewarpSource {
+        let processor: GameSpacewarp
+        let texture: MTLTexture
+        let sequence: UInt64
+        let descriptor: GameSpacewarp.Descriptor
+    }
+    private var pendingSpacewarpSource: PendingSpacewarpSource?
+    private var scenePredictionGuard: GameSpacewarp.PredictionGuard?
+    private(set) var spacewarpSourceFrames: UInt64 = 0
+    private(set) var spacewarpGeneratedFrames: UInt64 = 0
+    var spacewarpPrepared: Bool { spacewarpPreparation.ready != nil }
+    var spacewarpFailure: String? { spacewarpPreparation.failure }
+
+    func prepareSpacewarpIfEnabled() {
+        if Settings.shared.gameSpacewarpEnabled { spacewarpPreparation.start(device: device) }
+    }
+
+    private func resetSpacewarp() {
+        pendingSpacewarpSource = nil
+        if spacewarpEligible {
+            spacewarpPreparation.ready?.reset()
+            processedGameKey = nil
+        }
+        spacewarpEligible = false
+        spacewarpCadence.reset()
+        spacewarpGeometry = nil
+        spacewarpSourcePose = nil
+        spacewarpPredictionKey = nil
+    }
+
+    /// Predict only opaque game images whose producer actually negotiated half rate.
+    /// Game pose/FOV remain those of the latest real frame; fresh-head reprojection follows.
+    private func spacewarpProjection(_ original: ProjectionLayer, cb: MTLCommandBuffer) -> ProjectionLayer {
+        guard Settings.shared.gameSpacewarpEnabled, original.gameImage, original.gameHalfRate,
+              !original.seeThrough, original.imageSequence > 0,
+              original.sourceFrameInterval.isFinite,
+              (1.0 / 120...1.0 / 20).contains(original.sourceFrameInterval),
+              original.uvRect.x == 0, original.uvRect.z == 1,
+              abs(original.uvRect.w) == 1,
+              min(original.uvRect.y, original.uvRect.y + original.uvRect.w) == 0 else {
+            resetSpacewarp(); return original
+        }
+        prepareSpacewarpIfEnabled()
+        guard let processor = spacewarpPreparation.ready else {
+            if let problem = spacewarpPreparation.failure, !spacewarpFailureReported {
+                spacewarpFailureReported = true
+                log("[spacewarp] AMD Optical Flow unavailable: \(problem); keeping real frames")
+            }
+            return original
+        }
+        spacewarpEligible = true
+        let geometry = SpacewarpGeometry(size: SIMD2(original.texture.width, original.texture.height),
+            format: original.texture.pixelFormat.rawValue, uv: original.uvRect,
+            colours: original.colourSpaces, left: original.renderedTangents.left, right: original.renderedTangents.right,
+            sourceInterval: original.sourceFrameInterval, cadenceEpoch: original.gameCadenceEpoch)
+        var discontinuity = spacewarpGeometry != geometry
+        if let prior = spacewarpSourcePose {
+            let sameFrameChangedPose = prior.sequence == original.imageSequence &&
+                (prior.orientation != original.renderOrientation.vector || prior.position != original.renderPosition || prior.eyes != original.eyeViews)
+            let jumped = simd_distance(prior.position, original.renderPosition) > 0.25 ||
+                abs(simd_dot(prior.orientation, original.renderOrientation.vector)) < 0.866
+            let eyesJumped = original.eyeViews.flatMap { now in prior.eyes.map { now.jumped(from: $0) } } ?? false
+            discontinuity = discontinuity || sameFrameChangedPose || jumped || eyesJumped || ((prior.eyes == nil) != (original.eyeViews == nil))
+        }
+        if discontinuity {
+            pendingSpacewarpSource = nil
+            processor.reset(); spacewarpCadence.reset(); spacewarpPredictionKey = nil
+            processedGameKey = nil
+        }
+        spacewarpGeometry = geometry
+        spacewarpSourcePose = (original.imageSequence, original.renderOrientation.vector, original.renderPosition, original.eyeViews)
+        let now = CACurrentMediaTime()
+        let lateTarget = Double(lateTargetNs) * 1e-9
+        let target = lateTarget > 0 && abs(lateTarget - now) < 0.25 ? lateTarget : now
+        switch spacewarpCadence.update(sequence: original.imageSequence, sourceTime: original.imageTime,
+                                       target: target, sourceInterval: original.sourceFrameInterval,
+                                       imageTiming: original.imageTiming) {
+        case .source(let reset):
+            if reset { processor.reset() }
+            let descriptor = GameSpacewarp.Descriptor(orientation: original.renderOrientation.vector,
+                position: original.renderPosition, tangentsLeft: original.renderedTangents.left,
+                tangentsRight: original.renderedTangents.right, flipped: original.uvRect.w < 0,
+                colourSpaces: original.colourSpaces, reprojectionDepth: 0,
+                eyeViews: original.eyeViews)
+            // Real-first: this frame's scene/lens must not wait for AMD flow.
+            // Preparation is submitted separately after its scene buffer.
+            pendingSpacewarpSource = PendingSpacewarpSource(processor: processor,
+                texture: original.texture, sequence: original.imageSequence, descriptor: descriptor)
+            return original
+        case .predict(let phase):
+            guard let generated = processor.synthesize(alpha: phase, commandBuffer: cb),
+                  let srgb = generated.makeTextureView(pixelFormat: .rgba8Unorm_srgb) else { return original }
+            scenePredictionGuard = processor.currentPredictionGuard
+            var result = original
+            result.texture = generated
+            result.srgbTexture = srgb
+            result.uvRect = SIMD4(0, 0, 1, 1)
+            result.colourSpaces = SIMD2(original.colourSpaces.x == 0 ? 0 : 2,
+                                       original.colourSpaces.y == 0 ? 0 : 2)
+            let predictionKey = SIMD2(original.imageSequence, UInt64(phase.bitPattern))
+            if spacewarpPredictionKey != predictionKey {
+                // The same real sequence may be forecast at a different phase.
+                // Its output texture is reused; invalidate downstream FSR's cache.
+                processedGameKey = nil
+                spacewarpPredictionKey = predictionKey
+            }
+            spacewarpGeneratedFrames &+= 1
+            return result
+        case .original:
+            return original
+        }
+    }
+
+    /// Commit the real scene before encoding its optional history/flow work.
+    /// In the latched path, the real buffer's completion can now launch the
+    /// independent lens queue without waiting for the later flow buffer.
+    /// FIFO on `queue` also orders a future bridge upload and synthesis after
+    /// this source's canonical copy; no CPU wait or detached source read exists.
+    @discardableResult
+    private func commitSceneAndPrepareSpacewarp(_ scene: MTLCommandBuffer) -> MTLCommandBuffer? {
+        scene.commit()
+        guard let pending = pendingSpacewarpSource else { return nil }
+        pendingSpacewarpSource = nil
+        guard spacewarpEligible, Settings.shared.gameSpacewarpEnabled,
+              spacewarpSourcePose?.sequence == pending.sequence,
+              let processor = spacewarpPreparation.ready, processor === pending.processor,
+              let flow = queue.makeCommandBuffer() else {
+            resetSpacewarp(); return nil
+        }
+        flow.label = "Spacewarp preparation after real scene"
+        guard processor.prepare(source: pending.texture, sequence: pending.sequence,
+                                descriptor: pending.descriptor, commandBuffer: flow) else {
+            resetSpacewarp(); return nil
+        }
+        // Metal retains resources referenced by the encoders through GPU
+        // completion. The pending record holds the exact source while encoding.
+        flow.commit()
+        spacewarpSourceFrames &+= 1
+        return flow
+    }
+    private struct GameImageKey: Equatable {
+        let source: ObjectIdentifier
+        let sequence: UInt64
+        let upscale: Bool
+        let sharpness: Float
+        let colourSpaces: SIMD2<UInt32>
+        let targetWidth: Int
+        let targetHeight: Int
+    }
+    private var processedGameKey: GameImageKey?
+    private var processedGameTexture: MTLTexture?
+    private var processedGameSRGB: MTLTexture?
+
+    private func gameProjection(_ original: ProjectionLayer, cb: MTLCommandBuffer) -> ProjectionLayer {
+        let settings = Settings.shared
+        let sharpness = settings.gameSharpeningEnabled ? settings.gameSharpness : 0
+        guard original.gameImage, settings.gameFSREnabled || sharpness > 0, !original.seeThrough,
+              original.uvRect.x == 0, original.uvRect.z == 1,
+              abs(original.uvRect.w) == 1,
+              min(original.uvRect.y, original.uvRect.y + original.uvRect.w) == 0 else { return original }
+        let key = GameImageKey(source: ObjectIdentifier(original.texture), sequence: original.imageSequence,
+                               upscale: settings.gameFSREnabled, sharpness: sharpness, colourSpaces: original.colourSpaces,
+                               targetWidth: original.gameImageTarget?.width ?? GameImagePlan.targetWidth,
+                               targetHeight: original.gameImageTarget?.height ?? GameImagePlan.targetHeight)
+        if processedGameKey != key {
+            if gameUpscaler == nil, !gameUpscalerFailed {
+                do { gameUpscaler = try GameUpscaler(device: device) }
+                catch {
+                    gameUpscalerFailed = true
+                    log("[game image] FSR unavailable: \(error.localizedDescription)")
+                }
+            }
+            guard let texture = gameUpscaler?.encode(source: original.texture,
+                targetWidth: key.upscale ? max(key.targetWidth, original.texture.width / 2) : original.texture.width / 2,
+                targetHeight: key.upscale ? max(key.targetHeight, original.texture.height) : original.texture.height,
+                sharpness: key.sharpness, colourSpaces: original.colourSpaces, commandBuffer: cb) else { return original }
+            // Same-size/no-sharpen and unsupported downscales preserve the original.
+            guard texture !== original.texture else { return original }
+            processedGameTexture = texture
+            processedGameSRGB = texture.makeTextureView(pixelFormat: .rgba8Unorm_srgb)
+            processedGameKey = key
+        }
+        guard let texture = processedGameTexture else { return original }
+        if original.colourSpaces != .zero, processedGameSRGB == nil { return original }
+        var result = original
+        result.texture = texture
+        result.srgbTexture = processedGameSRGB
+        result.colourSpaces = SIMD2(original.colourSpaces.x == 0 ? 0 : 2,
+                                    original.colourSpaces.y == 0 ? 0 : 2)
+        return result
+    }
 
     /// A pipeline drawing a fullscreen triangle with fragment function `fragment` (e.g. the video's
     /// YUV conversion).
@@ -396,6 +642,12 @@ final class Renderer {
     /// Desktop view (the simulator on a monitor): one undistorted view filling the output, instead
     /// of the headset's two lens-warped eyes squeezed into a window. Much sharper on a monitor.
     var desktopView = false
+    private lazy var performanceHUD = PerformanceHUD(device: device)
+    /// Pure presentation facts; the callback owns a particular game/producer context.
+    var onPerformancePresented: (@Sendable (UInt64, Bool, Double, UInt64) -> Void)?
+    func updatePerformanceHUD(enabled: Bool, snapshot: PerformanceHUDSnapshot) {
+        performanceHUD.update(enabled: enabled, snapshot: snapshot)
+    }
     /// Half of the desktop view's horizontal field of view, as a tangent (1.1 ≈ 95° across).
     var desktopTanHalfWidth: Float = 1.1
     private var desktopTexture: MTLTexture?
@@ -457,6 +709,9 @@ final class Renderer {
     private var bakeTime: Float = 0
     private var lastBakeFinished = 0.0
     private static let bakeSize = (width: 4096, height: 2048), bakeStrips = 64
+    /// Encoded work, for the offscreen compositor oracle (no timing/recording).
+    private(set) var environmentBakePasses: UInt64 = 0
+    private(set) var environmentGeometryPasses: UInt64 = 0
 
     /// The Forest's fireflies this frame (xyz in meters, w brightness), worked out once here rather
     /// than per pixel; `firefly_count` in the shader must match.
@@ -507,6 +762,7 @@ final class Renderer {
         pass.colorAttachments[0].loadAction = whole ? .dontCare : .load
         pass.colorAttachments[0].storeAction = .store
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        environmentBakePasses &+= 1
         enc.setRenderPipelineState(pipeline)
         var uniforms = SIMD4<Float>(Float(environment), bakeTime, 1.65, 0)
         enc.setFragmentBytes(&uniforms, length: MemoryLayout<SIMD4<Float>>.stride, index: 0)
@@ -554,6 +810,14 @@ final class Renderer {
     var recenterProgress: Float = 0
     /// The pointer beam; nil hides it (the cursor ring alone is drawn, as before).
     var saber: Saber?
+
+    /// An immersive game owns its pointer. Halliday's menu beam and independent
+    /// head-direction ring must both disappear, including while the game loads.
+    /// Only an explicit mouse-enabled game overlay can supply a host beam there.
+    func setInterfacePointer(_ menu: Saber?, direction: SIMD3<Float>, gameActive: Bool, gameOverlay: Saber?) {
+        cursorDirection = gameActive ? nil : direction
+        saber = gameActive ? gameOverlay : menu
+    }
     /// The colored boxes around the origin (front red, left green, right blue, behind yellow), for
     /// checking tracking and orientation. Off by default (`--reference-boxes`).
     var showReferenceBoxes = false
@@ -613,7 +877,8 @@ final class Renderer {
     func setEyeSize(_ eyeSize: Int) {
         guard eyeTexture.height != eyeSize, let t = try? Renderer.makeEyeTexture(device: device, eyeSize: eyeSize) else { return }
         eyeTexture = t
-        spareEyeTexture = nil
+        completedSceneTextures = [nil, nil, nil]
+        retirePresentation()
     }
 
     private static func makeEyeTexture(device: MTLDevice, eyeSize: Int) throws -> MTLTexture {
@@ -653,6 +918,9 @@ final class Renderer {
             let t = desktopTanHalfWidth, v = t * Float(desktop.height) / Float(desktop.width)
             tangents = SIMD4(-t, t, v, -v)
         }
+        let submittedEye = projection?.eyeViews?.view(eye == .left ? 0 : 1)
+        let submittedOther = desktop != nil ? projection?.eyeViews?.right : nil
+        let projectionOrigin = desktop != nil ? head.position : eyePos
         return SceneUniforms(
             tanLRUD: tangents,
             eyePosition: SIMD4(eyePos, 1),
@@ -660,9 +928,10 @@ final class Renderer {
             params: SIMD4(Float(layerCount), Float(desktop?.width ?? eyeTexture.height), Float(CACurrentMediaTime() - startTime), shownDimming),
             cursor: cursorDirection.map { SIMD4($0, 1) } ?? .zero,
             highlight: SIMD4(Float(highlight ?? -1), sceneBrightness, 0, 0),
-            projFromWorld: projection.map { simd_float4x4($0.renderOrientation.inverse) } ?? matrix_identity_float4x4,
+            projFromWorld: submittedEye.map { simd_float4x4($0.orientation.inverse) }
+                ?? projection.map { simd_float4x4($0.renderOrientation.inverse) } ?? matrix_identity_float4x4,
             projUV: projection?.uvRect ?? .zero,
-            projTan: projection.map { eye == .left ? $0.tangents.left : $0.tangents.right } ?? .zero,
+            projTan: projection.map { eye == .left ? $0.renderedTangents.left : $0.renderedTangents.right } ?? .zero,
             projFlags: SIMD4(projection == nil ? 0 : 1, eye == .left ? 0 : 1, scene3D == nil ? 0 : 1, gameLayers == nil && gameAway == 0 ? 0 : 1),
             videoFromWorld: sphere.map { simd_float4x4($0.orientation.inverse) } ?? matrix_identity_float4x4,
             videoParams: sphere.map { SIMD4(Float($0.projection + 1), Float($0.stereo), $0.fisheyeFovDeg * .pi / 180, $0.zoom) } ?? .zero,
@@ -675,15 +944,20 @@ final class Renderer {
             saberParams: SIMD4(saberEnergy, saberPress, saber?.fromHand == false ? 1 : 0, environmentFade),
             envParams: SIMD4(showReferenceBoxes ? 1 : 0, recenterProgress,
                              Float(environment == 4 && environmentTexture == nil ? 0 : environment), environmentYaw),
-            projShift: projection.map { SIMD4(head.position - $0.renderPosition, Self.reprojectionDepth) } ?? .zero,
-            projTanOther: desktop != nil ? (projection?.tangents.right ?? .zero) : .zero,
-            gameFade: gameFade, gameBackgroundFade: gameBackgroundFade, gameAway: SIMD4(gameAway, projection?.seeThrough == true ? 1 : 0, 0, 0),
+            projShift: submittedEye.map { SIMD4(projectionOrigin - $0.position, Self.reprojectionDepth) }
+                ?? projection.map { SIMD4(head.position - $0.renderPosition, Self.reprojectionDepth) } ?? .zero,
+            projTanOther: desktop != nil ? (projection?.renderedTangents.right ?? .zero) : .zero,
+            gameFade: gameFade, gameBackgroundFade: gameBackgroundFade,
+            gameAway: SIMD4(gameAway, projection?.seeThrough == true || projection?.composition != nil ? 1 : 0,
+                Float(projection?.colourSpaces.x ?? 0), Float(projection?.colourSpaces.y ?? 0)),
             seeFromWorld: simd_float4x4(SIMD4(seeFromWorld.columns.0, 0), SIMD4(seeFromWorld.columns.1, 0),
                                         SIMD4(seeFromWorld.columns.2, 0), SIMD4(0, 0, 0, 1)),
             seeParams: SIMD4(cameraPicture == nil ? 0 : seeThrough, Self.cameraFocal,
                              eye == .left ? Self.cameraCentre.left : Self.cameraCentre.right, Self.cameraCentre.y),
             seeFishLeft: Self.fisheyeMatrix(0), seeFishRight: Self.fisheyeMatrix(1),
-            seeFish: SIMD4(cameraFisheyes && Self.fisheyes.count > 1 ? 1 : 0, Self.fisheyes.first?.k2 ?? 0, Self.fisheyes.dropFirst().first?.k2 ?? 0, 0))
+            seeFish: SIMD4(cameraFisheyes && Self.fisheyes.count > 1 ? 1 : 0, Self.fisheyes.first?.k2 ?? 0, Self.fisheyes.dropFirst().first?.k2 ?? 0, 0),
+            projFromWorldOther: submittedOther.map { simd_float4x4($0.orientation.inverse) } ?? matrix_identity_float4x4,
+            projShiftOther: submittedOther.map { SIMD4(projectionOrigin - $0.position, Self.reprojectionDepth) } ?? SIMD4(0, 0, 0, -1))
     }
 
     // --- Passthrough (ROADMAP W11 E.4) ---
@@ -751,12 +1025,14 @@ final class Renderer {
     func render(head: HeadPose, calibration: [Float], into target: MTLTexture, present drawable: CAMetalDrawable?) {
         let cpuStart = CACurrentMediaTime()
         guard let cb = queue.makeCommandBuffer() else { return }
-        let (sceneTexture, desktop) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
+        let generatedBefore = spacewarpGeneratedFrames
+        let (sceneTexture, desktop, sceneEncoded) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
 
         // 2. Distortion into the output.
         let lens = Lens(queue: queue, pipeline: distortPipeline, passthrough: passthroughPipeline, sampler: sampler,
-                        meshes: desktop == nil && distortionEnabled && meshes.count == 2 ? meshes : nil)
-        lens.encode(into: cb, target: target, scene: sceneTexture, warp: LateLatch.noTurn)
+                        meshes: desktop == nil && distortionEnabled && meshes.count == 2 ? meshes : nil,
+                        hud: desktop == nil ? performanceHUD.image : nil, ipd: ipd)
+        let lensEncoded = lens.encode(into: cb, target: target, scene: sceneTexture, warp: LateLatch.noTurn)
         let stats = self.stats
         let done = gpuDone
         gpuDone = nil
@@ -764,18 +1040,51 @@ final class Renderer {
             if cb.gpuEndTime > cb.gpuStartTime { stats.gpu(cb.gpuEndTime - cb.gpuStartTime) }
             done?(cb.gpuEndTime)
         }
-        if let drawable { cb.present(drawable) }
-        cb.commit()
-        if drawable == nil { cb.waitUntilCompleted() }
+        if let drawable {
+            if sceneEncoded, lensEncoded, let observe = onPerformancePresented {
+                let sequence = projection?.imageSequence ?? 0
+                let generated = spacewarpGeneratedFrames > generatedBefore
+                let prediction = scenePredictionGuard
+                drawable.addPresentedHandler { shown in
+                    let time = shown.presentedTime
+                    guard time.isFinite, time > 0 else { return }
+                    observe(sequence, generated && (prediction?.hasPredictionAfterGPUCompletion ?? true), time, 0)
+                }
+            }
+            cb.present(drawable)
+        }
+        let flow = commitSceneAndPrepareSpacewarp(cb)
+        if drawable == nil {
+            cb.waitUntilCompleted()
+            // Snapshot callers may replace shared source pixels immediately.
+            flow?.waitUntilCompleted()
+        }
         stats.cpu(CACurrentMediaTime() - cpuStart)
     }
 
     /// The scene (both eyes, or the desktop view) into its texture, encoded into `cb`.
     private func drawScene(head: HeadPose, calibration: [Float], cb: MTLCommandBuffer, output target: (width: Int, height: Int))
-        -> (MTLTexture, (width: Int, height: Int)?) {
+        -> (MTLTexture, (width: Int, height: Int)?, Bool) {
         updateMeshes(calibration: calibration)
+        scenePredictionGuard = nil
         for hook in beforeFrame { hook(cb) }
-        bakeEnvironment(cb)
+        // Runs on the same GPU queue before reprojection and lens correction;
+        // a repeated game frame reuses its already processed texture.
+        let sourceProjection = projection
+        if let sourceProjection {
+            if let composition = sourceProjection.composition, composition.projectionIndex == nil {
+                // Quad-only carriers must not seed optical flow or upscale submitted UI.
+                resetSpacewarp()
+            } else {
+                projection = gameProjection(spacewarpProjection(sourceProjection, cb: cb), cb: cb)
+            }
+        } else { resetSpacewarp() }
+        defer { projection = sourceProjection }
+        // scene_fs never reads the place or its geometry while a projection or
+        // surrounding video is active (its `surround` branch, including glass).
+        // Keep the bake/cache clock intact; a visible place resumes normally.
+        let surroundingsVisible = projection == nil && videoSphere == nil
+        if surroundingsVisible { bakeEnvironment(cb) }
         // Eased values (design board 9, "quick": 120 ms): the hover glow of the highlighted layer,
         // the cross-fade of panels whose texture changed, the saber between its states.
         let now = CACurrentMediaTime()
@@ -831,11 +1140,12 @@ final class Renderer {
         }
         let desktop = desktopView && sceneTexture !== eyeTexture ? (width: sceneTexture.width, height: sceneTexture.height) : nil
         // 1a. The 3D place's geometry, per eye, into color and distance targets the scene pass reads.
-        if let scene = scene3D { drawGeometry(scene, cb: cb, head: head, target: sceneTexture, desktop: desktop) }
+        if surroundingsVisible, let scene = scene3D { drawGeometry(scene, cb: cb, head: head, target: sceneTexture, desktop: desktop) }
         let sp = MTLRenderPassDescriptor()
         sp.colorAttachments[0].texture = sceneTexture
         sp.colorAttachments[0].loadAction = .dontCare
         sp.colorAttachments[0].storeAction = .store
+        var sceneEncoded = false
         if let enc = cb.makeRenderCommandEncoder(descriptor: sp) {
             enc.setRenderPipelineState(scenePipeline)
             enc.setFragmentSamplerState(sampler, index: 0)
@@ -857,6 +1167,9 @@ final class Renderer {
             enc.setFragmentTexture(scene3D != nil ? meshTargets?.color ?? placeholder : placeholder, index: 2 * maxLayers + 3)
             enc.setFragmentTexture(scene3D != nil ? meshTargets?.distance ?? placeholder : placeholder, index: 2 * maxLayers + 4)
             enc.setFragmentTexture(cameraPicture ?? placeholder, index: 2 * maxLayers + 5)
+            enc.setFragmentTexture(projection?.srgbTexture ?? projection?.texture ?? placeholder, index: 2 * maxLayers + 6)
+            OpenXRComposition.bind(projection?.composition, to: enc, headPosition: head.position,
+                                   headOrientation: head.orientation, placeholder: placeholder)
             let size = Double(eyeTexture.height)
             var lights = Self.fireflies(time: Float(CACurrentMediaTime() - startTime))
             enc.setFragmentBytes(&lights, length: lights.count * MemoryLayout<SIMD4<Float>>.stride, index: 2)
@@ -871,29 +1184,76 @@ final class Renderer {
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
             enc.endEncoding()
+            sceneEncoded = true
         }
 
-        return (sceneTexture, desktop)
+        return (sceneTexture, desktop, sceneEncoded)
     }
 
     // --- Late latching (LateLatch.swift) ---
 
     /// Set by the headset's view while the head comes from the headset: the tracker's orientation
     /// for a host time in ns, callable from any thread.
-    var latePose: (@Sendable (Int64) -> (orientation: simd_quatf, turning: SIMD3<Float>)?)?
+    var latePose: (@Sendable (Int64) -> LateHeadPose?)?
     /// The host time (ns) the frame being drawn is seen at: what the late pose is asked for.
     var lateTargetNs: Int64 = 0
     private lazy var lateLatch = LateLatch()
-    /// The other eye texture: a latched frame's scene is drawn into one while the lens thread may
-    /// still have the frame before in the other.
-    private var spareEyeTexture: MTLTexture?
-    /// Frames whose scene was committed and whose lens pass has not finished yet.
-    private let lensPending = LensPending()
     private let lensQueue = DispatchQueue(label: "halliday.lens", qos: .userInteractive)
+    private let presentationClock = LateDisplayClock()
+    let displayPulseDriver = CompositorRefreshDriver()
+    var displayPulseOffsetNs: Int64 = 0
+    var displayPulseFeedback = CompositorPulseFeedback()
+    private lazy var independentPresenter = IndependentLensPresenter(clock: presentationClock, queue: lensQueue)
+    private var completedSceneTextures: [MTLTexture?] = [nil, nil, nil]
+    private var sceneWrite: CompositorScenePolicy.Write?
+    private var admissionPrepared = false
+    private var independentPresentationActive = false
+    private var presentationGame = false
+    private var presentationProducer: String?
+    private(set) var sceneImageAcquisitionAllowed = true
+
+    /// Reserve GPU scene work before AppDelegate publishes input. Only image
+    /// ingestion is gated; head/input/haptics/heartbeats continue every refresh.
+    func preparePresentation(latched: Bool) {
+        if !latched {
+            if independentPresentationActive { retirePresentation() }
+            independentPresentationActive = false
+            sceneImageAcquisitionAllowed = true; admissionPrepared = false
+            return
+        }
+        independentPresentationActive = true
+        if let old = sceneWrite { independentPresenter.completed(old, scene: nil) }
+        sceneWrite = independentPresenter.mailbox.reserveWrite()
+        sceneImageAcquisitionAllowed = sceneWrite != nil
+        admissionPrepared = true
+    }
+
+    /// Retire unsubmitted output on display/space/content changes. A command
+    /// already on the GPU keeps its lease and completes normally.
+    func retirePresentation() {
+        displayPulseDriver.clearConfiguration()
+        presentationClock.reset(); independentPresenter.retire()
+        if let old = sceneWrite { independentPresenter.completed(old, scene: nil) }
+        sceneWrite = nil; sceneImageAcquisitionAllowed = false
+    }
+
+    func presentationContent(game: Bool, producer: String?) {
+        let changed = game != presentationGame || (game && producer != nil &&
+            presentationProducer != nil && producer != presentationProducer)
+        if changed { retirePresentation() }
+        presentationGame = game
+        if !game { presentationProducer = nil }
+        else if let producer { presentationProducer = producer }
+    }
     /// The display's refresh period, seconds (the headset's view sets it).
     var refreshPeriod: Double {
         get { displayPhase.period }
-        set { displayPhase.period = newValue }
+        set {
+            displayPhase.period = newValue
+            let epoch = presentationClock.epoch
+            presentationClock.configure(period: newValue)
+            if presentationClock.epoch != epoch { independentPresenter.retire() }
+        }
     }
     private let displayPhase = DisplayPhase()
 
@@ -905,14 +1265,18 @@ final class Renderer {
     /// most 2 ms and lost frames now and then. That is the floor of this display path.
     private final class DisplayPhase: @unchecked Sendable {
         private let lock = NSLock()
-        var period = 1.0 / 120
+        private var storedPeriod = 1.0 / 120
+        var period: Double {
+            get { lock.lock(); defer { lock.unlock() }; return storedPeriod }
+            set { lock.lock(); storedPeriod = newValue; lock.unlock() }
+        }
         private var frames = 0, waited = 0.0, phase = 0.0
         func shown(at time: Double, committed: Double) {
             lock.lock(); defer { lock.unlock() }
             frames += 1
             waited += time - committed
-            var p = (committed - time).truncatingRemainder(dividingBy: period)
-            if p < 0 { p += period }
+            var p = (committed - time).truncatingRemainder(dividingBy: storedPeriod)
+            if p < 0 { p += storedPeriod }
             phase += p
             if frames == 600 {
                 log(String(format: "[display] 600 frames shown %.2f ms after their lens pass, committed %.2f ms after a refresh",
@@ -930,79 +1294,81 @@ final class Renderer {
     /// pose to be had.
     var canLatch: Bool { LateLatch.enabled && latePose != nil && !desktopView && distortionEnabled && meshes.count == 2 }
 
-    /// One frame for the headset in two parts (LateLatch.swift): the scene now, with `head`; then,
-    /// on the lens queue once the GPU has drawn it, a drawable from `layer`, the orientation for
-    /// the same moment asked for again, and the lens pass turned by the difference. The main
-    /// thread never waits for a drawable (it waited up to 9 ms a frame, and frames were lost).
-    /// `presenting` is handed the drawable before it is presented. False when the frame is left
-    /// out: the lens pass of the frame before last hasn't finished yet (the display is behind;
-    /// leaving one out lets its queue drain).
+    /// Offer a physical-refresh output independently of scene GPU completion.
+    /// The presenter consumes the newest successful completed scene and queries
+    /// a fresh head pose after drawable acquisition, with one lens job in flight.
     @discardableResult
     func renderLatched(head: HeadPose, calibration: [Float], layer: CAMetalLayer,
-                       presenting: (@Sendable (CAMetalDrawable) -> Void)? = nil) -> Bool {
-        guard let pose = latePose, lensPending.begin() else { return false }
-        let cpuStart = CACurrentMediaTime()
-        guard let cb = queue.makeCommandBuffer() else { lensPending.end(); return false }
-        if spareEyeTexture == nil { spareEyeTexture = try? Renderer.makeEyeTexture(device: device, eyeSize: eyeTexture.height) }
-        if let spare = spareEyeTexture { spareEyeTexture = eyeTexture; eyeTexture = spare }
-        let size = CGSize(width: layer.drawableSize.width, height: layer.drawableSize.height)
-        let (sceneTexture, _) = drawScene(head: head, calibration: calibration, cb: cb, output: (Int(size.width), Int(size.height)))
-        let lens = Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline, passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
-        // Used on the lens queue: a layer's nextDrawable may be called from any thread, and the
-        // scene texture is only read there.
-        let shared = LensFrame(layer: layer, scene: sceneTexture)
-        let latch = lateLatch, pending = lensPending, stats = self.stats, lensQueue = self.lensQueue, phase = displayPhase
-        let rendered = head.orientation, target = lateTargetNs, started = Int64(cpuStart * 1e9)
-        let done = gpuDone
-        gpuDone = nil
-        cb.addCompletedHandler { cb in
-            let sceneEnd = cb.gpuEndTime, sceneTime = cb.gpuEndTime > cb.gpuStartTime ? cb.gpuEndTime - cb.gpuStartTime : 0
-            lensQueue.async {
-                let asked = CACurrentMediaTime()
-                guard let drawable = shared.layer.nextDrawable(), let lensCB = lens.queue.makeCommandBuffer() else {
-                    pending.end()
-                    return
-                }
-                let warp = latch.latch(rendered: rendered, startedNs: started, targetNs: target, sceneEnd: sceneEnd,
-                                       drawableWait: CACurrentMediaTime() - asked, pose: pose)
-                lens.encode(into: lensCB, target: drawable.texture, scene: shared.scene, warp: warp)
-                lensCB.addCompletedHandler { cb in
-                    // Its eye texture may be drawn into again (two queues: nothing else orders them).
-                    pending.end()
-                    if cb.gpuEndTime > cb.gpuStartTime { stats.gpu(cb.gpuEndTime - cb.gpuStartTime + sceneTime) }
-                    done?(cb.gpuEndTime)
-                }
-                presenting?(drawable)
-                let committed = CACurrentMediaTime()
-                drawable.addPresentedHandler { d in
-                    if d.presentedTime > 0 { phase.shown(at: d.presentedTime, committed: committed) }
-                }
-                lensCB.present(drawable)
-                lensCB.commit()
-            }
+                       presenting: (@Sendable (CAMetalDrawable) -> Void)? = nil,
+                       output: IndependentLensPresenter.Output? = nil,
+                       sceneCompleted: (@Sendable (Bool, Double) -> Void)? = nil) -> Bool {
+        if calibration != meshCalibration {
+            retirePresentation(); admissionPrepared = false
         }
-        cb.commit()
-        stats.cpu(CACurrentMediaTime() - cpuStart)
+        updateMeshes(calibration: calibration)
+        if !admissionPrepared { preparePresentation(latched: true) }
+        admissionPrepared = false
+        let ticket = sceneWrite
+        sceneWrite = nil
+        defer { sceneImageAcquisitionAllowed = true }
+        guard let pose = latePose else {
+            if let ticket { independentPresenter.completed(ticket, scene: nil) }
+            return false
+        }
+        let begin = CACurrentMediaTime()
+        let presenter = independentPresenter, stats = self.stats
+        gpuDone = nil // physical pulses own their fresh completion identity
+        let lens = Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
+                        passthrough: passthroughPipeline, sampler: sampler, meshes: meshes,
+                        hud: performanceHUD.image, ipd: ipd)
+        let epoch = presentationClock.epoch, latch = lateLatch, feedback = displayPulseFeedback
+        presenter.configureRefresh(displayPulseDriver, offsetNs: displayPulseOffsetNs, epoch: epoch,
+            output: output ?? .init(layer: layer, presenting: nil), lens: lens, latch: latch, pose: pose,
+            feedback: feedback, submitted: { stats.cpu($0) }, completed: { _, duration in stats.gpu(duration) })
+        displayPulseDriver.pulseIfUnclocked(startedNs: Int64(begin * 1e9), targetNs: lateTargetNs)
+        guard let ticket else { return true } // lens repeat requires no new scene
+        guard let cb = queue.makeCommandBuffer() else {
+            presenter.completed(ticket, scene: nil); return true
+        }
+        let side = eyeTexture.height
+        if completedSceneTextures[ticket.slot]?.height != side {
+            completedSceneTextures[ticket.slot] = try? Renderer.makeEyeTexture(device: device, eyeSize: side)
+        }
+        guard let target = completedSceneTextures[ticket.slot] else {
+            presenter.completed(ticket, scene: nil); return true
+        }
+        let normal = eyeTexture
+        eyeTexture = target
+        let rendered = head.orientation
+        let size = layer.drawableSize
+        let generatedBefore = spacewarpGeneratedFrames
+        let (scene, _, encoded) = drawScene(head: head, calibration: calibration, cb: cb,
+            output: (Int(size.width), Int(size.height)))
+        eyeTexture = normal
+        let started = Int64(begin * 1e9)
+        let completedScene = IndependentLensPresenter.Scene(texture: scene, rendered: rendered,
+            startedNs: started, ended: 0, nativeSequence: projection?.imageSequence ?? 0,
+            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration, predictionGuard: scenePredictionGuard,
+            imagePresented: onPerformancePresented)
+        cb.label = "Admitted compositor scene"
+        cb.addCompletedHandler { cb in
+            let successful = encoded && cb.status == .completed && cb.gpuEndTime > 0
+            if successful && cb.gpuEndTime > cb.gpuStartTime { stats.gpu(cb.gpuEndTime - cb.gpuStartTime) }
+            presenter.completed(ticket, scene: successful ? completedScene.ending(at: cb.gpuEndTime) : nil)
+            sceneCompleted?(successful, cb.gpuEndTime)
+        }
+        // Real scene first; history/flow preparation follows on the same queue.
+        commitSceneAndPrepareSpacewarp(cb)
+        stats.cpuWork(CACurrentMediaTime() - begin)
         return true
     }
 
-    private struct LensFrame: @unchecked Sendable {
-        let layer: CAMetalLayer
-        let scene: MTLTexture
-    }
-
-    /// At most two frames between their scene's commit and their lens pass's end: the two eye
-    /// textures.
-    private final class LensPending: @unchecked Sendable {
-        private let lock = NSLock()
-        private var count = 0
-        func begin() -> Bool {
-            lock.lock(); defer { lock.unlock() }
-            guard count < 2 else { return false }
-            count += 1
-            return true
-        }
-        func end() { lock.lock(); count -= 1; lock.unlock() }
+    /// A value snapshot of the actual production lens state. Its retained
+    /// resources can be used on the presentation queue or an offscreen oracle.
+    func makePresentationLens() -> Lens {
+        Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
+             passthrough: passthroughPipeline, sampler: sampler, meshes: meshes,
+             hud: performanceHUD.image, ipd: ipd)
     }
 
     /// The lens pass: what it needs, so it can be encoded on any thread.
@@ -1013,15 +1379,22 @@ final class Renderer {
         let sampler: MTLSamplerState
         /// Each eye's distortion mesh; nil: the scene texture stretched over the output.
         let meshes: [(vertices: MTLBuffer, indices: MTLBuffer, count: Int)]?
+        var hud: PerformanceHUD.Image? = nil
+        var ipd: Float = 0.063
 
-        func encode(into cb: MTLCommandBuffer, target: MTLTexture, scene: MTLTexture, warp: LensWarp) {
+        @discardableResult
+        func encode(into cb: MTLCommandBuffer, target: MTLTexture, scene: MTLTexture, warp: LensWarp) -> Bool {
             let dp = MTLRenderPassDescriptor()
             dp.colorAttachments[0].texture = target
             dp.colorAttachments[0].loadAction = .clear
             dp.colorAttachments[0].clearColor = MTLClearColor(red: 0, green: 0, blue: 0, alpha: 1)
             dp.colorAttachments[0].storeAction = .store
-            guard let enc = cb.makeRenderCommandEncoder(descriptor: dp) else { return }
+            guard let enc = cb.makeRenderCommandEncoder(descriptor: dp) else { return false }
             enc.setFragmentTexture(scene, index: 0)
+            // A valid fallback is bound even while disabled; no extra pass, queue or wait.
+            enc.setFragmentTexture(hud?.texture ?? scene, index: 1)
+            var overlay = [hud?.rectangle ?? .zero, SIMD4<Float>(hud?.depth ?? 1, ipd, hud == nil ? 0 : 1, 0)]
+            enc.setFragmentBytes(&overlay, length: 2 * MemoryLayout<SIMD4<Float>>.stride, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
             if let meshes {
                 enc.setRenderPipelineState(pipeline)
@@ -1035,9 +1408,12 @@ final class Renderer {
                 }
             } else {
                 enc.setRenderPipelineState(passthrough)
+                var tangents = [warp.tanLeft, warp.tanRight]
+                enc.setFragmentBytes(&tangents, length: 2 * MemoryLayout<SIMD4<Float>>.stride, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
             enc.endEncoding()
+            return true
         }
     }
 
@@ -1079,6 +1455,7 @@ final class Renderer {
         pass.depthAttachment.clearDepth = 1
         pass.depthAttachment.storeAction = .dontCare
         guard let enc = cb.makeRenderCommandEncoder(descriptor: pass) else { return }
+        environmentGeometryPasses &+= 1
         enc.setRenderPipelineState(meshPipeline)
         enc.setDepthStencilState(meshDepthState)
         enc.setFragmentSamplerState(sampler, index: 0)

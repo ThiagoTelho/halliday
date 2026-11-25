@@ -47,7 +47,7 @@ final class Environments {
     /// Where the user's own 360° images go.
     static let folder: URL = {
         let dir = FileManager.default.urls(for: .applicationSupportDirectory, in: .userDomainMask)[0]
-            .appendingPathComponent("Halliday/Environments")
+            .appendingPathComponent("\(RuntimePaths.folderName)/Environments")
         try? FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         return dir
     }()
