@@ -17,6 +17,8 @@ struct CompanionStatus: Equatable {
     var onHeadset = false
     var headset = "Not connected"
     var displayHz = 0
+    var refreshRates: [Int] = []
+    var refreshSwitching = false
     var framesPerSecond = 0.0
     var controllers: [String] = []
     var playing: String?
@@ -118,6 +120,7 @@ final class CompanionModel: ObservableObject {
     var onLookForHeadset: (() -> String)?
     var onQuit: (() -> Void)?
     var onPrediction: ((Int) -> Void)?
+    var onRefreshRate: ((Int) -> Void)?
 
     func refresh() {
         if let s = readStatus?(), s != status { status = s }
@@ -550,6 +553,12 @@ private struct SoundPane: View {
                 .font(.callout).foregroundStyle(.secondary).monospacedDigit()
             Text("Lower is faster; higher keeps more detail. Restart the game to apply render scale.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
+            Picker("Half frame rate", selection: model.setting(\.gameHalfFrameRateMode)) {
+                ForEach(GameHalfFrameRateMode.allCases) { mode in Text(mode.title).tag(mode) }
+            }.pickerStyle(.segmented)
+                .accessibilityIdentifier("game.halfFrameRate")
+            Text("Half: 60 game FPS at 120 Hz, or 45 at 90 Hz. Auto switches when the game cannot sustain full rate and checks for recovery. Applies live with Halliday; tracking and display stay at full rate.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("RCAS sharpening", isOn: model.setting(\.gameSharpeningEnabled)).toggleStyle(.switch)
             LevelRow(title: "Sharpness", value: "\(Int((s.gameSharpness * 100).rounded()))%",
                      level: model.setting(\.gameSharpness), range: Settings.gameSharpnessRange, step: 0.05)
@@ -565,6 +574,18 @@ private struct SoundPane: View {
                      level: model.setting(\.soundVolume), range: 0...1, step: 0.1)
         }
         CompanionCard(title: "Display") {
+            HStack {
+                Text("Refresh rate")
+                Spacer()
+                Picker("Refresh rate", selection: Binding(get: { model.status.displayHz }, set: { model.onRefreshRate?($0) })) {
+                    ForEach(model.status.refreshRates, id: \.self) { Text("\($0) Hz").tag($0) }
+                }
+                .labelsHidden().pickerStyle(.segmented).frame(width: 180)
+                .disabled(model.status.refreshSwitching || model.status.refreshRates.count < 2)
+                .accessibilityIdentifier("display.refreshRate")
+            }
+            Text(model.status.refreshSwitching ? "Switching the headset display…" : "Applies during the session. Half frame rate follows: 60 FPS at 120 Hz, 45 at 90 Hz.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             LevelRow(title: "Headset brightness", value: "\(Int((s.brightness * 100).rounded()))%", level: model.setting(\.brightness),
                      range: Settings.brightnessRange)
             LevelRow(title: "Dimming around the panels", value: "\(Int((s.dimming * 100).rounded()))%", level: model.setting(\.dimming),

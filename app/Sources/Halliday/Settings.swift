@@ -81,6 +81,12 @@ final class Settings {
         didSet { defaults.set(volume, forKey: "volume"); onChange?() }
     }
 
+    /// Zero retains the Mac's current mode until the user chooses 90 or 120 Hz.
+    /// Persist only after a physical mode change has actually been verified.
+    var headsetRefreshHz: Int {
+        didSet { defaults.set(headsetRefreshHz, forKey: "headsetRefreshHz") }
+    }
+
     /// The headset's panel brightness (0.1 … 1, full until the user sets it): the headset's own
     /// command, as Monado and GAV send it.
     static let brightnessRange: ClosedRange<Float> = 0.1...1
@@ -130,6 +136,23 @@ final class Settings {
         didSet { defaults.set(gameSharpeningEnabled, forKey: "gameSharpeningEnabled"); onChange?() }
     }
 
+    /// Auto is resolved by the live producer, never persisted as an On/Off decision.
+    var gameHalfFrameRateMode: GameHalfFrameRateMode {
+        didSet {
+            defaults.set(gameHalfFrameRateMode.rawValue, forKey: "gameHalfFrameRateMode")
+            // Preserve the old preference for rollback to a pre-Auto build.
+            defaults.set(gameHalfFrameRateMode == .on, forKey: "gameHalfFrameRate")
+            onChange?()
+        }
+    }
+    /// Compatibility for older command-line fixtures and callers. New UI uses the mode.
+    var gameHalfFrameRate: Bool {
+        get { gameHalfFrameRateMode == .on }
+        set { gameHalfFrameRateMode = newValue ? .on : .off }
+    }
+
+    var effectiveGameHalfFrameRate: Bool { gameHalfFrameRateMode == .on }
+
     /// Percentage of the full game image rendered by the game, in five-percent steps.
     static let gameRenderPercentRange = 50...100
     var gameRenderPercent: Int {
@@ -158,6 +181,22 @@ final class Settings {
         sharpness.isFinite ? min(max(sharpness, 0), 1) : 0.3
     }
 
+    /// Explicit old command-line flags retain precedence over a persisted new mode. Reading
+    /// either preference never writes a migration or clobbers unrelated user settings.
+    static func storedHalfFrameRateMode(_ defaults: UserDefaults) -> GameHalfFrameRateMode {
+        let arguments = defaults.volatileDomain(forName: UserDefaults.argumentDomain)
+        if let value = arguments["gameHalfFrameRateMode"] as? String,
+           let mode = GameHalfFrameRateMode(rawValue: value) { return mode }
+        if arguments["gameHalfFrameRate"] != nil {
+            return defaults.bool(forKey: "gameHalfFrameRate") ? .on : .off
+        }
+        if let saved = defaults.string(forKey: "gameHalfFrameRateMode"),
+           let mode = GameHalfFrameRateMode(rawValue: saved) { return mode }
+        // Old versions ORed both switches. Retain their effective cadence when no new
+        // choice exists; once Off is explicitly saved, Framegen cannot override it.
+        return defaults.bool(forKey: "gameHalfFrameRate") || defaults.bool(forKey: "gameSpacewarpEnabled") ? .on : .off
+    }
+
     /// The Windows panel's layout is remembered for each set of apps open together.
     var rememberLayouts: Bool {
         didSet { defaults.set(rememberLayouts, forKey: "rememberLayouts"); onChange?() }
@@ -170,6 +209,7 @@ final class Settings {
         gameCropHorizontal = Self.validGameCrop((defaults.object(forKey: "gameCropHorizontal") as? NSNumber)?.floatValue ?? 0.85, fallback: 0.85)
         gameCropVertical = Self.validGameCrop((defaults.object(forKey: "gameCropVertical") as? NSNumber)?.floatValue ?? 0.90, fallback: 0.90)
         gameSharpeningEnabled = defaults.bool(forKey: "gameSharpeningEnabled")
+        gameHalfFrameRateMode = Self.storedHalfFrameRateMode(defaults)
         let renderPercent = defaults.object(forKey: "gameRenderPercent")
         gameRenderPercent = Self.validGameRenderPercent((renderPercent as? Int) ?? (renderPercent as? String).flatMap(Int.init) ?? 100)
         let sharpness = defaults.object(forKey: "gameSharpness")
@@ -179,6 +219,8 @@ final class Settings {
         reduceMotion = defaults.bool(forKey: "reduceMotion")
         brightness = min(max(defaults.object(forKey: "brightness") as? Float ?? 1, Self.brightnessRange.lowerBound), 1)
         volume = min(max(defaults.object(forKey: "volume") as? Float ?? 0.5, 0), 1)
+        let savedRefresh = defaults.integer(forKey: "headsetRefreshHz")
+        headsetRefreshHz = [90, 120].contains(savedRefresh) ? savedRefresh : 0
         soundVolume = min(max(defaults.object(forKey: "soundVolume") as? Float ?? 0.5, 0), 1)
         environment = defaults.string(forKey: "environment") ?? "dusk"
         pointerSpeed = min(max(defaults.object(forKey: "pointerSpeed") as? Float ?? 1, Self.pointerSpeedRange.lowerBound), Self.pointerSpeedRange.upperBound)

@@ -26,6 +26,16 @@ final class GameBridge {
     /// Full game-image target; a reduced render scale is an explicit user choice.
     static let eyeSize = (width: UInt32(GameImagePlan.targetWidth), height: UInt32(GameImagePlan.targetHeight))
     let imageRenderPercent: Int
+    private(set) var halfFrameRate: Bool
+    private var frameCadence: GameFrameCadence
+    private var cadenceEpoch: UInt64 = 1
+    private var autoFrameRate = GameAutoFrameRate()
+    private(set) var halfFrameRateMode: GameHalfFrameRateMode = .off
+    private var dashboardShown = false
+    private var autoProducerRevision: UInt64 = 0
+    var requestedHalfFrameRate: Bool { autoFrameRate.halfFrameRate }
+    var physicalDisplayHz: Float { frameCadence.physicalHz }
+    var supportsLiveDisplayRate: Bool { bridge != nil }
     let cropSettings: GameCropSettings
     let viewGeometry: GameViewGeometry
     private static var nextImageSequence: UInt64 = 0
@@ -211,6 +221,11 @@ final class GameBridge {
         self.queue = queue
         imageRenderPercent = Settings.shared.gameRenderPercent
         cropSettings = crop
+        halfFrameRateMode = Settings.shared.gameHalfFrameRateMode
+        autoFrameRate = GameAutoFrameRate(mode: halfFrameRateMode)
+        halfFrameRate = autoFrameRate.halfFrameRate
+        frameCadence = GameFrameCadence(physicalHz: displayHz, halfFrameRate: halfFrameRate)
+        interval = 1 / Double(frameCadence.physicalHz)
         guard Self.installRuntime() else { return nil }
         func tangents(_ eye: Eye) -> (Float, Float, Float, Float) {
             let f = Optics.fov(eye)
@@ -223,7 +238,7 @@ final class GameBridge {
             leftTangents: SIMD4(l.0, l.1, l.2, l.3), rightTangents: SIMD4(r.0, r.1, r.2, r.3), crop: crop)
         let left = viewGeometry.leftTangents, right = viewGeometry.rightTangents
         var config = HallidayBridgeConfig(eye_width: UInt32(viewGeometry.renderSize.width), eye_height: UInt32(viewGeometry.renderSize.height),
-                                          display_hz: displayHz, ipd: 0.063,
+                                          display_hz: frameCadence.gameHz, ipd: 0.063,
                                           tangents: ((left.x, left.y, left.z, left.w), (right.x, right.y, right.z, right.w)))
         // The runtime appends to its log in every game process: start it afresh with Halliday,
         // after noting the games that tried to start while Halliday wasn't running.
@@ -248,6 +263,64 @@ final class GameBridge {
         stopCapture()
         if let b = bridge { halliday_bridge_close(b) }
         bridge = nil
+    }
+
+    /// Reapplying the same mode preserves Auto measurements and cooldowns.
+    @discardableResult
+    func setHalfFrameRateMode(_ mode: GameHalfFrameRateMode) -> Bool {
+        autoFrameRate.setMode(mode); halfFrameRateMode = mode
+        return setHalfFrameRate(autoFrameRate.halfFrameRate)
+    }
+
+    private func updateAutoFrameRate(_ bridge: OpaquePointer, now: Double, hostEligible: Bool) {
+        guard halfFrameRateMode == .auto else { return }
+        var client = HallidayBridgeClient()
+        halliday_bridge_client(bridge, &client)
+        let suspended = (lastScene?.0.grid ?? 0) != 0 || (lastScene?.0.suspended ?? 0) != 0
+        let eligible = hostEligible && client.initialized != 0 && isPresenting && framesArriving
+            && !paused && !dashboardShown && !suspended && layer?.gameImage == true
+        let wanted = autoFrameRate.observe(now: now, frames: client.frames,
+            producer: .init(pid: client.pid, epoch: 0, revision: autoProducerRevision),
+            physicalHz: Double(frameCadence.physicalHz), eligible: eligible, consumerBlocked: reading)
+        setHalfFrameRate(wanted)
+    }
+
+    /// Changes only the game's wake cadence. The public mapping, client/session,
+    /// physical display, poses and image dimensions keep their existing lifetimes.
+    @discardableResult
+    func setHalfFrameRate(_ enabled: Bool) -> Bool {
+        guard enabled != halfFrameRate else { return true }
+        guard let bridge else { return false }
+        frameCadence.setHalfFrameRate(enabled)
+        halfFrameRate = enabled
+        publishCadence(bridge: bridge)
+        log("[game] live render cadence \(frameCadence.gameHz) Hz; display and pose publication stay \(frameCadence.physicalHz) Hz")
+        return true
+    }
+
+    /// Call only after the physical display confirms its new mode. Images,
+    /// mapping and game session retain their existing lifetimes.
+    @discardableResult
+    func setPhysicalDisplayHz(_ hz: Float) -> Bool {
+        guard hz.isFinite, (20...240).contains(hz) else { return false }
+        guard supportsLiveDisplayRate, let bridge else { return false }
+        guard abs(frameCadence.physicalHz - hz) > 0.01 else { return true }
+        frameCadence.setPhysicalHz(hz)
+        interval = 1 / Double(hz)
+        publishCadence(bridge: bridge)
+        log("[game] live physical display \(frameCadence.physicalHz) Hz; game cadence \(frameCadence.gameHz) Hz")
+        return true
+    }
+
+    private func publishCadence(bridge: OpaquePointer) {
+        cadenceEpoch &+= 1
+        if cadenceEpoch == 0 { cadenceEpoch = 1 }
+        layer?.gameHalfRate = halfFrameRate
+        layer?.sourceFrameInterval = frameCadence.gameInterval
+        layer?.gameCadenceEpoch = cadenceEpoch
+        // Publish before the next notification, not after a waiter has woken.
+        // This does not manufacture a display tick or increment missed frames.
+        halliday_bridge_frame_shown(bridge, UInt64(frameCadence.gameInterval * 1e9), false)
     }
 
     /// Never replace a mapping while a client, capture or GPU read still uses it.
@@ -394,14 +467,22 @@ final class GameBridge {
     /// `ahead`: the head as it is expected `lead` after this frame is seen, when the frame the
     /// game draws with it will be: published instead of `head` (a game that predicts nothing
     /// itself drew for a head 20 to 40 ms old, and its picture had to be moved that far).
-    func tick(head: HeadPose, ahead: HeadPose? = nil) -> View? {
+    func tick(head: HeadPose, ahead: HeadPose? = nil, autoCadenceEligible: Bool = true) -> View? {
         guard let b = bridge else { return nil }
         let now = CACurrentMediaTime()
+        updateAutoFrameRate(b, now: now, hostEligible: autoCadenceEligible)
+        let displayTarget = HeadsetView.frameTarget
+        let target = displayTarget > 0 && abs(displayTarget - now) < 0.25 ? displayTarget : now
+        let notifyGame = frameCadence.shouldNotify(at: target)
         if lastTick > 0 {
             let dt = now - lastTick
             if dt > 0.002, dt < 0.1 { interval += (dt - interval) * 0.05 }
         }
         lastTick = now
+        // A late callback must not change the negotiated game cadence. Publish
+        // timing before waking a game; poses and controllers still update every tick.
+        let gameInterval = frameCadence.gameInterval
+        halliday_bridge_frame_shown(b, UInt64(gameInterval * 1e9), false)
         if !clientConnected { recenter(head: head) }
         let toGame = originTurn.inverse
         var state = HallidayBridgeState()
@@ -485,7 +566,7 @@ final class GameBridge {
             }
             if i == 1 { state.controllers.1 = c } else { state.controllers.0 = c }
         }
-        halliday_bridge_publish(b, &state)
+        halliday_bridge_publish_frame(b, &state, notifyGame)
 
         var client = HallidayBridgeClient()
         halliday_bridge_client(b, &client)
@@ -507,6 +588,7 @@ final class GameBridge {
             lastFrames = client.frames
             lastFrameTime = now
             if !isPresenting {
+                autoProducerRevision &+= 1
                 isPresenting = true
                 connectedExe = nil
                 startedAt = Date()
@@ -536,6 +618,8 @@ final class GameBridge {
                 if let startedAt {
                     GameLibrary.shared.recordLaunch(exe: appName, minutes: Int(Date().timeIntervalSince(startedAt) / 60), problem: nil)
                 }
+                autoFrameRate.resetProducer()
+                autoProducerRevision &+= 1
                 isPresenting = false
                 aims = [nil, nil]
                 pointing = nil
@@ -550,10 +634,11 @@ final class GameBridge {
                 onChange?(false)
             }
         }
-        // A display frame without a new game frame shows an older one again: the game is late.
-        let late = isPresenting && framesArriving && client.frames == framesAtLastTick
-        framesAtLastTick = client.frames
-        halliday_bridge_frame_shown(b, UInt64(interval * 1e9), late)
+        // Intentional half-rate repeats are not missed game frames. Compare the producer only
+        // at game deadlines, while pose/input publication and reprojection continue every tick.
+        let late = notifyGame && isPresenting && framesArriving && client.frames == framesAtLastTick
+        if notifyGame { framesAtLastTick = client.frames }
+        if late { halliday_bridge_frame_shown(b, UInt64(gameInterval * 1e9), true) }
         guard isPresenting else { return nil }
         takeWindowFrame(b, now: now, pid: client.pid)
         if !reading { takeFrame(b) }
@@ -591,6 +676,7 @@ final class GameBridge {
 
     /// Halliday's own interface is over the game (it should pause) or not.
     func setDashboard(_ shown: Bool) {
+        dashboardShown = shown
         guard let b = bridge else { return }
         halliday_bridge_set_dashboard(b, shown)
     }
@@ -1052,7 +1138,9 @@ final class GameBridge {
                                renderOrientation: originTurn * simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
                                tangents: (viewGeometry.leftTangents, viewGeometry.rightTangents),
-                               gameImage: true, imageSequence: Self.nextImageSequence)
+                               gameImage: true, imageSequence: Self.nextImageSequence,
+                               gameHalfRate: halfFrameRate, sourceFrameInterval: frameCadence.gameInterval,
+                               gameCadenceEpoch: cadenceEpoch)
         projection.gameImageTarget = viewGeometry.imageTarget
         return projection
     }

@@ -113,6 +113,9 @@ struct ProjectionLayer {
     var gameImage = false
     var gameImageTarget: GameViewGeometry.Size? = nil
     var imageSequence: UInt64 = 0
+    var gameHalfRate = false
+    var sourceFrameInterval = 1.0 / 90
+    var gameCadenceEpoch: UInt64 = 0
 }
 
 /// Must match `LayerData` in Shaders.swift.

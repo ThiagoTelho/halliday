@@ -15,12 +15,14 @@ final class SettingsPanel: VRPanel {
     /// The browser's current page, for "use the current page as home".
     var currentPage: (() -> String?)?
     var onNotice: ((String) -> Void)?
+    var onRefreshRate: ((Int) -> Void)?
+    var refreshState: (() -> (rates: [Int], current: Int, busy: Bool))?
 
     static let distance: Float = 1.2
     static let below: Float = 4
 
     private static let margin: CGFloat = 24
-    private static let width: CGFloat = 620, height: CGFloat = 800
+    private static let width: CGFloat = 620, height: CGFloat = 920
     private var glass: CGRect { CGRect(x: Self.margin, y: Self.margin, width: Self.width, height: Self.height) }
     private var tracks: [String: CGRect] = [:]
     private var showingGameImage = false
@@ -45,6 +47,11 @@ final class SettingsPanel: VRPanel {
         case "game:crop": settings.gameCropEnabled.toggle()
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
+        case "game:half:off": settings.gameHalfFrameRateMode = .off
+        case "game:half:on": settings.gameHalfFrameRateMode = .on
+        case "game:half:auto": settings.gameHalfFrameRateMode = .auto
+        case "display:90": onRefreshRate?(90)
+        case "display:120": onRefreshRate?(120)
         case "mode:seated": settings.mode = .seated
         case "mode:roomScale": settings.mode = .roomScale
         case "identity:vision": setIdentity(true)
@@ -198,8 +205,17 @@ final class SettingsPanel: VRPanel {
         }
         y = sliderRow(ctx, "sound", "Sounds", "speaker.wave.2", (0xFF8FC2, 0xC9407F),
                       settings.soundVolume < 0.01 ? "Off" : "\(Int((settings.soundVolume * 100).rounded()))%", CGFloat(settings.soundVolume), x: rx, y: y, width: rw)
-        _ = row(ctx, "Reduce motion", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["motion:reduce"], x: rx, y: y, width: rw) { r in
+        y = row(ctx, "Reduce motion", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["motion:reduce"], x: rx, y: y, width: rw) { r in
             self.toggle(ctx, "motion:reduce", self.settings.reduceMotion, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+
+        let refresh = refreshState?() ?? (rates: [], current: 0, busy: false)
+        _ = row(ctx, "Refresh rate", "display", (0xB79BFF, 0x6A47D6), ids: ["display:90", "display:120"], x: rx, y: y, width: rw) { r in
+            let left = CGRect(x: r.maxX - 14 - 184, y: r.midY - 20, width: 86, height: 40)
+            self.button(ctx, "display:90", "90 Hz", left, kind: refresh.current == 90 ? .main : .plain,
+                        enabled: !refresh.busy && refresh.rates.contains(90), selected: refresh.current == 90)
+            self.button(ctx, "display:120", "120 Hz", left.offsetBy(dx: 94, dy: 0), kind: refresh.current == 120 ? .main : .plain,
+                        enabled: !refresh.busy && refresh.rates.contains(120), selected: refresh.current == 120)
         }
 
         drawVersion(x: x)
@@ -244,6 +260,16 @@ final class SettingsPanel: VRPanel {
         NightGlass.drawText("Restart the game to apply render scale.", at: CGPoint(x: x, y: y + 56), style: .caption,
                             color: NightGlass.secondary, width: width)
         y += 100
+        y = row(ctx, "Half frame rate", "speedometer", (0xFFBF77, 0xBA7430), ids: ["game:half:off", "game:half:on", "game:half:auto"], x: rx, y: y, width: rw) { r in
+            _ = self.segmented(ctx, GameHalfFrameRateMode.allCases.map {
+                ("game:half:" + $0.rawValue, $0.title, self.settings.gameHalfFrameRateMode == $0)
+            }, x: r.maxX - 14 - 234, y: r.midY - 22, width: 234)
+        }
+        NightGlass.drawText("Every other refresh: 60 game FPS at 120 Hz; 45 at 90 Hz.", at: CGPoint(x: x, y: y + 4), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        NightGlass.drawText("Auto follows game performance and checks for recovery.", at: CGPoint(x: x, y: y + 26), style: .caption,
+                            color: NightGlass.secondary, width: width)
+        y += 54
         y = row(ctx, "RCAS sharpening", "sparkles", (0xB79BFF, 0x6A47D6), ids: ["game:sharpening"], x: rx, y: y, width: rw) { r in
             self.toggle(ctx, "game:sharpening", self.settings.gameSharpeningEnabled, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
         }

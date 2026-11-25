@@ -477,6 +477,17 @@ const _: () = assert!(EYE_BYTES % 16384 == 0 && HEADER_BYTES % 16384 == 0);
 /// # Safety
 /// `h` points to a mapped bridge file.
 pub unsafe fn publish(h: *mut Header, state: &State) {
+    // SAFETY: the caller provides a valid mapping.
+    unsafe { publish_with_notification(h, state, true) };
+}
+
+/// Publishes fresh head/input state independently of the game's render cadence.
+/// `notify_game` advances the existing v6 wake counter; false still updates the
+/// state sequence lock, so asynchronous pose/input reads remain current.
+///
+/// # Safety
+/// `h` points to a mapped bridge file with a single state writer.
+pub unsafe fn publish_with_notification(h: *mut Header, state: &State, notify_game: bool) {
     // SAFETY: `h` is valid (caller); the atomics may be shared.
     let (seq, vsync) = unsafe { (&(*h).state_seq, &(*h).vsync_count) };
     let s = seq.load(Ordering::Relaxed) | 1;
@@ -485,7 +496,9 @@ pub unsafe fn publish(h: *mut Header, state: &State) {
     // SAFETY: Halliday is the only writer of `state`; readers retry on a torn read.
     unsafe { core::ptr::write_volatile(core::ptr::addr_of_mut!((*h).state), *state) };
     seq.store(s.wrapping_add(1), Ordering::Release);
-    vsync.fetch_add(1, Ordering::SeqCst);
+    if notify_game {
+        vsync.fetch_add(1, Ordering::SeqCst);
+    }
 }
 
 /// The game side: the latest state, or `None` if it kept changing while read.
@@ -875,6 +888,28 @@ mod tests {
         assert_eq!(unsafe { read_state(h) }, Some(s));
         assert_eq!(unsafe { (*h).vsync_count.load(Ordering::SeqCst) }, 2);
         assert_eq!(unsafe { (*h).state_seq.load(Ordering::SeqCst) } & 1, 0);
+    }
+
+    #[test]
+    fn pose_publication_does_not_require_a_game_frame_notification() {
+        let mut b = header();
+        let h = b.ptr();
+        let mut state = State::default();
+        for tick in 0..120 {
+            state.head.stamp = tick as f32;
+            state.controllers[0].packet = tick;
+            state.controllers[1].packet = tick + 1000;
+            state.controllers[0].pose.position = [tick as f32, 1.0, -0.5];
+            state.controllers[1].pose.position = [-(tick as f32), 1.2, -0.4];
+            unsafe { publish_with_notification(h, &state, tick % 2 == 0) };
+            assert_eq!(unsafe { read_state(h) }, Some(state));
+        }
+        assert_eq!(unsafe { (*h).vsync_count.load(Ordering::SeqCst) }, 60);
+        assert_eq!(unsafe { (*h).state_seq.load(Ordering::SeqCst) }, 240);
+        // Legacy callers retain their existing one-publication/one-wake behavior.
+        unsafe { publish(h, &state) };
+        assert_eq!(unsafe { (*h).vsync_count.load(Ordering::SeqCst) }, 61);
+        assert_eq!(VERSION, 6);
     }
 
     #[test]

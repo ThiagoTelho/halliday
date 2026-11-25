@@ -1615,6 +1615,23 @@ pub unsafe extern "C" fn halliday_bridge_publish(
     }
 }
 
+/// Publishes the latest pose/input state; only `notify_game` advances the game's
+/// frame-wait counter. The mapped v6 Header layout and legacy publish API stay unchanged.
+///
+/// # Safety
+/// `bridge` is open; `state` points to a state (null pointers are ignored).
+#[unsafe(no_mangle)]
+pub unsafe extern "C" fn halliday_bridge_publish_frame(
+    bridge: *const HallidayGameBridge,
+    state: *const HallidayBridgeState,
+    notify_game: bool,
+) {
+    // SAFETY: caller guarantees valid or null pointers.
+    if let (Some(b), Some(s)) = unsafe { (bridge.as_ref(), state.as_ref()) } {
+        b.0.publish_frame(s, notify_game);
+    }
+}
+
 /// Claims the game's newest frame; false if there is none. Release it with `halliday_bridge_end_read`.
 ///
 /// # Safety

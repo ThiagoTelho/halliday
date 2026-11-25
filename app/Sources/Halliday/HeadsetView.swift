@@ -130,7 +130,6 @@ final class HeadsetView: NSView {
             return (target, aim)
         }
     }
-    private let pending = Pending()
 
     /// Aims each frame at one refresh of the headset and starts it as late as still gets there.
     ///
@@ -282,7 +281,9 @@ final class HeadsetView: NSView {
         var timebase = mach_timebase_info_data_t()
         mach_timebase_info(&timebase)
         let toSeconds = Double(timebase.numer) / Double(timebase.denom) / 1e9
-        let pending = self.pending
+        // Each display clock owns its mailbox. A retired queued callback must
+        // never drain, block or render a target belonging to its replacement.
+        let pending = Pending()
         let period = CVDisplayLinkGetNominalOutputVideoRefreshPeriod(link)
         let pacer = Pacer(period: period.timeScale > 0 && period.timeValue > 0 ? Double(period.timeValue) / Double(period.timeScale) : 1.0 / 120)
         self.pacer = pacer
@@ -291,10 +292,13 @@ final class HeadsetView: NSView {
         CVDisplayLinkSetOutputHandler(link) { [weak self] _, _, output, _, _ in
             // Until the pacer has seen frames shown, the link starts them: its output time is about
             // when a frame started now is shown (host time, CACurrentMediaTime's clock).
-            guard !pacer.paces else { return kCVReturnSuccess }
+            guard !pacer.isStopped, !pacer.paces else { return kCVReturnSuccess }
             let target = Double(output.pointee.hostTime) * toSeconds
             if pending.offer(target, aim: nil) {
-                DispatchQueue.main.async { [weak self] in self?.frame(target: pending.take().target) }
+                DispatchQueue.main.async { [weak self] in
+                    guard let self, self.pacer === pacer, !pacer.isStopped else { return }
+                    self.frame(target: pending.take().target)
+                }
             }
             return kCVReturnSuccess
         }
@@ -306,8 +310,12 @@ final class HeadsetView: NSView {
                 }
                 let wait = next.start - CACurrentMediaTime()
                 if wait > 0 { mach_wait_until(mach_absolute_time() + UInt64(wait * ticksPerSecond)) }
+                guard !pacer.isStopped else { break }
                 if pacer.offer() {
-                    DispatchQueue.main.async { [weak self] in self?.frame(target: next.aim, aim: next.aim) }
+                    DispatchQueue.main.async { [weak self] in
+                        guard let self, self.pacer === pacer, !pacer.isStopped else { return }
+                        self.frame(target: next.aim, aim: next.aim)
+                    }
                 }
             }
         }
@@ -400,6 +408,18 @@ final class HeadsetView: NSView {
         if let cvLink { CVDisplayLinkStop(cvLink); self.cvLink = nil }
         pacer?.stop()
         pacer = nil
+    }
+
+    /// A physical mode change keeps the view, game and renderer, but retires
+    /// the old display clock and measurements before pacing the new mode.
+    func refreshHeadsetTiming(display id: CGDirectDisplayID, hz: Double) {
+        guard headsetDisplay == id, Self.pacedRate == nil, hz.isFinite, hz > 0 else { return }
+        scanoutLookaheadNs = Int64(1e9 / (2 * hz))
+        let running = cvLink.map { CVDisplayLinkIsRunning($0) } ?? false
+        guard !running || pacer == nil || abs((pacer?.period ?? 0) - 1 / hz) > 0.00001 else { return }
+        stop()
+        startHeadsetLink(id)
+        log("[display] restarted headset pacing at \(Int(hz.rounded())) Hz")
     }
 
     // --- Input ---

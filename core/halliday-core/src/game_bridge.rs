@@ -156,6 +156,13 @@ impl GameBridge {
         unsafe { bridge::publish(self.header(), state) };
     }
 
+    /// Pose/input publication stays at the physical display rate; only selected
+    /// display targets wake a game running at a lower render cadence.
+    pub fn publish_frame(&self, state: &State, notify_game: bool) {
+        // SAFETY: our mapping, with the same single-writer contract as publish.
+        unsafe { bridge::publish_with_notification(self.header(), state, notify_game) };
+    }
+
     /// Claims the game's newest frame; release it with [`GameBridge::end_read`].
     pub fn begin_read(&self) -> Option<FrameInfo> {
         let h = self.header();
@@ -701,6 +708,40 @@ mod tests {
             ipd: 0.063,
             tangents: [[-1.8, 0.95, 1.33, -1.33]; 2],
         }
+    }
+
+    #[test]
+    fn lower_game_cadence_keeps_fresh_poses_and_coalesces_wakes() {
+        let path =
+            std::env::temp_dir().join(format!("halliday-cadence-test-{}.shm", std::process::id()));
+        let b = GameBridge::create(
+            &path,
+            Config {
+                display_hz: 60.0,
+                ..config()
+            },
+        )
+        .unwrap();
+        let h = b.header();
+        let mut game = GameSide::open(&path).unwrap();
+        assert_eq!(game.config().display_hz, 60.0);
+        let mut state = State::default();
+        state.head.stamp = 1.0;
+        b.publish_frame(&state, true);
+        assert_eq!(game.poll_frame().unwrap().head.stamp, 1.0);
+        state.head.stamp = 2.0;
+        b.publish_frame(&state, false);
+        assert!(game.poll_frame().is_none());
+        assert_eq!(unsafe { bridge::read_state(h) }.unwrap().head.stamp, 2.0);
+        // A late consumer sees the latest state once, not a burst of pending game frames.
+        for stamp in 3..=6 {
+            state.head.stamp = stamp as f32;
+            b.publish_frame(&state, true);
+        }
+        assert_eq!(game.poll_frame().unwrap().head.stamp, 6.0);
+        assert!(game.poll_frame().is_none());
+        assert_eq!(unsafe { (*h).state_seq.load(Ordering::SeqCst) }, 12);
+        assert_eq!(unsafe { (*h).vsync_count.load(Ordering::SeqCst) }, 5);
     }
 
     #[test]
