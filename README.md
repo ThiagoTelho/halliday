@@ -344,7 +344,8 @@ modules; `make vr-package` adds them to the ordinary app without installing it.
 Game image settings provide FSR 1 render scaling, independent RCAS sharpening,
 and separate horizontal/vertical outer FOV crop. Crop changes apply to the next
 game session and preserve retained source-pixel density. Display settings offer
-live 90/120 Hz and Off/Half/Auto game cadence. Image-only Spacewarp is optional; system game audio uses ScreenCaptureKit.
+live 90/120 Hz and Off/Half/Auto game cadence. Image-only Spacewarp and the
+performance HUD are optional; system game audio uses ScreenCaptureKit.
 
 See [runtime contracts](docs/native-runtime.md),
 [launch and routing](docs/host-launch-and-routing.md),
@@ -353,7 +354,7 @@ See [runtime contracts](docs/native-runtime.md),
 [frame reconstruction](docs/game-spacewarp.md),
 [controller tracking](docs/sense-tracking.md),
 [LED synchronization and contacts](docs/sense-led-feedback-and-touch.md),
-[audio](docs/system-game-audio.md).
+[audio](docs/system-game-audio.md), and [HUD metrics](docs/performance-hud.md).
 
 ### Without a headset
 

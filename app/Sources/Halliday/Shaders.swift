@@ -1426,6 +1426,7 @@ struct DistortOut {
     float2 lensG;
     float2 lensB;
     float eye [[flat]];
+    float4 tangents [[flat]];
 };
 
 // Late latching (LateLatch.swift): the turn from the view shown to the view the eye texture was
@@ -1464,11 +1465,24 @@ vertex DistortOut distort_vs(uint vid [[vertex_id]],
     o.uvG = warped(v.uvG, warp.rotation, t, turn);
     o.uvB = warped(v.uvB, warp.rotation, t, turn);
     o.lensR = v.uvR; o.lensG = v.uvG; o.lensB = v.uvB;
-    o.eye = eye;
+    o.eye = eye; o.tangents = t;
     return o;
 }
 
-static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, float eye, int c) {
+// A finite-distance head-locked plane, sampled through ORIGINAL calibrated
+// lens coordinates. It does not inherit scene rotation, rolling scan or game crop.
+static float4 performanceHUD(texture2d<float> hud, sampler s, float2 lens, float eye,
+                             float4 tangents, constant float4 *overlay) {
+    if (overlay[1].z < 0.5) return float4(0.0);
+    float2 ray = float2(mix(tangents.x, tangents.y, lens.x), mix(tangents.z, tangents.w, lens.y));
+    float2 hit = ray * overlay[1].x + float2((eye < 0.5 ? -0.5 : 0.5) * overlay[1].y, 0.0);
+    float2 uv = float2((hit.x - overlay[0].x) / overlay[0].z, (overlay[0].y - hit.y) / overlay[0].w);
+    if (any(uv < 0.0) || any(uv > 1.0)) return float4(0.0);
+    return hud.sample(s, uv, level(0.0));
+}
+
+static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, float eye, int c,
+                     texture2d<float> hud, float4 tangents, constant float4 *overlay) {
     // Keep the sample centre inside this eye's texel centres. Gradient sampling
     // is evaluated before the lens mask; implicit derivatives after a divergent
     // early return are undefined for partially covered fragment quads.
@@ -1484,15 +1498,21 @@ static float channel(texture2d<float> tex, sampler s, float2 uv, float2 lens, fl
     bool atSeam = distance <= radius;
     float2 gx = atSeam ? float2(0.0) : dx, gy = atSeam ? float2(0.0) : dy;
     float value = tex.sample(s, sbs, gradient2d(gx, gy))[c];
+    if (overlay[1].z > 0.5) {
+        float4 instrument = performanceHUD(hud, s, lens, eye, tangents, overlay);
+        value = instrument[c] + value * (1.0 - instrument.a); // premultiplied display bytes
+    }
     return (any(lens < 0.0) || any(lens > 1.0)) ? 0.0 : value;
 }
 
 fragment float4 distort_fs(DistortOut in [[stage_in]],
                            texture2d<float> eyes [[texture(0)]],
+                           texture2d<float> hud [[texture(1)]],
+                           constant float4 *overlay [[buffer(0)]],
                            sampler smp [[sampler(0)]]) {
-    return float4(channel(eyes, smp, in.uvR, in.lensR, in.eye, 0),
-                  channel(eyes, smp, in.uvG, in.lensG, in.eye, 1),
-                  channel(eyes, smp, in.uvB, in.lensB, in.eye, 2), 1.0);
+    return float4(channel(eyes, smp, in.uvR, in.lensR, in.eye, 0, hud, in.tangents, overlay),
+                  channel(eyes, smp, in.uvG, in.lensG, in.eye, 1, hud, in.tangents, overlay),
+                  channel(eyes, smp, in.uvB, in.lensB, in.eye, 2, hud, in.tangents, overlay), 1.0);
 }
 
 // --- Video: YUV (biplanar 4:2:0) to RGB, into a texture the scene samples ---
@@ -1541,7 +1561,17 @@ fragment float4 yuv_fs(FullscreenOut in [[stage_in]],
 // Undistorted view (distortion off): the side-by-side eye texture stretched over the output.
 fragment float4 passthrough_fs(FullscreenOut in [[stage_in]],
                                texture2d<float> eyes [[texture(0)]],
+                               texture2d<float> hud [[texture(1)]],
+                               constant float4 *overlay [[buffer(0)]],
+                               constant float4 *tangents [[buffer(1)]],
                                sampler smp [[sampler(0)]]) {
-    return eyes.sample(smp, in.uv);
+    float4 scene = eyes.sample(smp, in.uv);
+    if (overlay[1].z > 0.5) {
+        float eye = in.uv.x < 0.5 ? 0.0 : 1.0;
+        float2 lens = float2(in.uv.x * 2.0 - eye, in.uv.y);
+        float4 instrument = performanceHUD(hud, smp, lens, eye, tangents[uint(eye)], overlay);
+        scene.rgb = instrument.rgb + scene.rgb * (1.0 - instrument.a);
+    }
+    return scene;
 }
 """

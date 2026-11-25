@@ -37,7 +37,7 @@ func runGameImageUISnapshot(prefix: String) {
     guard ["display:90", "display:120"].allSatisfy({ id in general.controls.contains(where: { $0.id == id && $0.enabled }) })
     else { fatal("Headset refresh selectors are missing") }
 
-    let expected = Set(["game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:spacewarp", "game:sharpening", "game:sharpness"])
+    let expected = Set(["game:hud", "game:fsr", "game:scale", "game:half:off", "game:half:on", "game:half:auto", "game:spacewarp", "game:sharpening", "game:sharpness"])
     guard expected.isSubset(of: Set(gameImage.controls.map(\.id))) else { fatal("Image settings controls are missing") }
     let settings = Settings.shared
     guard ["game:half:off", "game:half:on", "game:half:auto", "game:spacewarp"].allSatisfy({ id in

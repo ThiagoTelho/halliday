@@ -642,6 +642,12 @@ final class Renderer {
     /// Desktop view (the simulator on a monitor): one undistorted view filling the output, instead
     /// of the headset's two lens-warped eyes squeezed into a window. Much sharper on a monitor.
     var desktopView = false
+    private lazy var performanceHUD = PerformanceHUD(device: device)
+    /// Pure presentation facts; the callback owns a particular game/producer context.
+    var onPerformancePresented: (@Sendable (UInt64, Bool, Double, UInt64) -> Void)?
+    func updatePerformanceHUD(enabled: Bool, snapshot: PerformanceHUDSnapshot) {
+        performanceHUD.update(enabled: enabled, snapshot: snapshot)
+    }
     /// Half of the desktop view's horizontal field of view, as a tangent (1.1 ≈ 95° across).
     var desktopTanHalfWidth: Float = 1.1
     private var desktopTexture: MTLTexture?
@@ -1019,12 +1025,14 @@ final class Renderer {
     func render(head: HeadPose, calibration: [Float], into target: MTLTexture, present drawable: CAMetalDrawable?) {
         let cpuStart = CACurrentMediaTime()
         guard let cb = queue.makeCommandBuffer() else { return }
-        let (sceneTexture, desktop, _) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
+        let generatedBefore = spacewarpGeneratedFrames
+        let (sceneTexture, desktop, sceneEncoded) = drawScene(head: head, calibration: calibration, cb: cb, output: (target.width, target.height))
 
         // 2. Distortion into the output.
         let lens = Lens(queue: queue, pipeline: distortPipeline, passthrough: passthroughPipeline, sampler: sampler,
-                        meshes: desktop == nil && distortionEnabled && meshes.count == 2 ? meshes : nil)
-        lens.encode(into: cb, target: target, scene: sceneTexture, warp: LateLatch.noTurn)
+                        meshes: desktop == nil && distortionEnabled && meshes.count == 2 ? meshes : nil,
+                        hud: desktop == nil ? performanceHUD.image : nil, ipd: ipd)
+        let lensEncoded = lens.encode(into: cb, target: target, scene: sceneTexture, warp: LateLatch.noTurn)
         let stats = self.stats
         let done = gpuDone
         gpuDone = nil
@@ -1033,6 +1041,16 @@ final class Renderer {
             done?(cb.gpuEndTime)
         }
         if let drawable {
+            if sceneEncoded, lensEncoded, let observe = onPerformancePresented {
+                let sequence = projection?.imageSequence ?? 0
+                let generated = spacewarpGeneratedFrames > generatedBefore
+                let prediction = scenePredictionGuard
+                drawable.addPresentedHandler { shown in
+                    let time = shown.presentedTime
+                    guard time.isFinite, time > 0 else { return }
+                    observe(sequence, generated && (prediction?.hasPredictionAfterGPUCompletion ?? true), time, 0)
+                }
+            }
             cb.present(drawable)
         }
         let flow = commitSceneAndPrepareSpacewarp(cb)
@@ -1301,7 +1319,8 @@ final class Renderer {
         let presenter = independentPresenter, stats = self.stats
         gpuDone = nil // physical pulses own their fresh completion identity
         let lens = Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
-                        passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
+                        passthrough: passthroughPipeline, sampler: sampler, meshes: meshes,
+                        hud: performanceHUD.image, ipd: ipd)
         let epoch = presentationClock.epoch, latch = lateLatch, feedback = displayPulseFeedback
         presenter.configureRefresh(displayPulseDriver, offsetNs: displayPulseOffsetNs, epoch: epoch,
             output: output ?? .init(layer: layer, presenting: nil), lens: lens, latch: latch, pose: pose,
@@ -1329,7 +1348,8 @@ final class Renderer {
         let started = Int64(begin * 1e9)
         let completedScene = IndependentLensPresenter.Scene(texture: scene, rendered: rendered,
             startedNs: started, ended: 0, nativeSequence: projection?.imageSequence ?? 0,
-            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration, predictionGuard: scenePredictionGuard)
+            generated: spacewarpGeneratedFrames > generatedBefore, trackingGeneration: head.trackingGeneration, predictionGuard: scenePredictionGuard,
+            imagePresented: onPerformancePresented)
         cb.label = "Admitted compositor scene"
         cb.addCompletedHandler { cb in
             let successful = encoded && cb.status == .completed && cb.gpuEndTime > 0
@@ -1347,7 +1367,8 @@ final class Renderer {
     /// resources can be used on the presentation queue or an offscreen oracle.
     func makePresentationLens() -> Lens {
         Lens(queue: lensCommandQueue ?? queue, pipeline: distortPipeline,
-             passthrough: passthroughPipeline, sampler: sampler, meshes: meshes)
+             passthrough: passthroughPipeline, sampler: sampler, meshes: meshes,
+             hud: performanceHUD.image, ipd: ipd)
     }
 
     /// The lens pass: what it needs, so it can be encoded on any thread.
@@ -1358,6 +1379,8 @@ final class Renderer {
         let sampler: MTLSamplerState
         /// Each eye's distortion mesh; nil: the scene texture stretched over the output.
         let meshes: [(vertices: MTLBuffer, indices: MTLBuffer, count: Int)]?
+        var hud: PerformanceHUD.Image? = nil
+        var ipd: Float = 0.063
 
         @discardableResult
         func encode(into cb: MTLCommandBuffer, target: MTLTexture, scene: MTLTexture, warp: LensWarp) -> Bool {
@@ -1368,6 +1391,10 @@ final class Renderer {
             dp.colorAttachments[0].storeAction = .store
             guard let enc = cb.makeRenderCommandEncoder(descriptor: dp) else { return false }
             enc.setFragmentTexture(scene, index: 0)
+            // A valid fallback is bound even while disabled; no extra pass, queue or wait.
+            enc.setFragmentTexture(hud?.texture ?? scene, index: 1)
+            var overlay = [hud?.rectangle ?? .zero, SIMD4<Float>(hud?.depth ?? 1, ipd, hud == nil ? 0 : 1, 0)]
+            enc.setFragmentBytes(&overlay, length: 2 * MemoryLayout<SIMD4<Float>>.stride, index: 0)
             enc.setFragmentSamplerState(sampler, index: 0)
             if let meshes {
                 enc.setRenderPipelineState(pipeline)
@@ -1381,6 +1408,8 @@ final class Renderer {
                 }
             } else {
                 enc.setRenderPipelineState(passthrough)
+                var tangents = [warp.tanLeft, warp.tanRight]
+                enc.setFragmentBytes(&tangents, length: 2 * MemoryLayout<SIMD4<Float>>.stride, index: 1)
                 enc.drawPrimitives(type: .triangle, vertexStart: 0, vertexCount: 3)
             }
             enc.endEncoding()

@@ -47,6 +47,7 @@ final class SettingsPanel: VRPanel {
         case "page:tracking": showingGameImage = false; showingTracking = true; showingFOV = false
         case "page:fov": showingGameImage = false; showingTracking = false; showingFOV = true
         case "tracking:led": settings.senseLEDFeedback.toggle()
+        case "game:hud": settings.gamePerformanceHUD.toggle()
         case "game:fsr": settings.gameFSREnabled.toggle()
         case "game:crop": settings.gameCropEnabled.toggle()
         case "game:sharpening": settings.gameSharpeningEnabled.toggle()
@@ -309,8 +310,11 @@ final class SettingsPanel: VRPanel {
                             color: NightGlass.secondary, width: width)
         NightGlass.drawText("Restart the game to apply crop or render scale.", at: CGPoint(x: x, y: y + 34), style: .caption,
                             color: NightGlass.secondary, width: width)
-        NightGlass.drawText("100%, crop and image effects off: original game image.", at: CGPoint(x: x, y: y + 60), style: .caption,
-                            color: NightGlass.secondary, width: width)
+        y += 70
+        y = row(ctx, "Performance HUD", "chart.xyaxis.line", (0x7FE3AB, 0x2D9460), ids: ["game:hud"], x: rx, y: y, width: rw) { r in
+            self.toggle(ctx, "game:hud", self.settings.gamePerformanceHUD, CGRect(x: r.maxX - 14 - 60, y: r.midY - 17, width: 60, height: 34))
+        }
+        NightGlass.drawText("Game FPS, display FPS and pose-to-display time. Applies live.", at: CGPoint(x: x, y: y + 4), style: .caption, color: NightGlass.secondary, width: width)
     }
 
     private func drawVersion(x: CGFloat) {

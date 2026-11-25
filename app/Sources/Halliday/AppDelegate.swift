@@ -52,6 +52,8 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
     /// pointer, its trigger clicks, its grip right-clicks and its stick scrolls.
     /// Hold PS to recenter; a tap in a game opens or closes Halliday's dashboard.
     private let sense = SenseControllers()
+    private weak var performanceHUDGame: GameBridge?
+    private var performanceHUDCollecting = false
     private let systemGameAudio = SystemGameAudio()
     private var senseHand = SenseControllers.Hand.right
     private var senseButtons: [SenseControllers.Hand: SenseControllers.Buttons] = [:]
@@ -467,6 +469,10 @@ final class AppDelegate: NSObject, NSApplicationDelegate, MouseOwnerDelegate {
         Settings.shared.onGameCropChange = { [weak self] in
             self?.settingsPanel?.setNeedsDisplay()
             self?.scheduleGameImageReconfiguration()
+        }
+        Settings.shared.onGamePerformanceHUDChange = { [weak self] in
+            self?.settingsPanel?.setNeedsDisplay()
+            self?.updatePerformanceHUD()
         }
         systemGameAudio.onStatus = { status in log("[game audio] \(status.displayText)") }
         applySettings()
@@ -2833,6 +2839,7 @@ if !open, passthroughForVideo {
     /// Applies the settings that take effect at once (the rest are read where they are used).
     private func applySettings() {
         let s = Settings.shared
+        updatePerformanceHUD()
         sense.setLEDFeedbackEnabled(s.senseLEDFeedback)
         sense.setHapticsFocused(game?.isPresenting != true || game?.controllerHapticsFocused == true)
         renderer?.prepareSpacewarpIfEnabled()
@@ -2864,6 +2871,41 @@ if !open, passthroughForVideo {
         scheduleGameImageReconfiguration()
     }
 
+    /// HUD settings never change input ownership, the game camera or menu placement.
+    private func updatePerformanceHUD() {
+        guard let renderer else { return }
+        let visible = Settings.shared.gamePerformanceHUD && game?.isPresenting == true
+        // Retire callbacks when switching away from the physical headset. A
+        // retained old scene must never report a Mac preview as headset latency.
+        let enabled = visible && onHeadset && !desktopMode && headsetDisplayNow != nil
+        if performanceHUDGame !== game {
+            performanceHUDGame?.setPerformanceHUDEnabled(false)
+            performanceHUDGame = game
+            performanceHUDCollecting = false
+        }
+        if performanceHUDCollecting != enabled {
+            game?.setPerformanceHUDEnabled(enabled)
+            performanceHUDCollecting = enabled
+        }
+        guard visible, let game else {
+            renderer.onPerformancePresented = nil
+            renderer.updatePerformanceHUD(enabled: false, snapshot: .empty)
+            return
+        }
+        let metrics = game.performanceMetrics
+        if onHeadset, !desktopMode, headsetDisplayNow != nil,
+           let context = metrics.presentationContext() {
+            // Bind producer/pause generation before admitting a scene. The renderer
+            // copies this closure with that scene; late GPU callbacks never query
+            // whichever game happens to be current when they finish.
+            renderer.onPerformancePresented = { sequence, generated, seen, epoch in
+                metrics.presented(imageSequence: sequence, generated: generated,
+                                  at: seen, epoch: epoch, context: context)
+            }
+        } else { renderer.onPerformancePresented = nil }
+        renderer.updatePerformanceHUD(enabled: true,
+            snapshot: enabled ? game.performanceHUDSnapshot(now: CACurrentMediaTime()) : .empty)
+    }
 
     /// Apply the independent host's cadence in place, including during loading.
     /// Dimensions, physical display rate and closed-runtime host configuration
@@ -4413,6 +4455,7 @@ if !open, passthroughForVideo {
             renderer.gameBackgroundFade = .zero
         }
         if browser?.xrActive != true, game?.isPresenting != true, renderer.projection != nil { renderer.projection = nil }
+        updatePerformanceHUD()
         renderer.presentationContent(game: game?.isPresenting == true, producer: game?.focusProducer?.lease)
         // Halliday over the game: its world dims and blurs in (420 ms) and out.
         let awayTarget: Float = gameAway && game?.isPresenting == true ? 1 : 0

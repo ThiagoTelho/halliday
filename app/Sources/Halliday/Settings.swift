@@ -10,6 +10,8 @@ final class Settings {
     var onChange: (() -> Void)?
     /// Crop changes only renegotiate the next game camera; they must not reanchor the VR UI.
     var onGameCropChange: (() -> Void)?
+    /// HUD visibility changes never reanchor panels or renegotiate game cameras.
+    var onGamePerformanceHUDChange: (() -> Void)?
 
     /// How the space behaves around the user.
     enum Mode: String, CaseIterable {
@@ -111,6 +113,14 @@ final class Settings {
     static let vrPageSizes = [1080, 1440, 1800, 2160]
     var vrPageEye: Int {
         didSet { defaults.set(vrPageEye, forKey: "vrPageEye"); onChange?() }
+    }
+
+    /// Non-interactive, head-locked game performance instrument; off by default.
+    var gamePerformanceHUD: Bool {
+        didSet {
+            defaults.set(gamePerformanceHUD, forKey: "gamePerformanceHUD")
+            if let onGamePerformanceHUDChange { onGamePerformanceHUDChange() } else { onChange?() }
+        }
     }
 
     /// FSR 1 processes game frames before the headset's lens correction.
@@ -257,6 +267,7 @@ final class Settings {
         brightness = min(max(defaults.object(forKey: "brightness") as? Float ?? 1, Self.brightnessRange.lowerBound), 1)
         volume = min(max(defaults.object(forKey: "volume") as? Float ?? 0.5, 0), 1)
         gameSystemAudio = defaults.object(forKey: "gameSystemAudio") as? Bool ?? true
+        gamePerformanceHUD = defaults.object(forKey: "gamePerformanceHUD") as? Bool ?? false
         let savedRefresh = defaults.integer(forKey: "headsetRefreshHz")
         headsetRefreshHz = [90, 120].contains(savedRefresh) ? savedRefresh : 0
         soundVolume = min(max(defaults.object(forKey: "soundVolume") as? Float ?? 0.5, 0), 1)

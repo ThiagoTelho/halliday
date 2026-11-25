@@ -586,6 +586,10 @@ private struct SoundPane: View {
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
         }
         CompanionCard(title: "Game image") {
+            Toggle("Performance HUD", isOn: model.setting(\.gamePerformanceHUD)).toggleStyle(.switch)
+                .accessibilityIdentifier("game.performanceHUD")
+            Text("Shows game FPS, display FPS, pose-to-display time and a frame-time history below your view. Applies live.")
+                .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)
             Toggle("FSR 1", isOn: model.setting(\.gameFSREnabled)).toggleStyle(.switch)
             Text("Reconstructs a lower-resolution game image before showing it in the headset.")
                 .font(.callout).foregroundStyle(.secondary).fixedSize(horizontal: false, vertical: true)

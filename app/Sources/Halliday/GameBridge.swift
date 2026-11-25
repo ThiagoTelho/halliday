@@ -48,6 +48,18 @@ final class GameBridge {
     private var bridge: OpaquePointer? { bridgeLease?.pointer }
     private var producerState = GameProducerState()
     private var producerWatchdog = GameProducerWatchdog()
+    nonisolated let performanceMetrics = GamePerformanceMetrics()
+    private var performanceHUDEnabled = false
+
+    /// Same-value calls preserve the current measurement/history window.
+    func setPerformanceHUDEnabled(_ enabled: Bool) {
+        guard enabled != performanceHUDEnabled else { return }
+        performanceHUDEnabled = enabled
+        performanceMetrics.setEnabled(enabled, at: CACurrentMediaTime())
+    }
+    func performanceHUDSnapshot(now: Double) -> PerformanceHUDSnapshot {
+        performanceMetrics.snapshot(now: now)
+    }
     private var buffer: MTLBuffer?
     private var texture: MTLTexture?
     private var reading = false
@@ -313,6 +325,7 @@ final class GameBridge {
     }
 
     func close() {
+        setPerformanceHUDEnabled(false)
         producerState.invalidateCallbacks()
         if let bridge { halliday_bridge_retire(bridge) }
         stopCapture()
@@ -651,6 +664,7 @@ final class GameBridge {
             c.axes.2.0 = input.grip
             if i == 1 { state.controllers.1 = c } else { state.controllers.0 = c }
         }
+        let performancePosePublishedAt = performanceHUDEnabled ? CACurrentMediaTime() : 0
         halliday_bridge_publish_frame_with_controller_frames(b, &state, notifyGame, motionMask,
             controllerFrames[0].rawValue, controllerFrames[1].rawValue)
 
@@ -718,6 +732,16 @@ final class GameBridge {
             log("[game] \(appName) acknowledged the quit request")
         }
         framesArriving = now - lastFrameTime < 0.5
+        if performanceHUDEnabled {
+            let ready = halliday_bridge_client_status(b) == 1 && client.initialized != 0 &&
+                publicEpoch == halliday_bridge_client_epoch(b)
+            let suspended = (publicEpoch == 0 || observedOpenVRSubmitTiming) &&
+                ((lastScene?.0.grid ?? 0) != 0 || (lastScene?.0.suspended ?? 0) != 0)
+            performanceMetrics.observeProducer(.init(pid: client.pid, epoch: publicEpoch,
+                revision: producerState.revision), frames: client.frames, at: now,
+                active: ready && isPresenting && framesArriving && !paused && !dashboardShown && !suspended)
+            performanceMetrics.posePublished(stamp: stamp, at: performancePosePublishedAt)
+        }
         if isPresenting {
             // Still running: its heartbeat beats (an older runtime has none: its frames count) and
             // it hasn't shut VR down.
@@ -758,6 +782,7 @@ final class GameBridge {
         // The compositor's own place instead of the game's frames: asked for (FadeGrid), the game
         // suspended its rendering, or no frame is coming.
         let showFrames = framesArriving && sc.grid == 0 && sc.suspended == 0
+        if performanceHUDEnabled, !showFrames { performanceMetrics.sourceInactive(at: now) }
         let reason = showFrames ? "its frames" : !framesArriving ? "no frames coming (loading?)" : sc.grid != 0 ? "the grid it asked for" : "its rendering suspended"
         if reason != lastShown {
             lastShown = reason
@@ -777,6 +802,7 @@ final class GameBridge {
         if let startedAt {
             GameLibrary.shared.recordLaunch(exe: appName, minutes: Int(Date().timeIntervalSince(startedAt) / 60), problem: nil)
         }
+        performanceMetrics.sourceInactive(at: CACurrentMediaTime())
         isPresenting = false
         aims = [nil, nil]
         pointing = nil
@@ -816,6 +842,7 @@ final class GameBridge {
     /// Halliday's own interface is over the game (it should pause) or not.
     func setDashboard(_ shown: Bool) {
         dashboardShown = shown
+        if shown, performanceHUDEnabled { performanceMetrics.sourceInactive(at: CACurrentMediaTime()) }
         for hand in inputRearm.indices { inputRearm[hand].setFocused(!shown) }
         if !shown { independentHaptics?.setFocused(true) }
         guard let b = bridge else { return }
@@ -1419,13 +1446,17 @@ final class GameBridge {
                                  imageTiming: GameSourceImageTime? = nil) -> ProjectionLayer {
         notePoseAge(p)
         Self.nextImageSequence &+= 1
+        let imageTime = CACurrentMediaTime()
+        if performanceHUDEnabled {
+            performanceMetrics.receivedImage(sequence: Self.nextImageSequence, poseStamp: p.stamp, at: imageTime)
+        }
         var projection = ProjectionLayer(texture: texture,
                                uvRect: flipped ? SIMD4(0, 1, 1, -1) : SIMD4(0, 0, 1, 1),
                                renderOrientation: originTurn * simd_quatf(ix: p.orientation.0, iy: p.orientation.1, iz: p.orientation.2, r: p.orientation.3),
                                renderPosition: originPlace + originTurn.act(SIMD3(p.position.0, p.position.1, p.position.2)),
                                tangents: (viewGeometry.leftTangents, viewGeometry.rightTangents),
                                gameImage: true, imageSequence: Self.nextImageSequence,
-                               imageTime: CACurrentMediaTime(), imageTiming: imageTiming, gameHalfRate: halfFrameRate,
+                               imageTime: imageTime, imageTiming: imageTiming, gameHalfRate: halfFrameRate,
                                sourceFrameInterval: frameCadence.gameInterval, gameCadenceEpoch: cadenceEpoch)
         projection.gameImageTarget = viewGeometry.imageTarget
         if let eyeViews, !eyeViews.matchesLegacy(position: projection.renderPosition, orientation: projection.renderOrientation,

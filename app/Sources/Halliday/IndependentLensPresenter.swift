@@ -15,6 +15,7 @@ final class IndependentLensPresenter: @unchecked Sendable {
         var generated = false
         var trackingGeneration: UInt64 = 0
         var predictionGuard: GameSpacewarp.PredictionGuard? = nil
+        var imagePresented: (@Sendable (UInt64, Bool, Double, UInt64) -> Void)? = nil
         func ending(at time: Double) -> Scene {
             var value = self; value.ended = time
             if let predictionGuard, predictionGuard.sequence == nativeSequence,
@@ -152,7 +153,8 @@ final class IndependentLensPresenter: @unchecked Sendable {
         }
         drawable.observe { [clock, telemetry] presented in
             work.request.presented(presented)
-            if presented > 0 {
+            if presented.isFinite, presented > 0, presented < Double(Int64.max) / 1e9 {
+                work.scene.imagePresented?(work.scene.nativeSequence, work.scene.generated, presented, epoch)
                 telemetry.presented(timing, atNs: Int64(presented * 1e9))
                 clock.observe(presentedNs: Int64(presented * 1e9),
                     committedNs: Int64(committed * 1e9), epoch: epoch)
