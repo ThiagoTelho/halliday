@@ -9,6 +9,14 @@
 set -euo pipefail
 cd "$(dirname "$0")/.."
 OUT=${1:?usage: collect-licenses.sh OUT}
+
+# Resolve the dependency graph once. Use Cargo's normal resolution behavior:
+# metadata needs package sources even when their build artifacts already exist.
+CARGO_METADATA_JSON=$(cargo metadata \
+  --manifest-path core/Cargo.toml \
+  --format-version 1 \
+  --locked)
+
 rm -rf "$OUT"
 mkdir -p "$OUT"
 
@@ -17,15 +25,23 @@ cp THIRD-PARTY.md "$OUT/THIRD-PARTY.md"
 
 # Rust crates compiled in: found through cargo, which knows where each one's source is.
 crate_dir() {
-    cargo metadata --manifest-path core/Cargo.toml --format-version 1 --offline 2>/dev/null \
-        | /usr/bin/python3 -c 'import json, sys, os
+  /usr/bin/python3 -c '
+import json, sys, os
+
 name = sys.argv[1]
-for p in json.load(sys.stdin)["packages"]:
-    if p["name"] == name: print(os.path.dirname(p["manifest_path"])); break' "$1"
+packages = json.load(sys.stdin)["packages"]
+
+for package in packages:
+    if package["name"] == name:
+        print(os.path.dirname(package["manifest_path"]))
+        break
+else:
+    sys.exit(f"collect-licenses: crate {name!r} not found in Cargo metadata")
+' "$1" <<<"$CARGO_METADATA_JSON"
 }
+
 copy_crate() {  # crate, files…
     local dir; dir=$(crate_dir "$1")
-    [ -n "$dir" ] || { echo "collect-licenses: $1 not found by cargo" >&2; exit 1; }
     local name=$1; shift
     for f in "$@"; do cp "$dir/$f" "$OUT/$name-$f.txt"; done
 }
